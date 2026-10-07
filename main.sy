@@ -1,15 +1,39 @@
 // Copyright 2026 Raph Levien
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-// Port of the led_only branch of pico-asm: bring up the 12 MHz crystal
-// and run clk_sys from PLL_SYS at 126 MHz, then blink an LED.
-// The .image_def and .vectors sections are in startup.s.
+// Port of the main branch of pico-asm: bring up the 12 MHz crystal and run
+// clk_sys from PLL_SYS at 126 MHz, then generate a 640x480 DVI signal with
+// HSTX, fed by two chained DMA channels that a DMA interrupt reprograms
+// every scanline. The LED toggles every 30 frames.
+// The .image_def, .vectors and DMA command lists are in startup.s.
 
 symbol _data_source: *u32
 symbol _data_start: *u32
 symbol _data_size_words: u32
 symbol _bss_start: *u32
 symbol _bss_size_words: u32
+
+// HSTX command lists, in startup.s
+symbol blank_line_vsync_off: *u32
+symbol blank_line_vsync_on: *u32
+symbol line_active: *u32
+
+struct Dvi {
+    v_scanline: u32
+    dma_pong: u32
+    frame_count: u32
+}
+
+static mut dvi: Dvi
+
+// One DMA channel's registers; channels are 0x40 apart.
+struct DmaChannel {
+    read_addr: u32
+    write_addr: u32
+    trans_count: u32
+    ctrl_trig: u32
+    al1_ctrl: u32
+}
 
 fn start() {
     // initialize RAM
@@ -32,7 +56,7 @@ bss_loop:
     bne bss_loop
 
     // reset DMA and HSTX
-    mask @r0 = 0xc
+    mask @r0 = (1 << 2) | (1 << 3)
     bl assert_reset
 
     bl configure_clk_sys1
@@ -42,8 +66,8 @@ bss_loop:
     bl configure_clk_sys2
 
     // release reset for IO_BANK0 and PADS_BANK0
-    mask @r0 = 0x240
-    bl clear_reset
+    mask @r0 = (1 << 6) | (1 << 9)
+    bl reset
 
     // set up pad: 4mA, pull-down, Schmitt input
     pads_bank0 @r0 = peripherals.PADS_BANK0
@@ -60,19 +84,35 @@ bss_loop:
     *(io_bank0 + (led_pin << 3)) = function
 
     sio @r0 = peripherals.SIO
-    mask @r1 = 0x80
-    sio.GPIO_OE_SET = mask
+    led_mask @r1 = 1 << 7
+    sio.GPIO_OE_SET = led_mask
 
-    // The original enables interrupts here with cpsie i. PRIMASK is
-    // already clear out of reset, so it's a no-op and is omitted.
+    bl configure_clk_hstx
+    // release reset for DMA and HSTX
+    mask @r0 = (1 << 2) | (1 << 3)
+    bl reset
+    bl setup_hstx
+    bl setup_dma
 
-blink_loop:
-    sio.GPIO_OUT_XOR = mask
+    // enable interrupts globally
+    cpsie(i)
+
+    // unmask DMA_IRQ_0
+    nvic_iser0 @r2 = 0xe000e100
+    irq @r3 = 1 << 10
+    *nvic_iser0 = irq
+
+    // start channel 0
+    multi_chan_trigger @r2 = 0x50000450
+    chan @r3 = 1
+    *multi_chan_trigger = chan
+
+idle_loop:
     delay @r2 = 3_000_000
 delay_loop:
     #(delay -= 1)
     bne delay_loop
-    b blink_loop
+    b idle_loop
 }
 
 fn init_xosc() {
@@ -97,10 +137,8 @@ xosc_wait:
 
 fn init_pll() {
     push(lr)
-    mask @r0 = 0x4000
-    bl assert_reset
-    mask @r0 = 0x4000
-    bl clear_reset
+    mask @r0 = 1 << 14
+    bl reset
     pll @r0 = peripherals.PLL_SYS
     // VCO = 12 MHz * 126 = 1512 MHz
     fbdiv @r1 = pll.FBDIV_INT
@@ -108,8 +146,8 @@ fn init_pll() {
     fbdiv[0..12] = fbdiv_val
     pll.FBDIV_INT = fbdiv
     // turn on pll and pll vco: clear PD and VCOPD in PWR
-    pwr_bits @r1 = 0x21
-    pwr_clear @r3 = 0x3004
+    pwr_bits @r1 = (1 << 5) | (1 << 0)
+    pwr_clear @r3 = 0x3000 + 0x4
     *(pll + pwr_clear) = pwr_bits
     // wait for lock
 pll_wait:
@@ -124,7 +162,7 @@ pll_wait:
     prim[16..19] = postdiv1
     pll.PRIM = prim
     // clear POSTDIVPD
-    pwr_bits @r1 = 8
+    pwr_bits @r1 = 1 << 3
     *(pll + pwr_clear) = pwr_bits
     pop(pc)
 }
@@ -150,12 +188,12 @@ fn configure_clk_sys1() {
     // select REF as the source
     clocks @r0 = peripherals.CLOCKS
     one @r1 = 1
-    sys_ctrl_clear @r2 = 0x303c
+    sys_ctrl_clear @r2 = 0x3000 + 0x3c
     *(clocks + sys_ctrl_clear) = one
     // wait for REF to get selected
 clk_sys1_wait_ref:
     selected @r3 = clocks.CLK_SYS_SELECTED
-    #(selected = selected >> 1)
+    #(selected >>= 1)
     bcc clk_sys1_wait_ref
 
     ctrl @r1 = clocks.CLK_REF_CTRL
@@ -184,8 +222,20 @@ fn configure_clk_sys2() {
     // wait for AUX to get selected
 clk_sys2_wait:
     selected @r1 = clocks.CLK_SYS_SELECTED
-    #(selected = selected >> 2)
+    #(selected >>= 2)
     bcc clk_sys2_wait
+    bx lr
+}
+
+// Take the blocks in mask out of reset and wait until they're ready.
+fn reset(mask: u32) {
+    resets @r1 = peripherals.RESETS
+    atomic_clear @r2 = 0x3000
+    *(resets + atomic_clear) = mask
+reset_wait:
+    status @r2 = resets.RESET_DONE
+    #(_ @r2 = mask & !status)
+    bne reset_wait
     bx lr
 }
 
@@ -196,13 +246,155 @@ fn assert_reset(mask: u32) {
     bx lr
 }
 
-fn clear_reset(mask: u32) {
-    resets @r1 = peripherals.RESETS
-    atomic_clear @r2 = 0x3000
-    *(resets + atomic_clear) = mask
-reset_wait:
-    status @r2 = resets.RESET_DONE
-    #(_ @r2 = mask & !status)
-    bne reset_wait
+fn default_handler() {
+hang:
+    b hang
+}
+
+fn configure_clk_hstx() {
+    clocks @r0 = peripherals.CLOCKS
+    ctrl @r1 = clocks.CLK_HSTX_CTRL
+    // clk_sys
+    ctrl[5..8] = 0
+    clocks.CLK_HSTX_CTRL = ctrl
+    // enable
+    one @r2 = 1
+    ctrl[11..12] = one
+    clocks.CLK_HSTX_CTRL = ctrl
     bx lr
+}
+
+fn setup_hstx() {
+    hstx @r0 = peripherals.HSTX_CTRL
+    // setup for rgb 555
+    tmds @r1 = 29 | (4 << 5) | (2 << 8) | (4 << 13) | (7 << 16) | (4 << 21)
+    hstx.EXPAND_TMDS = tmds
+    // This shifts a 32 bit word into 2 16 bit chunks.
+    // For doubled pixels, better to set enc_shift to 0,
+    // enc_n_shifts = number of pixel reps, and dma to 16 bit transfers
+    shift @r1 = (1 << 8) | (16 << 16) | (2 << 24)
+    hstx.EXPAND_SHIFT = shift
+    csr @r1 = 3 | (2 << 8) | (5 << 16) | (5 << 28)
+    *hstx = csr; hstx += 4
+    // setup bits; feather is d2, clk, d1, d0 (pos)
+    bit0 @r1 = 20 | (21 << 8)
+    bit1 @r2 = bit0 | (1 << 16)
+    *hstx = (bit0, bit1); hstx += 8
+    bit2 @r1 = 1 << 17
+    bit3 @r2 = bit2 | (1 << 16)
+    *hstx = (bit2, bit3); hstx += 8
+    bit4 @r1 = 10 | (11 << 8)
+    bit5 @r2 = bit4 | (1 << 16)
+    *hstx = (bit4, bit5); hstx += 8
+    bit6 @r1 = 1 << 8
+    bit7 @r2 = bit6 | (1 << 16)
+    *hstx = (bit6, bit7); hstx += 8
+
+    // pins 12..19 to function 0 (hstx), 4mA drive, Schmitt
+    io_bank0 @r0 = peripherals.IO_BANK0
+    // pin 12 = 8 * 12 + 4 - 8
+    ctrl_offset @r2 = 92
+    pad @r3 = 0x40038000 + 4 + 4 * 12
+hstx_pin_loop:
+    ctrl_offset += 8
+    function @r1 = 0
+    *(io_bank0 + ctrl_offset) = function
+    pad_config @r1 = 0x16
+    // pin 20 = 8 * 20 + 4 - 8
+    #(ctrl_offset - 156)
+    *pad = pad_config; pad += 4
+    bne hstx_pin_loop
+    bx lr
+}
+
+fn setup_dma() {
+    ch @r0 = peripherals.DMA as *DmaChannel
+    chain_to @r2 = 1 << 13
+dma_ch_loop:
+    read_addr @r1 = blank_line_vsync_off
+    ch.read_addr = read_addr
+    // hstx fifo
+    write_addr @r1 = 0x50600004
+    ch.write_addr = write_addr
+    // length of blank line
+    trans_count @r1 = 7
+    ch.trans_count = trans_count
+    ctrl @r1 = 0x680019
+    ctrl += chain_to
+    chain_to = 0
+    ch.al1_ctrl = ctrl
+
+    ch += 0x40
+    // carry is set after the second channel, when ch is DMA_BASE + 0x80
+    #(tmp @r1 = ch >> 8)
+    bcc dma_ch_loop
+    irqs @r1 = 3
+    // ints0
+    *(ch + (0x40c - 0x80)) = irqs
+    // inte0
+    *(ch + (0x404 - 0x80)) = irqs
+    bx lr
+}
+
+// The original places this in .ram; for now it runs from flash.
+fn dma_irq_0_handler() {
+    push(r0, r1, r2, r3, lr)
+
+    p @r0 = &dvi
+    pong @r1 = p.dma_pong
+    next_pong @r2 = pong ^ 1
+    p.dma_pong = next_pong
+    dma @r2 = peripherals.DMA
+    bit @r3 = 1
+    bit <<= pong
+    // clear interrupt
+    dma.INTR = bit
+    // the channel that just finished
+    ch @r2 = (dma + (pong << 6)) as *DmaChannel
+    line @r1 = p.v_scanline
+    // front porch
+    #(line -= 10)
+    bhs irq_not_front_porch
+irq_vsync_off:
+    cmd @r1 = blank_line_vsync_off
+    cmd_len @r3 = 7
+    b irq_set_cmd
+irq_not_front_porch:
+    // sync
+    #(line -= 3)
+    bhs irq_not_sync
+    cmd @r1 = blank_line_vsync_on
+    cmd_len @r3 = 7
+    b irq_set_cmd
+irq_not_sync:
+    // back porch
+    #(line -= 33)
+    blo irq_vsync_off
+    cmd @r1 = line_active
+    cmd_len @r3 = 9
+irq_set_cmd:
+    ch.read_addr = cmd
+    ch.trans_count = cmd_len
+
+    scanline @r1 = p.v_scanline
+    scanline += 1
+    #(scanline - 524)
+    if #hi {
+        scanline = 0
+    }
+    p.v_scanline = scanline
+    bls irq_done
+    frame @r1 = p.frame_count
+    frame += 1
+    #(frame - 30)
+    bne irq_store_frame
+    frame = 0
+
+    sio @r2 = peripherals.SIO
+    led_mask @r3 = 1 << 7
+    sio.GPIO_OUT_XOR = led_mask
+irq_store_frame:
+    p.frame_count = frame
+irq_done:
+    pop(r0, r1, r2, r3, pc)
 }
