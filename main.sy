@@ -1,8 +1,9 @@
 // Copyright 2026 Raph Levien
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-// A minimal program that can blink the LED on a Fruit Jam board.
-// It requires .vectors and .image_def sections.
+// Port of the led_only branch of pico-asm: bring up the 12 MHz crystal
+// and run clk_sys from PLL_SYS at 126 MHz, then blink an LED.
+// The .image_def and .vectors sections are in startup.s.
 
 symbol _data_source: *u32
 symbol _data_start: *u32
@@ -21,40 +22,171 @@ data_loop:
     *dst = val; dst += 4
     bne data_loop
 
-    count @r3 = lower16(_bss_size_words)
-    dst = _bss_start
+    // count is zero after the loop
     zero @r2 = count // elided
+    count @r1 = lower16(_bss_size_words)
+    dst @r0 = _bss_start
 bss_loop:
     #(count -= 1)
     *dst = zero; dst += 4
     bne bss_loop
 
+    // reset DMA and HSTX
     mask @r0 = 0xc
     bl assert_reset
-    // TODO: clock setup
 
+    bl configure_clk_sys1
+    bl init_xosc
+    bl init_pll
+    bl configure_clk_ref
+    bl configure_clk_sys2
+
+    // release reset for IO_BANK0 and PADS_BANK0
     mask @r0 = 0x240
     bl clear_reset
+
+    // set up pad: 4mA, pull-down, Schmitt input
     pads_bank0 @r0 = peripherals.PADS_BANK0
     pads_bank0 += 4
-    led_pin @r1 = 29
+    led_pin @r1 = 7
     config @r2 = 0x56
     *(pads_bank0 + (led_pin << 2)) = config
+
+    // function 5 is SIO
     io_bank0 @r0 = peripherals.IO_BANK0
     io_bank0 += 4
-    function @r2 = 5
+    function @r1 = 5
+    led_pin @r2 = 7
     *(io_bank0 + (led_pin << 3)) = function
+
     sio @r0 = peripherals.SIO
-    mask @r2 = 1
-    mask = mask << led_pin
+    mask @r1 = 0x80
     sio.GPIO_OE_SET = mask
+
+    // The original enables interrupts here with cpsie i. PRIMASK is
+    // already clear out of reset, so it's a no-op and is omitted.
+
 blink_loop:
     sio.GPIO_OUT_XOR = mask
-    count @r1 = 300_000
-delay:
-    #(count -= 1)
-    bne delay
+    delay @r2 = 3_000_000
+delay_loop:
+    #(delay -= 1)
+    bne delay_loop
     b blink_loop
+}
+
+fn init_xosc() {
+    xosc @r0 = peripherals.XOSC
+    startup @r1 = xosc.STARTUP
+    // ~64ms startup delay
+    startup_delay @r2 = 3000
+    startup[0..14] = startup_delay
+    xosc.STARTUP = startup
+    ctrl @r1 = xosc.CTRL
+    // enable, 1_15MHz
+    ctrl_val @r2 = 0xfabaa0
+    ctrl[0..24] = ctrl_val
+    xosc.CTRL = ctrl
+    // wait for stable bit
+xosc_wait:
+    status @r1 = xosc.STATUS
+    #(status & status)
+    bpl xosc_wait
+    bx lr
+}
+
+fn init_pll() {
+    push(lr)
+    mask @r0 = 0x4000
+    bl assert_reset
+    mask @r0 = 0x4000
+    bl clear_reset
+    pll @r0 = peripherals.PLL_SYS
+    // VCO = 12 MHz * 126 = 1512 MHz
+    fbdiv @r1 = pll.FBDIV_INT
+    fbdiv_val @r2 = 126
+    fbdiv[0..12] = fbdiv_val
+    pll.FBDIV_INT = fbdiv
+    // turn on pll and pll vco: clear PD and VCOPD in PWR
+    pwr_bits @r1 = 0x21
+    pwr_clear @r3 = 0x3004
+    *(pll + pwr_clear) = pwr_bits
+    // wait for lock
+pll_wait:
+    cs @r1 = pll.CS
+    #(cs & cs)
+    bpl pll_wait
+    // 1512 / (2 * 6) = 126 MHz
+    prim @r1 = pll.PRIM
+    postdiv2 @r2 = 2
+    prim[12..15] = postdiv2
+    postdiv1 @r2 = 6
+    prim[16..19] = postdiv1
+    pll.PRIM = prim
+    // clear POSTDIVPD
+    pwr_bits @r1 = 8
+    *(pll + pwr_clear) = pwr_bits
+    pop(pc)
+}
+
+fn configure_clk_ref() {
+    // select xosc as the source
+    clocks @r0 = peripherals.CLOCKS
+    ctrl @r1 = clocks.CLK_REF_CTRL
+    src @r2 = 2
+    ctrl[0..2] = src
+    clocks.CLK_REF_CTRL = ctrl
+    // wait for xosc to get selected
+clk_ref_wait:
+    selected @r1 = clocks.CLK_REF_SELECTED
+    selected = selected[0..4]
+    #(selected - 4)
+    bne clk_ref_wait
+    bx lr
+}
+
+// switch sys clock to ref and ref clock to rosc
+fn configure_clk_sys1() {
+    // select REF as the source
+    clocks @r0 = peripherals.CLOCKS
+    one @r1 = 1
+    sys_ctrl_clear @r2 = 0x303c
+    *(clocks + sys_ctrl_clear) = one
+    // wait for REF to get selected
+clk_sys1_wait_ref:
+    selected @r3 = clocks.CLK_SYS_SELECTED
+    #(selected = selected >> 1)
+    bcc clk_sys1_wait_ref
+
+    ctrl @r1 = clocks.CLK_REF_CTRL
+    zero @r2 = 0
+    ctrl[0..2] = zero
+    clocks.CLK_REF_CTRL = ctrl
+    // wait for rosc to get selected
+clk_sys1_wait_rosc:
+    selected @r1 = clocks.CLK_REF_SELECTED
+    selected = selected[0..4]
+    #(selected - 1)
+    bne clk_sys1_wait_rosc
+    bx lr
+}
+
+fn configure_clk_sys2() {
+    clocks @r0 = peripherals.CLOCKS
+    one @r1 = 1
+    // set aux source to PLL
+    ctrl @r3 = clocks.CLK_SYS_CTRL
+    // select CLKSRC_PLL_SYS
+    ctrl[5..8] = 0
+    // CLKSRC_CLK_SYS_AUX
+    ctrl[0..1] = one
+    clocks.CLK_SYS_CTRL = ctrl
+    // wait for AUX to get selected
+clk_sys2_wait:
+    selected @r1 = clocks.CLK_SYS_SELECTED
+    #(selected = selected >> 2)
+    bcc clk_sys2_wait
+    bx lr
 }
 
 fn assert_reset(mask: u32) {
@@ -68,9 +200,9 @@ fn clear_reset(mask: u32) {
     resets @r1 = peripherals.RESETS
     atomic_clear @r2 = 0x3000
     *(resets + atomic_clear) = mask
-loop:
+reset_wait:
     status @r2 = resets.RESET_DONE
     #(_ @r2 = mask & !status)
-    bne loop
+    bne reset_wait
     bx lr
 }
