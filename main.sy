@@ -1,11 +1,14 @@
 // Copyright 2026 Raph Levien
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-// Port of the main branch of pico-asm: bring up the 12 MHz crystal and run
-// clk_sys from PLL_SYS at 126 MHz, then generate a 640x480 DVI signal with
-// HSTX, fed by two chained DMA channels that a DMA interrupt reprograms
-// every scanline. The LED toggles every 30 frames.
-// The .image_def, .vectors and DMA command lists are in startup.s.
+// Bring up the 12 MHz crystal and run clk_sys from PLL_SYS at 126 MHz, then
+// generate a 640x480 DVI signal with HSTX. Two chained DMA channels feed
+// HSTX: channel 0 sends each line's horizontal sync, channel 1 its content,
+// either blanking or a line of pixels. A DMA interrupt reprograms the
+// channel that just finished, and hands line buffers to the renderer, which
+// runs in thread mode and gets them with dvi_get_line. This follows the
+// main branch of pico-dvi-rs, without audio. The LED toggles every 30
+// frames. The .image_def and .vectors are in startup.s.
 
 symbol _data_source: *u32
 symbol _data_start: *u32
@@ -13,15 +16,116 @@ symbol _data_size_words: u32
 symbol _bss_start: *u32
 symbol _bss_size_words: u32
 
-// HSTX command lists, in startup.s
-symbol blank_line_vsync_off: *u32
-symbol blank_line_vsync_on: *u32
-symbol line_active: *u32
+// 640x480 at 60 Hz
+const H_FRONT_PORCH = 16
+const H_SYNC_WIDTH = 96
+const H_BACK_PORCH = 48
+const H_ACTIVE = 640
+const V_FRONT_PORCH = 10
+const V_SYNC_WIDTH = 2
+const V_BACK_PORCH = 33
+const V_ACTIVE = 480
+const V_SYNC_START = V_FRONT_PORCH
+const V_SYNC_END = V_SYNC_START + V_SYNC_WIDTH
+const V_ACTIVE_START = V_SYNC_END + V_BACK_PORCH
+const V_TOTAL = V_ACTIVE_START + V_ACTIVE
+
+// HSTX commands
+const HSTX_RAW = 0 << 12
+const HSTX_RAW_REPEAT = 1 << 12
+const HSTX_TMDS = 2 << 12
+const HSTX_TMDS_REPEAT = 3 << 12
+
+// TMDS control symbols for lane 0, indexed by (vsync, hsync), where 1 is
+// inactive (both polarities are negative). Lanes 1 and 2 send 00.
+const TMDS_CTRL_00 = 0x354
+const TMDS_CTRL_01 = 0x0ab
+const TMDS_CTRL_10 = 0x154
+const TMDS_CTRL_11 = 0x2ab
+const SYNC_V0_H0 = TMDS_CTRL_00 | (TMDS_CTRL_00 << 10) | (TMDS_CTRL_00 << 20)
+const SYNC_V0_H1 = TMDS_CTRL_01 | (TMDS_CTRL_00 << 10) | (TMDS_CTRL_00 << 20)
+const SYNC_V1_H0 = TMDS_CTRL_10 | (TMDS_CTRL_00 << 10) | (TMDS_CTRL_00 << 20)
+const SYNC_V1_H1 = TMDS_CTRL_11 | (TMDS_CTRL_00 << 10) | (TMDS_CTRL_00 << 20)
+
+// Sync words at the end of each command list are sent raw rather than
+// repeated, as in pico-dvi-rs.
+const TAIL = 8
+
+// HSTX command lists, read by DMA. Channel 0 sends the horizontal sync
+// pulse, from the end of one line's active pixels to the start of the
+// next's.
+static mut sync_pulse_vsync_off: [u32; 15] = [
+    HSTX_RAW_REPEAT | H_FRONT_PORCH, SYNC_V1_H1,
+    HSTX_RAW_REPEAT | H_SYNC_WIDTH, SYNC_V1_H0,
+    HSTX_RAW_REPEAT | (H_BACK_PORCH - TAIL), SYNC_V1_H1,
+    HSTX_RAW | TAIL,
+    SYNC_V1_H1, SYNC_V1_H1, SYNC_V1_H1, SYNC_V1_H1,
+    SYNC_V1_H1, SYNC_V1_H1, SYNC_V1_H1, SYNC_V1_H1,
+]
+static mut sync_pulse_vsync_on: [u32; 15] = [
+    HSTX_RAW_REPEAT | H_FRONT_PORCH, SYNC_V0_H1,
+    HSTX_RAW_REPEAT | H_SYNC_WIDTH, SYNC_V0_H0,
+    HSTX_RAW_REPEAT | (H_BACK_PORCH - TAIL), SYNC_V0_H1,
+    HSTX_RAW | TAIL,
+    SYNC_V0_H1, SYNC_V0_H1, SYNC_V0_H1, SYNC_V0_H1,
+    SYNC_V0_H1, SYNC_V0_H1, SYNC_V0_H1, SYNC_V0_H1,
+]
+
+// Channel 1 sends a line's content: blanking outside the active lines,
+// a line buffer, or err_line if the renderer didn't finish in time.
+static mut line_only_vsync_off: [u32; 11] = [
+    HSTX_RAW_REPEAT | (H_ACTIVE - TAIL), SYNC_V1_H1,
+    HSTX_RAW | TAIL,
+    SYNC_V1_H1, SYNC_V1_H1, SYNC_V1_H1, SYNC_V1_H1,
+    SYNC_V1_H1, SYNC_V1_H1, SYNC_V1_H1, SYNC_V1_H1,
+]
+static mut line_only_vsync_on: [u32; 11] = [
+    HSTX_RAW_REPEAT | (H_ACTIVE - TAIL), SYNC_V0_H1,
+    HSTX_RAW | TAIL,
+    SYNC_V0_H1, SYNC_V0_H1, SYNC_V0_H1, SYNC_V0_H1,
+    SYNC_V0_H1, SYNC_V0_H1, SYNC_V0_H1, SYNC_V0_H1,
+]
+// Red, in RGB555
+const ERR_PIXELS = 0x7c007c00
+static mut err_line: [u32; 11] = [
+    HSTX_TMDS_REPEAT | (H_ACTIVE - 2 * TAIL), ERR_PIXELS,
+    HSTX_TMDS | (2 * TAIL),
+    ERR_PIXELS, ERR_PIXELS, ERR_PIXELS, ERR_PIXELS,
+    ERR_PIXELS, ERR_PIXELS, ERR_PIXELS, ERR_PIXELS,
+]
+
+// Two line buffers, each an HSTX command followed by 640 RGB555 pixels.
+// The command word is stored at startup.
+const LINE_WORDS = 1 + H_ACTIVE / 2
+const N_LINES = 2
+static mut video_lines: [[u32; LINE_WORDS]; N_LINES]
+const LINE_BYTES = size(video_lines) / N_LINES
+static mut line_ptrs: [*u32; N_LINES] = [&video_lines, &video_lines + LINE_BYTES]
+
+// The state of one line buffer
+struct LineState {
+    // lent to the renderer
+    lent: u32
+    // still lent when its next line was due, so that line shows err_line
+    missed: u32
+}
+
+const QUEUE_SIZE = 4
 
 struct Dvi {
-    v_scanline: u32
+    // First, so a buffer's state is at p + ix * 8
+    lines: [LineState; N_LINES]
+    // The line the next interrupts set up, 0 at the start of the front
+    // porch. Starts at 1, since line 0 is set up before DMA starts.
+    v_ctr: u32
+    // The channel that will finish next
     dma_pong: u32
     frame_count: u32
+    // Line numbers handed to the renderer, a single producer single
+    // consumer queue written by the interrupt
+    queue_rd: u32
+    queue_wr: u32
+    queue: [u32; QUEUE_SIZE]
 }
 
 static mut dvi: Dvi
@@ -67,8 +171,8 @@ fn start() {
     bl configure_clk_ref
     bl configure_clk_sys2
 
-    // release reset for IO_BANK0 and PADS_BANK0
-    mask @r0 = (1 << 6) | (1 << 9)
+    // release reset for BUSCTRL, IO_BANK0 and PADS_BANK0
+    mask @r0 = (1 << 1) | (1 << 6) | (1 << 9)
     bl reset
 
     // set up pad: 4mA, pull-down, Schmitt input
@@ -89,6 +193,13 @@ fn start() {
     led_mask @r1 = 1 << 7
     sio.GPIO_OE_SET = led_mask
 
+    // DMA gets priority on the bus, so the CPU can't starve HSTX
+    busctrl @r0 = peripherals.BUSCTRL
+    priority @r1 = (1 << 8) | (1 << 12)
+    busctrl.BUS_PRIORITY = priority
+
+    bl dvi_init
+
     bl configure_clk_hstx
     // release reset for DMA and HSTX
     mask @r0 = (1 << 2) | (1 << 3)
@@ -100,21 +211,108 @@ fn start() {
     cpsie(i)
 
     // unmask DMA_IRQ_0
-    nvic_iser0 @r2 = 0xe000e100
+    nvic_iser0 @r2 = &peripherals.PPB.NVIC_ISER0
     irq @r3 = 1 << 10
     *nvic_iser0 = irq
 
     // start channel 0
-    multi_chan_trigger @r2 = 0x50000450
+    dma @r2 = peripherals.DMA
     chan @r3 = 1
-    *multi_chan_trigger = chan
+    dma.MULTI_CHAN_TRIGGER = chan
 
     loop {
-        delay @r2 = 3_000_000
-        loop {
-            #(delay -= 1)
-            if #ne goto loop
-        }
+        bl dvi_get_line
+        y @r0 = r0
+        pixels @r1 = r1
+        bl render_line
+        bl dvi_release_line
+        goto loop
+    }
+}
+
+// Fill a line with a test pattern: red increases down the screen, blue
+// decreases, and green ramps up every 128 lines. y is preserved, for
+// dvi_release_line.
+fn render_line(y: u32, pixels: *u32) {
+    push(r4, r5, r6, r7)
+    red @r4 = y >> 4
+    c @r5 = red << 10
+    // green before blue, so the shifted orr's result isn't needed by the
+    // next instruction
+    green @r6 = y[2..7]
+    c |= green << 5
+    blue @r6 = red ^ 31
+    c |= blue
+    // two pixels per word; pkhbt takes one cycle, orr with a shift two
+    c = pkhbt(c, c << 16)
+    c0 @r4 = c
+    c2 @r6 = c
+    c3 @r7 = c
+    n @r2 = H_ACTIVE / 8
+    loop {
+        // decrement first, so the flags are ready for the branch
+        #(n -= 1)
+        *pixels = (c0, c, c2, c3); pixels += 16
+        if #ne goto loop
+    }
+    pop(r4, r5, r6, r7)
+    bx lr
+}
+
+// Store the HSTX command at the start of each line buffer, and set the
+// line counter.
+fn dvi_init() {
+    lines @r0 = &video_lines
+    cmd @r1 = HSTX_TMDS | H_ACTIVE
+    *lines = cmd
+    *(lines + LINE_BYTES) = cmd
+    p @r0 = &dvi
+    one @r1 = 1
+    p.v_ctr = one
+    bx lr
+}
+
+// Wait for the next line to render. Returns its number y in r0 and a
+// pointer to its pixels in r1, which belong to the caller until
+// dvi_release_line(y).
+fn dvi_get_line() {
+    p @r3 = &dvi
+    rd @r0 = p.queue_rd
+    loop {
+        wr @r1 = p.queue_wr
+        #(rd - wr)
+        if #ne goto end
+        // The interrupt that fills the queue does sev, so a push between
+        // the check and the wfe isn't missed.
+        wfe
+        goto loop
+    }
+    queue @r1 = &p.queue
+    y @r2 = *(queue + rd * 4)
+    rd += 1
+    rd &= QUEUE_SIZE - 1
+    p.queue_rd = rd
+    ptrs @r1 = &line_ptrs
+    ix @r0 = y & 1
+    pixels @r1 = *(ptrs + ix * 4)
+    // skip the HSTX command
+    pixels += 4
+    y_out @r0 = y
+    bx lr
+}
+
+// Give line y's buffer back, for the interrupt to send.
+fn dvi_release_line(y: u32) {
+    p @r1 = &dvi
+    ix @r0 = y & 1
+    line @r1 = (p + ix * 8) as *LineState
+    zero @r2 = 0
+    line.lent = zero
+    bx lr
+}
+
+fn default_handler() {
+    loop {
         goto loop
     }
 }
@@ -257,12 +455,6 @@ fn assert_reset(mask: u32) {
     bx lr
 }
 
-fn default_handler() {
-    loop {
-        goto loop
-    }
-}
-
 fn configure_clk_hstx() {
     clocks @r0 = peripherals.CLOCKS
     ctrl @r1 = clocks.CLK_HSTX_CTRL
@@ -322,86 +514,125 @@ fn setup_hstx() {
 
 fn setup_dma() {
     ch @r0 = peripherals.DMA as *DmaChannel
-    chain_to @r2 = 1 << 13
-    loop {
-        read_addr @r1 = blank_line_vsync_off
-        ch.read_addr = read_addr
-        // hstx fifo
-        write_addr @r1 = 0x50600004
-        ch.write_addr = write_addr
-        // length of blank line
-        trans_count @r1 = 7
-        ch.trans_count = trans_count
-        ctrl @r1 = 0x680019
-        ctrl += chain_to
-        chain_to = 0
-        ch.al1_ctrl = ctrl
+    hstx_fifo @r1 = &peripherals.HSTX_FIFO.FIFO
+    // 32 bit transfers, incrementing the read address, paced by HSTX
+    // (DREQ 52), enabled
+    ctrl @r2 = 0x680019
 
-        ch += 0x40
-        // carry is set after the second channel, when ch is DMA_BASE + 0x80
-        #(tmp @r1 = ch >> 8)
-        if #cc goto loop
-    }
+    // channel 0 starts with line 0's sync pulse and chains to channel 1
+    cmds @r3 = &sync_pulse_vsync_off
+    ch.read_addr = cmds
+    ch.write_addr = hstx_fifo
+    len @r3 = count(sync_pulse_vsync_off)
+    ch.trans_count = len
+    chain @r3 = ctrl | (1 << 13)
+    ch.al1_ctrl = chain
+
+    // channel 1 starts with line 0's blanking and chains to channel 0
+    ch += 0x40
+    cmds @r3 = &line_only_vsync_off
+    ch.read_addr = cmds
+    ch.write_addr = hstx_fifo
+    len @r3 = count(line_only_vsync_off)
+    ch.trans_count = len
+    ch.al1_ctrl = ctrl
+
+    dma @r0 = peripherals.DMA
     irqs @r1 = 3
-    // ints0
-    *(ch + (0x40c - 0x80)) = irqs
-    // inte0
-    *(ch + (0x404 - 0x80)) = irqs
+    dma.INTS0 = irqs
+    dma.INTE0 = irqs
     bx lr
 }
 
-// The original places this in .ram; for now it runs from flash.
+// Runs from RAM, so flash access can't delay it.
+#[link_section = ".ram"]
 fn dma_irq_0_handler() {
-    push(r0, r1, r2, r3, lr)
-
     p @r0 = &dvi
     pong @r1 = p.dma_pong
-    next_pong @r2 = pong ^ 1
-    p.dma_pong = next_pong
+    next @r2 = pong ^ 1
+    p.dma_pong = next
     dma @r2 = peripherals.DMA
     bit @r3 = 1
     bit <<= pong
-    // clear interrupt
     dma.INTR = bit
     // the channel that just finished
     ch @r2 = (dma + (pong << 6)) as *DmaChannel
-    line @r1 = p.v_scanline
-    // front porch
-    #(line -= 10)
-    if {
-        if #hs goto else
-    vsync_off:
-        cmd @r1 = blank_line_vsync_off
-        cmd_len @r3 = 7
-        goto end
-    } else {
-        // sync
-        #(line -= 3)
-        if {
-            if #hs goto else
-            cmd @r1 = blank_line_vsync_on
-            cmd_len @r3 = 7
-            goto end
-        } else {
-            // back porch
-            #(line -= 33)
-            if #lo goto vsync_off
-            cmd @r1 = line_active
-            cmd_len @r3 = 9
-        }
-    }
-    ch.read_addr = cmd
-    ch.trans_count = cmd_len
+    v @r3 = p.v_ctr
+    if pong != 0 goto line_done
 
-    scanline @r1 = p.v_scanline
-    scanline += 1
-    #(scanline - 524)
-    if #hi {
-        scanline = 0
-    }
-    p.v_scanline = scanline
+    // Channel 0 finished line v - 1's sync pulse; set up line v's.
+    cmds @r1 = &sync_pulse_vsync_off
+    #(v - V_SYNC_START)
+    if #lo goto set_sync
+    #(v - V_SYNC_END)
+    if #hs goto set_sync
+    cmds = &sync_pulse_vsync_on
+set_sync:
+    ch.read_addr = cmds
+    len @r1 = count(sync_pulse_vsync_off)
+    ch.trans_count = len
+    bx lr
+
+    // Channel 1 finished line v - 1's content; set up line v's.
+line_done:
+    #(y @r1 = v - V_ACTIVE_START)
+    if #lo goto blank
+    ix @r1 = y & 1
+    line @r12 = (p + ix * 8) as *LineState
+    l @r0 = line.lent
+    m @r12 = line.missed
+    l |= m
+    if l != 0 goto error
+    ptrs @r0 = &line_ptrs
+    cmds @r0 = *(ptrs + ix * 4)
+    len @r1 = LINE_WORDS
+    goto set_line
+error:
+    cmds @r0 = &err_line
+    len @r1 = count(err_line)
+    goto set_line
+blank:
+    cmds @r0 = &line_only_vsync_off
+    #(v - V_SYNC_START)
+    if #lo goto blank_set
+    #(v - V_SYNC_END)
+    if #hs goto blank_set
+    cmds = &line_only_vsync_on
+blank_set:
+    len @r1 = count(line_only_vsync_off)
+set_line:
+    ch.read_addr = cmds
+    ch.trans_count = len
+
+    // Lend line v + 1's buffer to the renderer, unless it's still lent
+    // from two lines ago, in which case that line shows err_line.
+    p @r0 = &dvi
+    #(y @r1 = v - (V_ACTIVE_START - 1))
+    if #lo goto advance
+    #(y - V_ACTIVE)
+    if #hs goto advance
+    ix @r2 = y & 1
+    line @r12 = (p + ix * 8) as *LineState
+    l @r2 = line.lent
+    line.missed = l
+    if l != 0 goto advance
+    one @r2 = 1
+    line.lent = one
+    wr @r2 = p.queue_wr
+    queue @r12 = &p.queue
+    *(queue + wr * 4) = y
+    wr += 1
+    wr &= QUEUE_SIZE - 1
+    p.queue_wr = wr
+    sev
+
+advance:
+    v += 1
+    // cmp can't encode V_TOTAL (525), but it can encode 524
+    #(v - (V_TOTAL - 1))
     if {
         if #ls goto end
+        v = 0
         frame @r1 = p.frame_count
         frame += 1
         #(frame - 30)
@@ -409,10 +640,11 @@ fn dma_irq_0_handler() {
             if #ne goto end
             frame = 0
             sio @r2 = peripherals.SIO
-            led_mask @r3 = 1 << 7
+            led_mask @r12 = 1 << 7
             sio.GPIO_OUT_XOR = led_mask
         }
         p.frame_count = frame
     }
-    pop(r0, r1, r2, r3, pc)
+    p.v_ctr = v
+    bx lr
 }
