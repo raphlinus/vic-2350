@@ -40,20 +40,22 @@ fn start() {
     src @r0 = _data_source
     dst @r1 = _data_start
     count @r2 = lower16(_data_size_words)
-data_loop:
-    #(count -= 1)
-    val @r3 = *src; src += 4
-    *dst = val; dst += 4
-    bne data_loop
+    loop {
+        #(count -= 1)
+        val @r3 = *src; src += 4
+        *dst = val; dst += 4
+        if #ne goto loop
+    }
 
     // count is zero after the loop
     zero @r2 = count // elided
     count @r1 = lower16(_bss_size_words)
     dst @r0 = _bss_start
-bss_loop:
-    #(count -= 1)
-    *dst = zero; dst += 4
-    bne bss_loop
+    loop {
+        #(count -= 1)
+        *dst = zero; dst += 4
+        if #ne goto loop
+    }
 
     // reset DMA and HSTX
     mask @r0 = (1 << 2) | (1 << 3)
@@ -107,12 +109,14 @@ bss_loop:
     chan @r3 = 1
     *multi_chan_trigger = chan
 
-idle_loop:
-    delay @r2 = 3_000_000
-delay_loop:
-    #(delay -= 1)
-    bne delay_loop
-    b idle_loop
+    loop {
+        delay @r2 = 3_000_000
+        loop {
+            #(delay -= 1)
+            if #ne goto loop
+        }
+        goto loop
+    }
 }
 
 fn init_xosc() {
@@ -128,10 +132,11 @@ fn init_xosc() {
     ctrl[0..24] = ctrl_val
     xosc.CTRL = ctrl
     // wait for stable bit
-xosc_wait:
-    status @r1 = xosc.STATUS
-    #(status & status)
-    bpl xosc_wait
+    loop {
+        status @r1 = xosc.STATUS
+        #(status & status)
+        if #pl goto loop
+    }
     bx lr
 }
 
@@ -150,10 +155,11 @@ fn init_pll() {
     pwr_clear @r3 = 0x3000 + 0x4
     *(pll + pwr_clear) = pwr_bits
     // wait for lock
-pll_wait:
-    cs @r1 = pll.CS
-    #(cs & cs)
-    bpl pll_wait
+    loop {
+        cs @r1 = pll.CS
+        #(cs & cs)
+        if #pl goto loop
+    }
     // 1512 / (2 * 6) = 126 MHz
     prim @r1 = pll.PRIM
     postdiv2 @r2 = 2
@@ -175,11 +181,12 @@ fn configure_clk_ref() {
     ctrl[0..2] = src
     clocks.CLK_REF_CTRL = ctrl
     // wait for xosc to get selected
-clk_ref_wait:
-    selected @r1 = clocks.CLK_REF_SELECTED
-    selected = selected[0..4]
-    #(selected - 4)
-    bne clk_ref_wait
+    loop {
+        selected @r1 = clocks.CLK_REF_SELECTED
+        selected = selected[0..4]
+        #(selected - 4)
+        if #ne goto loop
+    }
     bx lr
 }
 
@@ -191,21 +198,23 @@ fn configure_clk_sys1() {
     sys_ctrl_clear @r2 = 0x3000 + 0x3c
     *(clocks + sys_ctrl_clear) = one
     // wait for REF to get selected
-clk_sys1_wait_ref:
-    selected @r3 = clocks.CLK_SYS_SELECTED
-    #(selected >>= 1)
-    bcc clk_sys1_wait_ref
+    loop {
+        selected @r3 = clocks.CLK_SYS_SELECTED
+        #(selected >>= 1)
+        if #cc goto loop
+    }
 
     ctrl @r1 = clocks.CLK_REF_CTRL
     zero @r2 = 0
     ctrl[0..2] = zero
     clocks.CLK_REF_CTRL = ctrl
     // wait for rosc to get selected
-clk_sys1_wait_rosc:
-    selected @r1 = clocks.CLK_REF_SELECTED
-    selected = selected[0..4]
-    #(selected - 1)
-    bne clk_sys1_wait_rosc
+    loop {
+        selected @r1 = clocks.CLK_REF_SELECTED
+        selected = selected[0..4]
+        #(selected - 1)
+        if #ne goto loop
+    }
     bx lr
 }
 
@@ -220,10 +229,11 @@ fn configure_clk_sys2() {
     ctrl[0..1] = one
     clocks.CLK_SYS_CTRL = ctrl
     // wait for AUX to get selected
-clk_sys2_wait:
-    selected @r1 = clocks.CLK_SYS_SELECTED
-    #(selected >>= 2)
-    bcc clk_sys2_wait
+    loop {
+        selected @r1 = clocks.CLK_SYS_SELECTED
+        #(selected >>= 2)
+        if #cc goto loop
+    }
     bx lr
 }
 
@@ -232,10 +242,11 @@ fn reset(mask: u32) {
     resets @r1 = peripherals.RESETS
     atomic_clear @r2 = 0x3000
     *(resets + atomic_clear) = mask
-reset_wait:
-    status @r2 = resets.RESET_DONE
-    #(_ @r2 = mask & !status)
-    bne reset_wait
+    loop {
+        status @r2 = resets.RESET_DONE
+        #(_ @r2 = mask & !status)
+        if #ne goto loop
+    }
     bx lr
 }
 
@@ -247,8 +258,9 @@ fn assert_reset(mask: u32) {
 }
 
 fn default_handler() {
-hang:
-    b hang
+    loop {
+        goto loop
+    }
 }
 
 fn configure_clk_hstx() {
@@ -295,39 +307,41 @@ fn setup_hstx() {
     // pin 12 = 8 * 12 + 4 - 8
     ctrl_offset @r2 = 92
     pad @r3 = 0x40038000 + 4 + 4 * 12
-hstx_pin_loop:
-    ctrl_offset += 8
-    function @r1 = 0
-    *(io_bank0 + ctrl_offset) = function
-    pad_config @r1 = 0x16
-    // pin 20 = 8 * 20 + 4 - 8
-    #(ctrl_offset - 156)
-    *pad = pad_config; pad += 4
-    bne hstx_pin_loop
+    loop {
+        ctrl_offset += 8
+        function @r1 = 0
+        *(io_bank0 + ctrl_offset) = function
+        pad_config @r1 = 0x16
+        // pin 20 = 8 * 20 + 4 - 8
+        #(ctrl_offset - 156)
+        *pad = pad_config; pad += 4
+        if #ne goto loop
+    }
     bx lr
 }
 
 fn setup_dma() {
     ch @r0 = peripherals.DMA as *DmaChannel
     chain_to @r2 = 1 << 13
-dma_ch_loop:
-    read_addr @r1 = blank_line_vsync_off
-    ch.read_addr = read_addr
-    // hstx fifo
-    write_addr @r1 = 0x50600004
-    ch.write_addr = write_addr
-    // length of blank line
-    trans_count @r1 = 7
-    ch.trans_count = trans_count
-    ctrl @r1 = 0x680019
-    ctrl += chain_to
-    chain_to = 0
-    ch.al1_ctrl = ctrl
+    loop {
+        read_addr @r1 = blank_line_vsync_off
+        ch.read_addr = read_addr
+        // hstx fifo
+        write_addr @r1 = 0x50600004
+        ch.write_addr = write_addr
+        // length of blank line
+        trans_count @r1 = 7
+        ch.trans_count = trans_count
+        ctrl @r1 = 0x680019
+        ctrl += chain_to
+        chain_to = 0
+        ch.al1_ctrl = ctrl
 
-    ch += 0x40
-    // carry is set after the second channel, when ch is DMA_BASE + 0x80
-    #(tmp @r1 = ch >> 8)
-    bcc dma_ch_loop
+        ch += 0x40
+        // carry is set after the second channel, when ch is DMA_BASE + 0x80
+        #(tmp @r1 = ch >> 8)
+        if #cc goto loop
+    }
     irqs @r1 = 3
     // ints0
     *(ch + (0x40c - 0x80)) = irqs
@@ -354,25 +368,28 @@ fn dma_irq_0_handler() {
     line @r1 = p.v_scanline
     // front porch
     #(line -= 10)
-    bhs irq_not_front_porch
-irq_vsync_off:
-    cmd @r1 = blank_line_vsync_off
-    cmd_len @r3 = 7
-    b irq_set_cmd
-irq_not_front_porch:
-    // sync
-    #(line -= 3)
-    bhs irq_not_sync
-    cmd @r1 = blank_line_vsync_on
-    cmd_len @r3 = 7
-    b irq_set_cmd
-irq_not_sync:
-    // back porch
-    #(line -= 33)
-    blo irq_vsync_off
-    cmd @r1 = line_active
-    cmd_len @r3 = 9
-irq_set_cmd:
+    if {
+        if #hs goto else
+    vsync_off:
+        cmd @r1 = blank_line_vsync_off
+        cmd_len @r3 = 7
+        goto end
+    } else {
+        // sync
+        #(line -= 3)
+        if {
+            if #hs goto else
+            cmd @r1 = blank_line_vsync_on
+            cmd_len @r3 = 7
+            goto end
+        } else {
+            // back porch
+            #(line -= 33)
+            if #lo goto vsync_off
+            cmd @r1 = line_active
+            cmd_len @r3 = 9
+        }
+    }
     ch.read_addr = cmd
     ch.trans_count = cmd_len
 
@@ -383,18 +400,19 @@ irq_set_cmd:
         scanline = 0
     }
     p.v_scanline = scanline
-    bls irq_done
-    frame @r1 = p.frame_count
-    frame += 1
-    #(frame - 30)
-    bne irq_store_frame
-    frame = 0
-
-    sio @r2 = peripherals.SIO
-    led_mask @r3 = 1 << 7
-    sio.GPIO_OUT_XOR = led_mask
-irq_store_frame:
-    p.frame_count = frame
-irq_done:
+    if {
+        if #ls goto end
+        frame @r1 = p.frame_count
+        frame += 1
+        #(frame - 30)
+        if {
+            if #ne goto end
+            frame = 0
+            sio @r2 = peripherals.SIO
+            led_mask @r3 = 1 << 7
+            sio.GPIO_OUT_XOR = led_mask
+        }
+        p.frame_count = frame
+    }
     pop(r0, r1, r2, r3, pc)
 }
