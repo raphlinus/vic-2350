@@ -1,0 +1,17 @@
+[package]
+name = "fill-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cortex-m = "0.7.7"
+cortex-m-rt = "0.7.3"
+rp235x-hal = { version = "0.2.0", features = ["critical-section-impl"] }
+usb-device = "0.3.2"
+usbd-serial = "0.2.2"
+heapless = "0.8.0"
+panic-halt = "0.2.0"
+embedded-hal = "0.2.7"
+
+[profile.release]
+debug = true
