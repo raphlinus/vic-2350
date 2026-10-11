@@ -146,8 +146,8 @@ fn start() {
     count @r2 = lower16(_data_size_words)
     loop {
         #(count -= 1)
-        val @r3 = *src; src += 4
-        *dst = val; dst += 4
+        val @r3 = *src++
+        *dst++ = val
         if #ne goto loop
     }
 
@@ -157,7 +157,7 @@ fn start() {
     dst @r0 = _bss_start
     loop {
         #(count -= 1)
-        *dst = zero; dst += 4
+        *dst++ = zero
         if #ne goto loop
     }
 
@@ -252,10 +252,59 @@ fn render_line(y: u32, pixels: *u32) {
     loop {
         // decrement first, so the flags are ready for the branch
         #(n -= 1)
-        *pixels = (c0, c, c2, c3); pixels += 16
+        *pixels++ = (c0, c, c2, c3)
         if #ne goto loop
     }
     pop(r4, r5, r6, r7)
+    bx lr
+}
+
+// Fill count 16 bit pixels at dst with color. 0.75 cycles per pixel in
+// the main loop.
+fn fill_16(dst: *u16, color: u32, count: u32) {
+    // bit 1 of dst to carry: if it's set, store one pixel to align
+    #(_ @r3 = dst >> 2)
+    if #cs {
+        count -= 1
+        *dst++ = color
+    }
+    // word aligned from here; the move is elided
+    dst32 @r0 = dst as *u32
+    // whole words to store; the odd pixel is in carry, until finish
+    #(words @r3 = count >> 1)
+    if #eq goto finish
+    color = pkhbt(color, color << 16)
+    #(words -= 2)
+    *dst32++ = color
+    if #lo goto finish
+    *dst32++ = color
+    if #eq goto finish
+    #(words >>= 1)
+    *dst32++ = color
+    if #eq goto finish
+    if #cs {
+        *dst32++ = color
+    }
+    #(words -= 2)
+    *dst32++ = color
+    if #lo goto finish
+    *dst32++ = color
+    *dst32++ = color
+    if #eq goto finish
+    loop {
+        #(words -= 2)
+        *dst32++ = color
+        *dst32++ = color
+        if #lo goto finish
+        *dst32++ = color
+        *dst32++ = color
+        if #ne goto loop
+    }
+finish:
+    #(count >>= 1)
+    if #cs {
+        *(dst32 as *u16) = color
+    }
     bx lr
 }
 
