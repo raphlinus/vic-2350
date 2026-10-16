@@ -1,0 +1,59 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+// A really tiny bitmap allocator, suitable for renderer temporaries.
+
+const N_BLOCKS = 16
+const LOG_BLOCK_SIZE = 7
+const BLOCK_SIZE = 1 << LOG_BLOCK_SIZE
+static mut pico_free_mask: u32 = (1 << N_BLOCKS) - 1
+static mut pico_heap: [u32; N_BLOCKS * BLOCK_SIZE / 4]
+
+// Assumes size != 0
+fn pico_alloc(size: u32) {
+    pfree @r1 = &pico_free_mask
+    size -= 1
+    mask @r3 = 1
+    #(size >>= LOG_BLOCK_SIZE)
+    free @r2 = *pfree
+    if {
+        if #eq goto end
+        mask = 2
+        mask <<= size
+        mask -= 1
+        loop {
+            #(size -= 1)
+            free &= free >> 1
+            if #ne goto loop
+        }
+    }
+    if {
+        if free == 0 goto end
+        free = rbit(free)
+        ix @r2 = clz(free)
+        free @r0 = *pfree
+        mask <<= ix
+        free &= !mask
+        heap @r3 = &pico_heap
+        *pfree = free
+        addr @r0 = heap + (ix << LOG_BLOCK_SIZE)
+    }
+    bx lr
+}
+
+fn pico_free(p: *u8, size: u32) {
+    heap @r2 = &pico_heap
+    size -= 1
+    size >>= LOG_BLOCK_SIZE
+    p -= heap
+    ix @r0 = p >> LOG_BLOCK_SIZE
+    mask @r3 = 2
+    mask <<= size
+    mask -= 1
+    pfree @r2 = &pico_free_mask
+    mask <<= ix
+    free @r1 = *pfree
+    free |= mask
+    *pfree = free
+    bx lr
+}
