@@ -8,7 +8,7 @@ TILESET=${TILESET:-$HOME/Downloads/dandelion_tileset.png}
 
 python3 tools/tiles.py "$TILESET" > tiles.sy
 
-cargo run -q --manifest-path "$SYMBOLASM/Cargo.toml" -- main.sy tiles.sy --svd "$SVD" > main.s
+cargo run -q --manifest-path "$SYMBOLASM/Cargo.toml" -- main.sy render.sy colorbars.sy pico_alloc.sy --svd "$SVD" > main.s
 cargo run -q --manifest-path "$SYMBOLASM/Cargo.toml" -- fill.sy > fill.s
 arm-none-eabi-as -mcpu=cortex-m33 -o main.o main.s
 arm-none-eabi-as -mcpu=cortex-m33 -o fill.o fill.s

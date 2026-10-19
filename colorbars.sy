@@ -1,0 +1,52 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+// The colorbars scene from pico-dvi-rs (without the text row), as a
+// static display list in y0 order.
+
+const N_COLORBARS = 22
+
+#[link_section = ".ram"]
+static colorbars: [Solid; N_COLORBARS] = [
+    Solid { vtable: &solid_vtable, x0: 0, y0: 0, x1: 92, y1: 320, color: 0x6318 },
+    Solid { vtable: &solid_vtable, x0: 92, y0: 0, x1: 182, y1: 320, color: 0x6300 },
+    Solid { vtable: &solid_vtable, x0: 182, y0: 0, x1: 274, y1: 320, color: 0x0318 },
+    Solid { vtable: &solid_vtable, x0: 274, y0: 0, x1: 366, y1: 320, color: 0x0300 },
+    Solid { vtable: &solid_vtable, x0: 366, y0: 0, x1: 458, y1: 320, color: 0x6018 },
+    Solid { vtable: &solid_vtable, x0: 458, y0: 0, x1: 548, y1: 320, color: 0x6000 },
+    Solid { vtable: &solid_vtable, x0: 548, y0: 0, x1: 640, y1: 320, color: 0x0018 },
+    Solid { vtable: &solid_vtable, x0: 0, y0: 320, x1: 92, y1: 360, color: 0x0018 },
+    Solid { vtable: &solid_vtable, x0: 92, y0: 320, x1: 182, y1: 360, color: 0x0842 },
+    Solid { vtable: &solid_vtable, x0: 182, y0: 320, x1: 274, y1: 360, color: 0x6018 },
+    Solid { vtable: &solid_vtable, x0: 274, y0: 320, x1: 366, y1: 360, color: 0x0842 },
+    Solid { vtable: &solid_vtable, x0: 366, y0: 320, x1: 458, y1: 360, color: 0x0318 },
+    Solid { vtable: &solid_vtable, x0: 458, y0: 320, x1: 548, y1: 360, color: 0x0842 },
+    Solid { vtable: &solid_vtable, x0: 548, y0: 320, x1: 640, y1: 360, color: 0x6318 },
+    Solid { vtable: &solid_vtable, x0: 0, y0: 360, x1: 114, y1: 480, color: 0x0089 },
+    Solid { vtable: &solid_vtable, x0: 114, y0: 360, x1: 228, y1: 480, color: 0x7fff },
+    Solid { vtable: &solid_vtable, x0: 228, y0: 360, x1: 342, y1: 480, color: 0x180d },
+    Solid { vtable: &solid_vtable, x0: 342, y0: 360, x1: 458, y1: 480, color: 0x0842 },
+    Solid { vtable: &solid_vtable, x0: 458, y0: 360, x1: 488, y1: 480, color: 0x0421 },
+    Solid { vtable: &solid_vtable, x0: 488, y0: 360, x1: 518, y1: 480, color: 0x0842 },
+    Solid { vtable: &solid_vtable, x0: 518, y0: 360, x1: 548, y1: 480, color: 0x0c63 },
+    Solid { vtable: &solid_vtable, x0: 548, y0: 360, x1: 640, y1: 480, color: 0x0842 },
+]
+
+// Word offsets of the objects in colorbars
+#[link_section = ".ram"]
+static colorbar_heads: [u32; N_COLORBARS] = [
+    0, 4, 8, 12, 16, 20, 24, 28,
+    32, 36, 40, 44, 48, 52, 56, 60,
+    64, 68, 72, 76, 80, 84,
+]
+
+fn colorbars_init() {
+    r @r0 = &render_state
+    payload @r1 = &colorbars
+    r.display_payload = payload
+    heads @r1 = &colorbar_heads
+    r.display_heads = heads
+    count @r1 = N_COLORBARS
+    r.display_count = count
+    goto render_init
+}

@@ -1,0 +1,230 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+// The main renderer
+
+struct RenderState {
+    display_payload: *u32
+    display_heads: *u32
+    display_count: u32
+    y: u32
+    display_head_ix: u32
+    active: *ActiveEntry
+    active_count: u32
+    active_scratch: *ActiveEntry
+}
+
+static mut render_state: RenderState
+
+struct DisplayObj {
+    vtable: *DisplayVtable
+    x0: u16
+    y0: u16
+    x1: u16
+    y1: u16
+    scratch: u32 // optional, only if vtable.start != 0
+}
+
+// These are actually function pointers, but we haven't built out the types yet.
+struct DisplayVtable {
+    render: *u8
+    start: *u8
+}
+
+struct ActiveEntry {
+    obj: *DisplayObj
+}
+
+static mut active0: [ActiveEntry; 64]
+static mut active1: [ActiveEntry; 64]
+
+// to be called once before any rendering
+fn render_init() {
+    r @r0 = &render_state
+    minusone @r1 = -1
+    r.y = minusone
+    bx lr
+}
+
+#[link_section = ".ram"]
+fn render_line(y: u32, buf: *u16) {
+    push(buf, r4, r5, r6, r7, r8, r9, lr)
+    r @r2 = &render_state
+    r_y @r3 = r.y
+    #(y - r_y)
+    // A case we have to handle eventually is when y is ahead of r_y. This happens when
+    // we miss the frame timing budget.
+    //
+    // For the time being, we *assume* this function is called with y starting at 0
+    // and incrementing by 1 each scan line
+    if {
+        if #hs goto end
+        push(y)
+        bl pico_reset
+        r @r2 = &render_state
+        a0 @r0 = &active0
+        r.active = a0
+        a1 @r0 = &active1
+        r.active_scratch = a1
+        zero @r0 = 0
+        r.active_count = zero
+        r.display_head_ix = zero
+        pop(y @r0)
+    }
+    ynext @r1 = y + 1
+    r.y = ynext
+
+    // update active list
+    // TODO: keep track of "next y event", skip if not at event
+    active_src @r1 = r.active
+    active_dst @r7 = r.active_scratch
+    active_count @r4 = r.active_count
+    ix @r12 = r.display_head_ix
+    end @r9 = r.display_count
+    display_heads @r8 = r.display_heads
+    display_payload @r2 = r.display_payload
+    loop {
+        // TODO: deal with overflow of active_dst
+        #(ix - end)
+        if {
+            if #eq goto else
+            obj_ix @r6 = *(display_heads + ix * 4)
+            obj @r5 = (display_payload + (obj_ix << 2)) as *DisplayObj
+            y0 @r6 = obj.y0
+            #(y - y0)
+            if #eq goto end
+        } else {
+            obj = -1
+        }
+        if {
+            if active_count == 0 goto end
+loop1:
+            loop {
+                active_obj @r3 = active_src.obj
+                y1 @r6 = active_obj.y1
+                #(y - y1)
+                if #ne goto break
+                vtable @r6 = active_obj.vtable
+                active_src += 4
+                // drop scratch alloc if vtable.start != 0
+                start @r6 = vtable.start
+                if {
+                    if start == 0 goto end
+                    push(y, active_src, display_payload, ix)
+                    buf @r0 = active_obj.scratch
+                    bl pico_free
+                    pop(y @r0, active_src @r1, display_payload @r2, ix @r12)
+                }
+                #(active_count -= 1)
+                if #ne goto loop
+                goto no_more_active
+            }
+            // have both active and (maybe) new obj, pick whichever is lower
+            #(obj - active_obj)
+            if {
+                if #hi goto else
+store_obj:
+                *active_dst++ = obj
+                ix += 1
+                goto loop
+            } else {
+                *active_dst++ = active_obj
+                active_src += 4
+                #(active_count -= 1)
+                if #ne goto loop1 // loop, but skip reloading obj
+            }
+        }
+no_more_active:
+        #(obj + 1)
+        if #ne goto store_obj
+    }
+
+    // iterate from display_head_ix to ix, calling start
+    r @r9 = &render_state
+    old_ix @r6 = r.display_head_ix
+    #(ix - old_ix)
+    if #eq goto starts_done
+    loop {
+        obj_ix @r5 = *(display_heads + old_ix * 4)
+        obj @r5 = (display_payload + (obj_ix << 2)) as *DisplayObj
+        vtable @r4 = obj.vtable
+        start @r4 = vtable.start
+        if {
+            if start == 0 goto end
+            push(y, display_payload, ix)
+            obj_arg @r0 = obj
+            blx start
+            bl pico_alloc
+            // should we deal with allocation failure here? We could make
+            // the draw object handle it.
+            obj.scratch = r0
+            pop(y @r0, display_payload @r2, ix @r12)
+        }
+        old_ix += 1
+        #(ix - old_ix)
+        if #ne goto loop
+    }
+starts_done:
+
+    active @r6 = r.active_scratch
+    r.display_head_ix = ix
+    active_count @r4 = active_dst - active
+    // swap active and scratch
+    active_count >>= 2
+    r.active_count = active_count
+    active_scratch @r5 = r.active
+    r.active = active
+    r.active_scratch = active_scratch
+    active_end @r7 = active_dst
+    y @r5 = y
+
+    // now actually run the rendering, taking another pass over active list
+    #(active - active_end)
+    if #eq goto done // this is a problem, it means unwritten output
+    loop {
+        active_obj @r0 = active.obj
+        active += 4
+        x0 @r2 = active_obj.x0
+        x1 @r4 = active_obj.x1
+        y_arg @r1 = y
+        x0x1 @r2 = pkhbt(x0, x1 << 16)
+        vtable @r4 = active_obj.vtable
+        buf @r3 = *sp // TODO: `sp.buf` or suchlike when we have stack placement
+        render @r4 = vtable.render
+        blx render
+
+        #(active - active_end)
+        if #ne goto loop
+    }
+done:
+
+    pop(r1, r4, r5, r6, r7, r8, r9, pc)
+}
+
+// solid color rendering
+
+struct Solid {
+    // should the first 5 elements be a `DrawBase` struct?
+    vtable: *DisplayVtable
+    x0: u16
+    y0: u16
+    x1: u16
+    y1: u16
+    color: u32
+}
+
+#[link_section = ".ram"]
+fn solid_render(self: *Solid, y: u32, x1x0: u32, buf: *u16) {
+    color @r1 = self.color
+    x0 @r0 = x1x0[0..16]
+    x1 @r2 = x1x0[16..32]
+    count @r2 = x1 - x0
+    dst @r0 = buf + x0 * 2
+    goto fill_16
+}
+
+#[link_section = ".ram"]
+static solid_vtable = DisplayVtable {
+    render: solid_render,
+    start: 0,
+}

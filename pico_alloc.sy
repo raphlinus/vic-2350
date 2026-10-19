@@ -6,18 +6,27 @@
 const N_BLOCKS = 16
 const LOG_BLOCK_SIZE = 7
 const BLOCK_SIZE = 1 << LOG_BLOCK_SIZE
-static mut pico_free_mask: u32 = (1 << N_BLOCKS) - 1
 static mut pico_heap: [u32; N_BLOCKS * BLOCK_SIZE / 4]
-static mut pico_masks: [u32; N_BLOCKS]
+// free mask is last
+static mut pico_masks: [u32; N_BLOCKS + 1]
+
+// Must be called before first allocation
+#[link_section = ".ram"]
+fn pico_reset() {
+    masks @r0 = &pico_masks
+    free @r1 = (1 << N_BLOCKS) - 1
+    *(masks + N_BLOCKS * 4) = free
+    bx lr
+}
 
 // Assumes size != 0
 #[link_section = ".ram"]
 fn pico_alloc(size: u32) {
-    pfree @r1 = &pico_free_mask
+    masks @r1 = &pico_masks
     size -= 1
     mask @r3 = 2
     #(size >>= LOG_BLOCK_SIZE)
-    free @r2 = *pfree
+    free @r2 = *(masks + N_BLOCKS * 4)
     if {
         if #eq goto end
         mask <<= size
@@ -32,12 +41,11 @@ fn pico_alloc(size: u32) {
         if free == 0 goto end
         free = rbit(free)
         ix @r2 = clz(free)
-        free @r0 = *pfree
+        free @r0 = *(masks + N_BLOCKS * 4)
         mask <<= ix
         free &= !mask
-        *pfree = free
-        masks @r0 = &pico_masks
-        heap @r1 = &pico_heap
+        *(masks + N_BLOCKS * 4) = free
+        heap @r0 = &pico_heap
         *(masks + ix * 4) = mask
         addr @r0 = heap + (ix << LOG_BLOCK_SIZE)
     }
@@ -47,13 +55,15 @@ fn pico_alloc(size: u32) {
 #[link_section = ".ram"]
 fn pico_free(p: *u8) {
     heap @r1 = &pico_heap
-    pfree @r3 = &pico_free_mask
-    p -= heap
-    ix @r0 = p >> LOG_BLOCK_SIZE
     masks @r2 = &pico_masks
-    free @r1 = *pfree
-    mask @r2 = *(masks + ix * 4)
-    free |= mask
-    *pfree = free
+    #(p -= heap)
+    if {
+        if #lo goto end
+        ix @r0 = p >> LOG_BLOCK_SIZE
+        free @r1 = *(masks + N_BLOCKS * 4)
+        mask @r3 = *(masks + ix * 4)
+        free |= mask
+        *(masks + N_BLOCKS * 4) = free
+    }
     bx lr
 }
