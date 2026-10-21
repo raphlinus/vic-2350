@@ -40,7 +40,7 @@ static colorbar_heads: [u32; N_COLORBARS] = [
     64, 68, 72, 76, 80, 84,
 ]
 
-fn colorbars_init() {
+fn demo_init() {
     r @r0 = &render_state
     payload @r1 = &colorbars
     r.display_payload = payload
@@ -49,4 +49,9 @@ fn colorbars_init() {
     count @r1 = N_COLORBARS
     r.display_count = count
     goto render_init
+}
+
+#[link_section = ".ram"]
+fn demo_line(y: u32, pixels: *u16) {
+    goto render_line
 }

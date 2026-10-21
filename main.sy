@@ -7,8 +7,10 @@
 // either blanking or a line of pixels. A DMA interrupt reprograms the
 // channel that just finished, and hands line buffers to the renderer, which
 // runs in thread mode and gets them with dvi_get_line. This follows the
-// main branch of pico-dvi-rs, without audio. The renderer draws a 640x480
-// image, from the image branch. The LED toggles every 30 frames.
+// main branch of pico-dvi-rs, without audio. Each demo is its own binary,
+// and provides demo_init, called once before DMA starts, and
+// demo_line(y, pixels), which draws a line. The LED toggles every 30
+// frames.
 
 // The .image_def and .vectors are in startup.s.
 
@@ -206,6 +208,7 @@ fn start() {
     mask @r0 = (1 << 2) | (1 << 3)
     bl reset
     bl setup_hstx
+    bl demo_init
     bl setup_dma
 
     // enable interrupts globally
@@ -226,7 +229,7 @@ fn start() {
         y @r0 = r0
         pixels @r1 = r1
         push(y)
-        bl render_line_image
+        bl demo_line
         pop(y @r0)
         bl dvi_release_line
         goto loop

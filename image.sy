@@ -12,10 +12,14 @@ const IMAGE_PALETTE = 4
 const IMAGE_LINES = 256 * 4
 const IMAGE_STRIDE = 4 + H_ACTIVE / 2
 
+fn demo_init() {
+    bx lr
+}
+
 // Decode line y of the image. Each pair is the previous pair's right pixel,
 // doubled, plus its delta.
 #[link_section = ".ram"]
-fn render_line_image(y: u32, pixels: *u32) {
+fn demo_line(y: u32, pixels: *u32) {
     push(r4, r5)
     stride @r3 = IMAGE_STRIDE
     pal @r12 = image_data as u32

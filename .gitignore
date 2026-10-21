@@ -1,5 +1,4 @@
 *.elf
 *.o
-main.s
-fill.s
+build/
 tiles.sy
