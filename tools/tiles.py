@@ -10,7 +10,7 @@ Tiles are 4 bits per pixel, the left pixel of each pair in the low
 nibble, 8 bytes per row, 128 bytes per tile. Each tile uses one of a
 few 16 color palettes, where index 0 is transparent and shows the
 background color. Each palette is expanded to the 1 KB fast form: for
-every byte, two RGB555 pixels in one word, the left in the low half.
+every byte, two RGB565 pixels in one word, the left in the low half.
 
 The screen map covers 640x480 with the tileset repeated, each entry a
 pointer to the tile's data and a pointer to its fast palette. Empty
@@ -65,9 +65,9 @@ def read_png_rgba(path):
     return w, h, rows
 
 
-def rgb555(c):
+def rgb565(c):
     r, g, b = c[:3]
-    return (b >> 3) | ((g & 0xF8) << 2) | ((r & 0xF8) << 7)
+    return (b >> 3) | ((g & 0xFC) << 3) | ((r & 0xF8) << 8)
 
 
 def main():
@@ -127,12 +127,12 @@ def main():
         out.write("    " + ", ".join(f"0x{v:08x}" for v in words[i : i + 8]) + ",\n")
     out.write("]\n\n")
 
-    bg = rgb555(BACKGROUND)
+    bg = rgb565(BACKGROUND)
     fast = []
     for pal in palettes:
-        cols = [bg] + [rgb555(c) for c in pal] + [bg] * (15 - len(pal))
+        cols = [bg] + [rgb565(c) for c in pal] + [bg] * (15 - len(pal))
         fast += [cols[b & 15] | (cols[b >> 4] << 16) for b in range(256)]
-    out.write(f"// 1 KB fast palettes: byte to two RGB555 pixels, left in the low half\n#[link_section = \".data\"]\nstatic palettes: [u32; {len(fast)}] = [\n")
+    out.write(f"// 1 KB fast palettes: byte to two RGB565 pixels, left in the low half\n#[link_section = \".data\"]\nstatic palettes: [u32; {len(fast)}] = [\n")
     for i in range(0, len(fast), 8):
         out.write("    " + ", ".join(f"0x{v:08x}" for v in fast[i : i + 8]) + ",\n")
     out.write("]\n\n")

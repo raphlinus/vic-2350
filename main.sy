@@ -7,8 +7,8 @@
 // either blanking or a line of pixels. A DMA interrupt reprograms the
 // channel that just finished, and hands line buffers to the renderer, which
 // runs in thread mode and gets them with dvi_get_line. This follows the
-// main branch of pico-dvi-rs, without audio. The renderer draws a colorbars
-// test image. The LED toggles every 30 frames.
+// main branch of pico-dvi-rs, without audio. The renderer draws a 640x480
+// image, from the image branch. The LED toggles every 30 frames.
 
 // The .image_def and .vectors are in startup.s.
 
@@ -87,8 +87,8 @@ static mut line_only_vsync_on: [u32; 11] = [
     SYNC_V0_H1, SYNC_V0_H1, SYNC_V0_H1, SYNC_V0_H1,
     SYNC_V0_H1, SYNC_V0_H1, SYNC_V0_H1, SYNC_V0_H1,
 ]
-// Red, in RGB555
-const ERR_PIXELS = 0x7c007c00
+// Red, in RGB565
+const ERR_PIXELS = 0xf800f800
 static mut err_line: [u32; 11] = [
     HSTX_TMDS_REPEAT | (H_ACTIVE - 2 * TAIL), ERR_PIXELS,
     HSTX_TMDS | (2 * TAIL),
@@ -96,7 +96,7 @@ static mut err_line: [u32; 11] = [
     ERR_PIXELS, ERR_PIXELS, ERR_PIXELS, ERR_PIXELS,
 ]
 
-// Two line buffers, each an HSTX command followed by 640 RGB555 pixels.
+// Two line buffers, each an HSTX command followed by 640 RGB565 pixels.
 // The command word is stored at startup.
 const LINE_WORDS = 1 + H_ACTIVE / 2
 const N_LINES = 2
@@ -206,7 +206,6 @@ fn start() {
     mask @r0 = (1 << 2) | (1 << 3)
     bl reset
     bl setup_hstx
-    bl colorbars_init
     bl setup_dma
 
     // enable interrupts globally
@@ -227,7 +226,7 @@ fn start() {
         y @r0 = r0
         pixels @r1 = r1
         push(y)
-        bl render_line
+        bl render_line_image
         pop(y @r0)
         bl dvi_release_line
         goto loop
@@ -272,10 +271,8 @@ fn dvi_get_line() {
     p.queue_rd = rd
     ix @r2 = y & 1
     stride @r3 = LINE_BYTES
-    // TODO: possibly use mla instruction
-    ix *= stride
     pixels @r1 = &video_lines + 4
-    pixels += ix
+    pixels += ix * stride
     y_out @r0 = y
     bx lr
 }
@@ -449,8 +446,8 @@ fn configure_clk_hstx() {
 
 fn setup_hstx() {
     hstx @r0 = peripherals.HSTX_CTRL
-    // setup for rgb 555
-    tmds @r1 = 29 | (4 << 5) | (2 << 8) | (4 << 13) | (7 << 16) | (4 << 21)
+    // setup for rgb 565
+    tmds @r1 = 29 | (4 << 5) | (3 << 8) | (5 << 13) | (8 << 16) | (4 << 21)
     hstx.EXPAND_TMDS = tmds
     // This shifts a 32 bit word into 2 16 bit chunks.
     // For doubled pixels, better to set enc_shift to 0,
@@ -562,11 +559,9 @@ line_done:
     m @r12 = line.missed
     l |= m
     if l != 0 goto error
-    stride @r0 = LINE_BYTES
-    // TODO: possibly use mla instruction
-    ix *= stride
+    stride @r12 = LINE_BYTES
     cmds @r0 = &video_lines
-    cmds += ix
+    cmds += ix * stride
     len @r1 = LINE_WORDS
     goto set_line
 error:
@@ -611,8 +606,8 @@ set_line:
 advance:
     v += 1
     // cmp can't encode V_TOTAL (525), but it can encode 524
-    #(v - (V_TOTAL - 1))
     if {
+        #(v - (V_TOTAL - 1))
         if #ls goto end
         v = 0
         frame @r1 = p.frame_count

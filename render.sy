@@ -51,13 +51,13 @@ fn render_line(y: u32, buf: *u16) {
     push(buf, r4, r5, r6, r7, r8, r9, lr)
     r @r2 = &render_state
     r_y @r3 = r.y
-    #(y - r_y)
-    // A case we have to handle eventually is when y is ahead of r_y. This happens when
-    // we miss the frame timing budget.
-    //
-    // For the time being, we *assume* this function is called with y starting at 0
-    // and incrementing by 1 each scan line
     if {
+        #(y - r_y)
+        // A case we have to handle eventually is when y is ahead of r_y. This happens when
+        // we miss the frame timing budget.
+        //
+        // For the time being, we *assume* this function is called with y starting at 0
+        // and incrementing by 1 each scan line
         if #hs goto end
         push(y)
         bl pico_reset
@@ -85,8 +85,8 @@ fn render_line(y: u32, buf: *u16) {
     display_payload @r2 = r.display_payload
     loop {
         // TODO: deal with overflow of active_dst
-        #(ix - end)
         if {
+            #(ix - end)
             if #eq goto else
             obj_ix @r6 = *(display_heads + ix * 4)
             obj @r5 = (display_payload + (obj_ix << 2)) as *DisplayObj
@@ -120,8 +120,8 @@ loop1:
                 goto no_more_active
             }
             // have both active and (maybe) new obj, pick whichever is lower
-            #(obj - active_obj)
             if {
+                #(obj - active_obj)
                 if #hi goto else
 store_obj:
                 *active_dst++ = obj
@@ -139,12 +139,13 @@ no_more_active:
         if #ne goto store_obj
     }
 
-    // iterate from display_head_ix to ix, calling start
+    // iterate from display_head_ix to ix (all the newly added objs), calling start
     r @r9 = &render_state
     old_ix @r6 = r.display_head_ix
-    #(ix - old_ix)
-    if #eq goto starts_done
-    loop {
+    while {
+        #(ix - old_ix)
+        if #eq goto break
+    } loop {
         obj_ix @r5 = *(display_heads + old_ix * 4)
         obj @r5 = (display_payload + (obj_ix << 2)) as *DisplayObj
         vtable @r4 = obj.vtable
@@ -164,7 +165,6 @@ no_more_active:
         #(ix - old_ix)
         if #ne goto loop
     }
-starts_done:
 
     active @r6 = r.active_scratch
     r.display_head_ix = ix
@@ -179,9 +179,10 @@ starts_done:
     y @r5 = y
 
     // now actually run the rendering, taking another pass over active list
-    #(active - active_end)
-    if #eq goto done // this is a problem, it means unwritten output
-    loop {
+    while {
+        #(active - active_end)
+        if #eq goto break // this is a problem, it means unwritten output
+    } loop {
         active_obj @r0 = active.obj
         active += 4
         x0 @r2 = active_obj.x0
@@ -196,7 +197,6 @@ starts_done:
         #(active - active_end)
         if #ne goto loop
     }
-done:
 
     pop(r1, r4, r5, r6, r7, r8, r9, pc)
 }

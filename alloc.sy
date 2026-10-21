@@ -68,8 +68,8 @@ candidate:
     prev @r3 = tmp
 candidate2:
     cur_end @r7 = cur + cur_size
-    #(cur & align)
     if {
+        #(cur & align)
         if #eq goto end
         cur_aligned @r6 = cur + align
         cur_aligned &= !align
@@ -118,17 +118,17 @@ fn free(ptr: *Hole, size: u32) {
     // prev < ptr < cur (cur may be 0); first try to absorb cur
     ptr_end @r4 = ptr + size
     #(ptr_end - cur)
+    prev_size @r5 = prev.size
     if {
         if #ne goto end
-        cur_size @r5 = cur.size
-        size += cur_size
+        cur_size @r4 = cur.size
         cur = cur.next
+        size += cur_size
     }
     // then try to extend prev over the freed block
-    prev_size @r5 = prev.size
     prev_end @r4 = prev + prev_size
-    #(prev_end - ptr)
     if {
+        #(prev_end - ptr)
         if #ne goto else
         prev_size += size
         prev.size = prev_size

@@ -1,0 +1,40 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+// A 640x480 RGB565 image, compressed with pixel pair delta quantization,
+// from the image branch of pico-dvi-rs. image_data (in image.s) starts with
+// the width and height as u16s, then 256 pixel pair deltas, then the lines.
+// Each line is its first pixel pair, then one byte per following pair,
+// which indexes the deltas, and a byte of padding.
+symbol image_data: *u8
+
+const IMAGE_PALETTE = 4
+const IMAGE_LINES = 256 * 4
+const IMAGE_STRIDE = 4 + H_ACTIVE / 2
+
+// Decode line y of the image. Each pair is the previous pair's right pixel,
+// doubled, plus its delta.
+#[link_section = ".ram"]
+fn render_line_image(y: u32, pixels: *u32) {
+    push(r4, r5)
+    stride @r3 = IMAGE_STRIDE
+    pal @r12 = image_data as u32
+    pal += IMAGE_PALETTE
+    src @r2 = pal + IMAGE_LINES
+    src += y * stride
+    pair @r4 = *src++
+    src8 @r2 = src as *u8
+    count @r3 = H_ACTIVE / 2 - 1
+    loop {
+        ix @r5 = *src8++
+        *pixels++ = pair
+        delta @r5 = *(pal + ix * 4)
+        pair = pkhtb(pair, pair >> 16)
+        #(count -= 1)
+        pair += delta
+        if #ne goto loop
+    }
+    *pixels++ = pair
+    pop(r4, r5)
+    bx lr
+}
