@@ -3,8 +3,9 @@
 
 //! USB CDC serial logging for vic, linked into the symbolasm program.
 //!
-//! The program calls `usb_init` once, on core 0, after the crystal is
-//! running and before interrupts are enabled. It sets up USB and starts
+//! The program calls `usb_init` once, on core 0, after clk_usb is
+//! running at 48 MHz (main.sy's configure_clk_usb) and before interrupts
+//! are enabled. It sets up USB and starts
 //! core 1, which handles `USBCTRL_IRQ` and drains the `USBLOG` ring buffer
 //! to the host, so USB never preempts core 0. The program logs by writing
 //! bytes into the ring and bumping `head`, then doing `sev` to wake core 1.
@@ -111,53 +112,6 @@ unsafe impl critical_section::Impl for BasepriCs {
     }
 }
 
-/// Bring up a 48 MHz clk_usb from PLL_USB, which needs the 12 MHz crystal
-/// to be running. clk_sys is left alone.
-unsafe fn init_clk_usb(p: &pac::Peripherals) {
-    let resets = &p.RESETS;
-    resets.reset().modify(|_, w| w.pll_usb().set_bit());
-    resets.reset().modify(|_, w| w.pll_usb().clear_bit());
-    while resets.reset_done().read().pll_usb().bit_is_clear() {}
-
-    // VCO = 12 MHz * 100 = 1200 MHz, / 5 / 5 = 48 MHz
-    let pll = &p.PLL_USB;
-    pll.cs().write(|w| unsafe { w.refdiv().bits(1) });
-    pll.fbdiv_int()
-        .write(|w| unsafe { w.fbdiv_int().bits(100) });
-    // power up the PLL and VCO, leaving the post dividers off
-    pll.pwr().write(|w| {
-        w.pd()
-            .clear_bit()
-            .vcopd()
-            .clear_bit()
-            .postdivpd()
-            .set_bit()
-            .dsmpd()
-            .set_bit()
-    });
-    while pll.cs().read().lock().bit_is_clear() {}
-    pll.prim()
-        .write(|w| unsafe { w.postdiv1().bits(5).postdiv2().bits(5) });
-    pll.pwr().write(|w| {
-        w.pd()
-            .clear_bit()
-            .vcopd()
-            .clear_bit()
-            .postdivpd()
-            .clear_bit()
-            .dsmpd()
-            .set_bit()
-    });
-
-    // clk_usb: disable, select PLL_USB as aux source, divide by 1, enable
-    let clocks = &p.CLOCKS;
-    clocks.clk_usb_ctrl().write(|w| w.enable().clear_bit());
-    clocks.clk_usb_div().write(|w| unsafe { w.int().bits(1) });
-    clocks
-        .clk_usb_ctrl()
-        .write(|w| w.auxsrc().clksrc_pll_usb().enable().set_bit());
-}
-
 /// Enable the FPU on this core, in case the compiler emits floating point
 /// instructions.
 unsafe fn enable_fpu() {
@@ -180,7 +134,6 @@ pub unsafe extern "C" fn usb_init() {
     hal::rom_data::reboot(REBOOT_TYPE_BOOTSEL, FAILSAFE_MS, 0, 0);
     *addr_of_mut!(FAILSAFE_ARMED) = true;
 
-    init_clk_usb(&p);
     let clocks = hal::clocks::ClocksManager::new(pac::Peripherals::steal().CLOCKS);
     let bus = UsbBus::new(p.USB, p.USB_DPRAM, clocks.usb_clock, true, &mut p.RESETS);
     let alloc: &'static UsbBusAllocator<UsbBus> =

@@ -1,16 +1,18 @@
 // Copyright 2026 Raph Levien
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-// Bring up the 12 MHz crystal and run clk_sys from PLL_SYS at 126 MHz, then
-// generate a 640x480 DVI signal with HSTX. Two chained DMA channels feed
-// HSTX: channel 0 sends each line's horizontal sync, channel 1 its content,
-// either blanking or a line of pixels. A DMA interrupt reprograms the
-// channel that just finished, and hands line buffers to the renderer, which
-// runs in thread mode and gets them with dvi_get_line. This follows the
-// main branch of pico-dvi-rs, without audio. Each demo is its own binary,
-// and provides demo_init, called once before DMA starts, and
-// demo_line(y, pixels), which draws a line. The LED toggles every 30
-// frames.
+// Bring up the 12 MHz crystal and run clk_sys and clk_peri at 144 MHz from
+// PLL_SYS, clk_usb at 48 MHz from PLL_SYS / 3, and clk_hstx at 126 MHz from
+// PLL_USB (the routing suggested in RP2350 datasheet 8.6.1, though 8.6.3
+// gives 48 MHz as the USB PLL's maximum). Then generate a 640x480 DVI
+// signal with HSTX. Two chained DMA channels feed HSTX: channel 0 sends
+// each line's horizontal sync, channel 1 its content, either blanking or a
+// line of pixels. A DMA interrupt reprograms the channel that just
+// finished, and hands line buffers to the renderer, which runs in thread
+// mode and gets them with dvi_get_line. This follows the main branch of
+// pico-dvi-rs, without audio. Each demo is its own binary, and provides
+// demo_init, called once before DMA starts, and demo_line(y, pixels),
+// which draws a line. The LED toggles every 30 frames.
 
 // The .image_def and .vectors are in startup.s.
 
@@ -19,6 +21,9 @@ symbol _data_start: *u32
 symbol _data_size_words: u32
 symbol _bss_start: *u32
 symbol _bss_size_words: u32
+
+// PLL_USB is derived from PLL_SYS in the SVD, so it isn't in peripherals
+const PLL_USB = 0x40058000
 
 // 640x480 at 60 Hz
 const H_FRONT_PORCH = 16
@@ -175,10 +180,12 @@ fn start() {
 
     bl configure_clk_sys1
     bl init_xosc
-    bl init_pll
+    bl init_plls
     bl configure_clk_ref
     bl configure_clk_sys2
-    // USB serial logging, from the usblog crate; needs the crystal
+    bl configure_clk_peri
+    bl configure_clk_usb
+    // USB serial logging, from the usblog crate; needs clk_usb
     bl usb_init
 
     // release reset for BUSCTRL, IO_BANK0 and PADS_BANK0
@@ -324,37 +331,48 @@ fn init_xosc() {
     bx lr
 }
 
-fn init_pll() {
+fn init_plls() {
     push(lr)
-    mask @r0 = 1 << 14
+    // reset PLL_SYS and PLL_USB
+    mask @r0 = (1 << 14) | (1 << 15)
     bl reset
+    // VCO = 12 MHz * 120 = 1440 MHz, 1440 / (5 * 2) = 144 MHz
     pll @r0 = peripherals.PLL_SYS
-    // VCO = 12 MHz * 126 = 1512 MHz
-    fbdiv @r1 = pll.FBDIV_INT
-    fbdiv_val @r2 = 126
-    fbdiv[0..12] = fbdiv_val
-    pll.FBDIV_INT = fbdiv
+    fbdiv @r1 = 120
+    prim @r2 = (5 << 16) | (2 << 12)
+    bl init_pll
+    // VCO = 12 MHz * 126 = 1512 MHz, 1512 / (6 * 2) = 126 MHz
+    pll @r0 = PLL_USB
+    fbdiv @r1 = 126
+    prim @r2 = (6 << 16) | (2 << 12)
+    bl init_pll
+    pop(pc)
+}
+
+// Start a PLL that is out of reset, with REFDIV 1. prim has POSTDIV1 in
+// bits 16..19 and POSTDIV2 in bits 12..15.
+fn init_pll(pll: *u32, fbdiv: u32, prim: u32) {
+    // CS: REFDIV 1
+    one @r3 = 1
+    *pll = one
+    // FBDIV_INT
+    *(pll + 0x8) = fbdiv
     // turn on pll and pll vco: clear PD and VCOPD in PWR
     pwr_bits @r1 = (1 << 5) | (1 << 0)
     pwr_clear @r3 = 0x3000 + 0x4
     *(pll + pwr_clear) = pwr_bits
     // wait for lock
     loop {
-        cs @r1 = pll.CS
+        cs @r1 = *pll
         #(cs & cs)
         if #pl goto loop
     }
-    // 1512 / (2 * 6) = 126 MHz
-    prim @r1 = pll.PRIM
-    postdiv2 @r2 = 2
-    prim[12..15] = postdiv2
-    postdiv1 @r2 = 6
-    prim[16..19] = postdiv1
-    pll.PRIM = prim
+    // PRIM
+    *(pll + 0xc) = prim
     // clear POSTDIVPD
     pwr_bits @r1 = 1 << 3
     *(pll + pwr_clear) = pwr_bits
-    pop(pc)
+    bx lr
 }
 
 fn configure_clk_ref() {
@@ -444,13 +462,47 @@ fn assert_reset(mask: u32) {
 fn configure_clk_hstx() {
     clocks @r0 = peripherals.CLOCKS
     ctrl @r1 = clocks.CLK_HSTX_CTRL
-    // clk_sys
-    ctrl[5..8] = 0
+    // disable, and wait for it to stop before changing the aux source
+    ctrl[11..12] = 0
+    clocks.CLK_HSTX_CTRL = ctrl
+    loop {
+        ctrl @r1 = clocks.CLK_HSTX_CTRL
+        #(ctrl & (1 << 28))
+        if #ne goto loop
+    }
+    // clksrc_pll_usb
+    src @r2 = 2
+    ctrl[5..8] = src
     clocks.CLK_HSTX_CTRL = ctrl
     // enable
     one @r2 = 1
     ctrl[11..12] = one
     clocks.CLK_HSTX_CTRL = ctrl
+    bx lr
+}
+
+fn configure_clk_peri() {
+    clocks @r0 = peripherals.CLOCKS
+    // disable, divide by 1, then enable with clk_sys as the aux source
+    zero @r1 = 0
+    clocks.CLK_PERI_CTRL = zero
+    div @r1 = 1 << 16
+    clocks.CLK_PERI_DIV = div
+    ctrl @r1 = 1 << 11
+    clocks.CLK_PERI_CTRL = ctrl
+    bx lr
+}
+
+fn configure_clk_usb() {
+    clocks @r0 = peripherals.CLOCKS
+    // disable, divide by 3, then enable with clksrc_pll_sys as the aux
+    // source: 144 / 3 = 48 MHz
+    zero @r1 = 0
+    clocks.CLK_USB_CTRL = zero
+    div @r1 = 3 << 16
+    clocks.CLK_USB_DIV = div
+    ctrl @r1 = (1 << 5) | (1 << 11)
+    clocks.CLK_USB_CTRL = ctrl
     bx lr
 }
 
