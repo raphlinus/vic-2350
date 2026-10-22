@@ -34,6 +34,9 @@ const V_SYNC_END = V_SYNC_START + V_SYNC_WIDTH
 const V_ACTIVE_START = V_SYNC_END + V_BACK_PORCH
 const V_TOTAL = V_ACTIVE_START + V_ACTIVE
 
+// red LED on the Adafruit Fruit Jam
+const LED_PIN = 29
+
 // HSTX commands
 const HSTX_RAW = 0 << 12
 const HSTX_RAW_REPEAT = 1 << 12
@@ -185,7 +188,7 @@ fn start() {
     // set up pad: 4mA, pull-down, Schmitt input
     pads_bank0 @r0 = peripherals.PADS_BANK0
     pads_bank0 += 4
-    led_pin @r1 = 7
+    led_pin @r1 = LED_PIN
     config @r2 = 0x56
     *(pads_bank0 + (led_pin << 2)) = config
 
@@ -193,11 +196,11 @@ fn start() {
     io_bank0 @r0 = peripherals.IO_BANK0
     io_bank0 += 4
     function @r1 = 5
-    led_pin @r2 = 7
+    led_pin @r2 = LED_PIN
     *(io_bank0 + (led_pin << 3)) = function
 
     sio @r0 = peripherals.SIO
-    led_mask @r1 = 1 << 7
+    led_mask @r1 = 1 << LED_PIN
     sio.GPIO_OE_SET = led_mask
 
     // DMA gets priority on the bus, so the CPU can't starve HSTX
@@ -463,18 +466,19 @@ fn setup_hstx() {
     hstx.EXPAND_SHIFT = shift
     csr @r1 = 3 | (2 << 8) | (5 << 16) | (5 << 28)
     *hstx = csr; hstx += 4
-    // setup bits; feather is d2, clk, d1, d0 (pos)
-    bit0 @r1 = 20 | (21 << 8)
-    bit1 @r2 = bit0 | (1 << 16)
+    // setup bits; fruit jam is clk, d0, d1, d2 (neg)
+    // (feather was d2, clk, d1, d0 (pos))
+    bit1 @r2 = 1 << 17
+    bit0 @r1 = bit1 | (1 << 16)
     *hstx = (bit0, bit1); hstx += 8
-    bit2 @r1 = 1 << 17
-    bit3 @r2 = bit2 | (1 << 16)
+    bit3 @r2 = 1 << 8
+    bit2 @r1 = bit3 | (1 << 16)
     *hstx = (bit2, bit3); hstx += 8
-    bit4 @r1 = 10 | (11 << 8)
-    bit5 @r2 = bit4 | (1 << 16)
+    bit5 @r2 = 10 | (11 << 8)
+    bit4 @r1 = bit5 | (1 << 16)
     *hstx = (bit4, bit5); hstx += 8
-    bit6 @r1 = 1 << 8
-    bit7 @r2 = bit6 | (1 << 16)
+    bit7 @r2 = 20 | (21 << 8)
+    bit6 @r1 = bit7 | (1 << 16)
     *hstx = (bit6, bit7); hstx += 8
 
     // pins 12..19 to function 0 (hstx), 4mA drive, Schmitt
@@ -628,7 +632,7 @@ advance:
             if #ne goto end
             frame = 0
             sio @r2 = peripherals.SIO
-            led_mask @r12 = 1 << 7
+            led_mask @r12 = 1 << LED_PIN
             sio.GPIO_OUT_XOR = led_mask
         }
         p.frame_count = frame
