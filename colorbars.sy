@@ -40,7 +40,37 @@ static colorbar_heads: [u32; N_COLORBARS] = [
     64, 68, 72, 76, 80, 84,
 ]
 
+// Render timing, logged over USB about once per second
+struct LineStats {
+    // frames since the last report
+    frames: u32
+    reports: u32
+    // cycles in render_line since the last report
+    sum: u32
+    max: u32
+}
+
+static mut line_stats: LineStats
+
+const REPORT_FRAMES = 60
+// After this many reports, also log the end marker tools/run.sh waits for
+const END_REPORTS = 5
+
+static avg_str: [u8; _] = "cycles/line avg "
+static max_str: [u8; _] = " max "
+static missed_str: [u8; _] = " missed "
+
 fn demo_init() {
+    // enable the DWT cycle counter
+    demcr @r0 = &peripherals.PPB.DEMCR
+    v @r1 = *demcr
+    v |= 1 << 24
+    *demcr = v
+    dwt_ctrl @r0 = &peripherals.PPB.DWT_CTRL
+    v = *dwt_ctrl
+    v |= 1
+    *dwt_ctrl = v
+
     r @r0 = &render_state
     payload @r1 = &colorbars
     r.display_payload = payload
@@ -53,5 +83,80 @@ fn demo_init() {
 
 #[link_section = ".ram"]
 fn demo_line(y: u32, pixels: *u16) {
-    goto render_line
+    push(r4, r5, r6, lr)
+    y_saved @r4 = y
+    cyccnt @r2 = &peripherals.PPB.DWT_CYCCNT
+    t0 @r5 = *cyccnt
+    bl render_line
+    cyccnt @r2 = &peripherals.PPB.DWT_CYCCNT
+    t @r3 = *cyccnt
+    t -= t0
+    s @r0 = &line_stats
+    sum @r1 = s.sum
+    sum += t
+    s.sum = sum
+    max @r1 = s.max
+    #(t - max)
+    if {
+        if #ls goto end
+        s.max = t
+    }
+    // After the last line, the vertical blanking leaves time to log.
+    last @r1 = V_ACTIVE - 1
+    #(y_saved - last)
+    if {
+        if #ne goto end
+        frames @r1 = s.frames
+        frames += 1
+        s.frames = frames
+        #(frames - REPORT_FRAMES)
+        if #ne goto end
+        // Give the line back first, so the report can't make it late.
+        // The main loop's second release is harmless.
+        y @r0 = r4
+        bl dvi_release_line
+        bl report_stats
+    }
+    pop(r4, r5, r6, pc)
+}
+
+fn report_stats() {
+    push(r4, r5, r6, lr)
+    p @r0 = &avg_str
+    len @r1 = count(avg_str)
+    bl log_str
+    s @r4 = &line_stats
+    sum @r0 = s.sum
+    lines @r1 = V_ACTIVE * REPORT_FRAMES
+    avg @r0 = sum / lines
+    bl log_dec
+    p @r0 = &max_str
+    len @r1 = count(max_str)
+    bl log_str
+    s @r4 = &line_stats
+    max @r0 = s.max
+    bl log_dec
+    p @r0 = &missed_str
+    len @r1 = count(missed_str)
+    bl log_str
+    d @r0 = &dvi
+    missed @r0 = d.missed_lines
+    bl log_dec
+    nl @r0 = 10
+    bl log_byte
+    bl log_flush
+    s @r4 = &line_stats
+    zero @r0 = 0
+    s.frames = zero
+    s.sum = zero
+    s.max = zero
+    reports @r0 = s.reports
+    reports += 1
+    s.reports = reports
+    #(reports - END_REPORTS)
+    if {
+        if #ne goto end
+        bl log_end
+    }
+    pop(r4, r5, r6, pc)
 }

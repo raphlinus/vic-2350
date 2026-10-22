@@ -129,6 +129,8 @@ struct Dvi {
     queue_rd: u32
     queue_wr: u32
     queue: [u32; QUEUE_SIZE]
+    // lines sent as err_line, for logging
+    missed_lines: u32
 }
 
 static mut dvi: Dvi
@@ -173,6 +175,8 @@ fn start() {
     bl init_pll
     bl configure_clk_ref
     bl configure_clk_sys2
+    // USB serial logging, from the usblog crate; needs the crystal
+    bl usb_init
 
     // release reset for BUSCTRL, IO_BANK0 and PADS_BANK0
     mask @r0 = (1 << 1) | (1 << 6) | (1 << 9)
@@ -568,6 +572,10 @@ line_done:
     len @r1 = LINE_WORDS
     goto set_line
 error:
+    p @r0 = &dvi
+    missed @r1 = p.missed_lines
+    missed += 1
+    p.missed_lines = missed
     cmds @r0 = &err_line
     len @r1 = count(err_line)
     goto set_line

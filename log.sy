@@ -1,0 +1,134 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+// Logging over USB CDC serial. The ring buffer and the USB stack live in
+// the usblog Rust crate: these functions write bytes into USBLOG, and
+// core 1 sends them. Bytes are dropped when the ring is full.
+//
+// log_byte doesn't wake core 1; the other functions end with log_flush,
+// which does.
+
+const LOG_SIZE = 4096
+
+// Must match usblog's UsbLog
+struct UsbLog {
+    head: u32
+    tail: u32
+    buf: [u8; LOG_SIZE]
+}
+
+symbol USBLOG: *UsbLog
+
+const USBCTRL_IRQ = 14
+
+// The end marker tools/run.sh waits for
+static log_end_str: [u8; _] = "\n#END\n"
+
+// Digits of log_dec, least significant first
+static mut log_digits: [u8; 12]
+
+// Append byte b. Preserves r0 and r12.
+fn log_byte(b: u32) {
+    log @r1 = USBLOG
+    head @r2 = log.head
+    tail @r3 = log.tail
+    used @r3 = head - tail
+    #(used - LOG_SIZE)
+    if {
+        if #hs goto end
+        ix @r3 = head[0..12]
+        buf @r1 = &log.buf
+        *((buf as *u8) + ix) = b
+        // the byte must be visible to core 1 before the new head
+        dmb
+        head += 1
+        log @r1 = USBLOG
+        log.head = head
+    }
+    bx lr
+}
+
+// Wake the USB side so it sends what has been logged: sev for core 1,
+// and the interrupt's pending bit in case USB runs on this core.
+// Preserves r0, r2 and r12.
+fn log_flush() {
+    ispr @r3 = &peripherals.PPB.NVIC_ISPR0
+    bit @r1 = 1 << USBCTRL_IRQ
+    *ispr = bit
+    sev
+    bx lr
+}
+
+// Append len bytes from p.
+fn log_str(p: *u8, len: u32) {
+    push(r4, r5, r6, lr)
+    p @r4 = p
+    len @r5 = len
+    while {
+        if len == 0 goto break
+    } loop {
+        b @r0 = *p++
+        bl log_byte
+        #(len -= 1)
+        if #ne goto loop
+    }
+    bl log_flush
+    pop(r4, r5, r6, pc)
+}
+
+// Append v as 8 hex digits.
+fn log_hex(v: u32) {
+    push(r4, r5, r6, lr)
+    v @r4 = v
+    n @r5 = 8
+    loop {
+        d @r0 = v >> 28
+        v <<= 4
+        #(d - 10)
+        if {
+            if #lo goto end
+            d += 7
+        }
+        d += 48
+        bl log_byte
+        #(n -= 1)
+        if #ne goto loop
+    }
+    bl log_flush
+    pop(r4, r5, r6, pc)
+}
+
+// Append v in decimal.
+fn log_dec(v: u32) {
+    push(r4, r5, r6, lr)
+    digits @r1 = &log_digits
+    ten @r2 = 10
+    loop {
+        q @r3 = v / ten
+        d @r12 = v - q * ten
+        d += 48
+        *((digits as *u8) + 0) = d
+        digits += 1
+        v = q
+        #(v - 0)
+        if #ne goto loop
+    }
+    end @r4 = digits
+    start @r5 = &log_digits
+    loop {
+        end -= 1
+        b @r0 = *((end as *u8) + 0)
+        bl log_byte
+        #(end - start)
+        if #ne goto loop
+    }
+    bl log_flush
+    pop(r4, r5, r6, pc)
+}
+
+// Append "\n#END\n", marking the end of a run's output.
+fn log_end() {
+    p @r0 = &log_end_str
+    len @r1 = count(log_end_str)
+    goto log_str
+}

@@ -50,3 +50,7 @@
 .word default_handler // interrupt 8, PWM_IRQ_WRAP_0
 .word default_handler // interrupt 9, PWM_IRQ_WRAP_1
 .word dma_irq_0_handler // interrupt 10, DMA_IRQ_0
+.word default_handler // interrupt 11, DMA_IRQ_1
+.word default_handler // interrupt 12, DMA_IRQ_2
+.word default_handler // interrupt 13, DMA_IRQ_3
+.word USBCTRL_IRQ // interrupt 14, USBCTRL_IRQ, in the usblog crate

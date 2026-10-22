@@ -11,6 +11,8 @@ SECTIONS
         KEEP(*(.image_def))
         *(.text*)
         *(.rodata*)
+        /* so .data's load address, _data_source, is word aligned */
+        . = ALIGN(4);
     } > FLASH
 
     .data : {
@@ -30,6 +32,12 @@ SECTIONS
         . = ALIGN(4);
         _bss_end = .;
     } > RAM
+
+    /* unwind tables from the usblog crate, unused with panic = "abort" */
+    /DISCARD/ : {
+        *(.ARM.exidx*)
+        *(.ARM.extab*)
+    }
 }
 _data_size_words = (_data_end - _data_start) / 4;
 ASSERT(_data_size_words <= 0xffff, "_data_size_words >= 64k, can fix this by using ldr instead of movw")

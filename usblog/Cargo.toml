@@ -1,0 +1,25 @@
+[package]
+name = "usblog"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+cortex-m = "0.7.7"
+rp235x-hal = "0.2.0"
+usb-device = "0.3.2"
+usbd-serial = "0.2.2"
+critical-section = { version = "1.2.0", features = ["restore-state-u8"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true
