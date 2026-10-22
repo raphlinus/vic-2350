@@ -4,7 +4,7 @@
 
 """Convert a 16x16 tileset PNG into symbolasm statics for vic's renderer.
 
-Usage: tools/tiles.py ~/Downloads/dandelion_tileset.png > tiles.sy
+Usage: tools/tiles.py maps/alien_world.png [MAP.tmx] > tiles.sy
 
 Tiles are 4 bits per pixel, the left pixel of each pair in the low
 nibble, 8 bytes per row, 128 bytes per tile. Each tile uses one of a
@@ -12,13 +12,16 @@ few 16 color palettes, where index 0 is transparent and shows the
 background color. Each palette is expanded to the 1 KB fast form: for
 every byte, two RGB565 pixels in one word, the left in the low half.
 
-The screen map covers 640x480 with the tileset repeated, each entry a
-pointer to the tile's data and a pointer to its fast palette. Empty
-tiles point at an all-zero tile.
+The screen map covers 640x480, each entry a pointer to the tile's data
+and a pointer to its fast palette. Empty tiles point at an all-zero
+tile. The map comes from a Tiled map (one tileset, CSV layers, the
+topmost non-empty tile of each cell wins, no flips), or else is the
+tileset repeated.
 """
 
 import struct
 import sys
+import xml.etree.ElementTree as ET
 import zlib
 
 TILE = 16
@@ -63,6 +66,24 @@ def read_png_rgba(path):
         rows.append([tuple(line[x * 4 : x * 4 + 4]) for x in range(w)])
         prev = line
     return w, h, rows
+
+
+def read_tmx(path):
+    """Tileset index of each cell, None for empty, flattening the layers."""
+    root = ET.parse(path).getroot()
+    assert (int(root.get("width")), int(root.get("height"))) == (SCREEN_W, SCREEN_H), "map size"
+    assert root.get("infinite") == "0", "infinite map"
+    firstgid = int(root.find("tileset").get("firstgid"))
+    cells = [[None] * SCREEN_W for _ in range(SCREEN_H)]
+    for layer in root.iter("layer"):
+        data = layer.find("data")
+        assert data.get("encoding") == "csv", "layer format must be CSV"
+        gids = [int(v) for v in data.text.split(",")]
+        for k, gid in enumerate(gids):
+            if gid:
+                assert gid < 1 << 28, "flipped tile"
+                cells[k // SCREEN_W][k % SCREEN_W] = gid - firstgid
+    return cells
 
 
 def rgb565(c):
@@ -137,12 +158,16 @@ def main():
         out.write("    " + ", ".join(f"0x{v:08x}" for v in fast[i : i + 8]) + ",\n")
     out.write("]\n\n")
 
-    out.write("// The screen, the tileset repeated: tile data, fast palette\n")
+    if len(sys.argv) > 2:
+        layout = read_tmx(sys.argv[2])
+    else:
+        layout = [[(sy % th) * tw + (sx % tw) for sx in range(SCREEN_W)] for sy in range(SCREEN_H)]
+    out.write("// The screen: tile data, fast palette\n")
     out.write(f"#[link_section = \".data\"]\nstatic tile_map: [*u32; {2 * SCREEN_W * SCREEN_H}] = [\n")
     for sy in range(SCREEN_H):
         entries = []
         for sx in range(SCREEN_W):
-            i = (sy % th) * tw + (sx % tw)
+            i = layout[sy][sx]
             t = index.get(i, 0)
             p = assign.get(i, 0)
             entries.append(f"&tiles + {t * 128}, &palettes + {p * 1024}")

@@ -6,9 +6,9 @@ set -e
 
 SYMBOLASM=${SYMBOLASM:-$HOME/garden/symbolasm}
 SVD=${SVD:-$HOME/dl/pico-sdk/src/rp2350/hardware_regs/RP2350.svd}
-TILESET=${TILESET:-$HOME/Downloads/dandelion_tileset.png}
+TILESET=${TILESET:-maps/alien_world.png}
 
-python3 tools/tiles.py "$TILESET" > tiles.sy
+python3 tools/tiles.py "$TILESET" maps/colony.tmx > tiles.sy
 
 mkdir -p build
 cargo run -q --manifest-path "$SYMBOLASM/Cargo.toml" -- fill.sy > build/fill.s
