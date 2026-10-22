@@ -21,7 +21,7 @@ arm-none-eabi-as -mcpu=cortex-m33 -o build/image_data.o image.s
 
 # demo name, its .sy files (compiled with main.sy), and its other objects
 demo() {
-    cargo run -q --manifest-path "$SYMBOLASM/Cargo.toml" -- main.sy log.sy $2 --svd "$SVD" > "build/$1.s"
+    cargo run -q --manifest-path "$SYMBOLASM/Cargo.toml" -- main.sy log.sy psram.sy $2 --svd "$SVD" > "build/$1.s"
     arm-none-eabi-as -mcpu=cortex-m33 -o "build/$1.o" "build/$1.s"
     # --gc-sections drops the cortex-m-rt reset handler and vector table
     # that come with rp235x-hal
@@ -32,3 +32,4 @@ demo() {
 demo colorbars "render.sy colorbars.sy pico_alloc.sy" build/fill.o
 demo image image.sy build/image_data.o
 demo tiles "render_tiles.sy tiles.sy"
+demo psram_test psram_test.sy

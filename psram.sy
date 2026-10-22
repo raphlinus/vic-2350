@@ -1,0 +1,235 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+// Setup for the PSRAM chip on the Adafruit Fruit Jam (and other boards)
+
+// The chip is an 8MB APS6404L QSPI. On RP2350, the PSRAM chip is wired
+// to chip select 1 (the flash is chip select 0), which is GPIO47 on the
+// Fruit Jam.
+
+// After this function runs, the PSRAM appears at 0x1100_0000 behind a
+// cache, and an uncached alias is at 0x1500_0000. Both are writable.
+
+// psram_init() does the following steps:
+// * reset the chip
+// * check its ID
+// * put it in QPI mode and configure QMI window 1
+
+// PSRAM chips have somewhat delicate timing requirements, and improperly
+// tuned values can fail or have degraded performance. These values were
+// determined for clk_sys of 126 MHz and 144 MHz, then tested on hardware.
+
+// This module is specific to that PSRAM chip, but could be adapted.
+
+// Direct mode disconnects XIP, so a flash access faults until it's turned
+// off again. Everything here runs from RAM and calls nothing in flash.
+// psram_init must run before core 1 is started, as core 1 runs from flash.
+
+// Window 1 timing and formats for the two clk_sys values:
+
+// 144 MHz: CLKDIV 2 (72 MHz SCK), RXDELAY 2, MIN_DESELECT 2, MAX_SELECT 16
+// (1024 cycles, 7.1 us), SELECT_SETUP 1, PAGEBREAK 1024, COOLDOWN 1. Reads
+// are QPI EBh (6 wait cycles). MAX_SELECT leaves room for a transfer to
+// finish within tCEM (8 us), and SELECT_SETUP adds a cycle to the 0.3 ns
+// of tCSP margin left by the slower GPIO CS1 path.
+const PSRAM_M1_TIMING = 0x62202202
+const PSRAM_M1_RFMT = 0x0006128a
+const PSRAM_M1_RCMD = 0xeb
+
+// 126 MHz: CLKDIV 2 (63 MHz SCK), RXDELAY 2, MIN_DESELECT 2,
+// MAX_SELECT 14 (896 cycles, 7.1 us), PAGEBREAK 1024, COOLDOWN 1. Reads
+// are QPI 0Bh (4 wait cycles, at most 66 MHz). On the Fruit Jam, RXDELAY
+// 1 to 3 read back 256 KB without errors and 0 and 4 to 7 failed, so 2 is
+// the middle of the window.
+//   PSRAM_M1_TIMING = 0x601c2202
+//   PSRAM_M1_RFMT = 0x0004128a
+//   PSRAM_M1_RCMD = 0x0b
+
+// Writes are QPI 02h with no wait cycles, at both frequencies.
+const PSRAM_M1_WFMT = 0x0000120a
+const PSRAM_M1_WCMD = 0x02
+
+// direct mode clock divisor: 18 MHz at 144 MHz, under Read ID's 33 MHz
+const PSRAM_DIRECT_CLKDIV = 8
+
+const CSR_EN = 1 << 0
+const CSR_BUSY = 1 << 1
+const CSR_ASSERT_CS1N = 1 << 3
+const TX_NOPUSH = 1 << 20
+const TX_OE = 1 << 19
+const TX_DWIDTH = 1 << 18
+const TX_QUAD = 2 << 16
+
+const PSRAM_GPIO = 47
+// xip_ss_n_1
+const PSRAM_FUNCSEL = 9
+// ISO, PDE, PUE and IE clear, 4 mA, Schmitt, fast slew. The board has a
+// 10K pull-up on CS.
+const PSRAM_PAD = 0x13
+const XIP_CTRL_WRITABLE_M1 = 1 << 11
+
+// Manufacturer ID 0Dh then Known Good Die 5Dh (pass), as one 16 bit FIFO entry
+const PSRAM_ID0 = 0x5d0d
+// EID[47:45], the density, is 010 for 64 Mb
+const PSRAM_DENSITY_MASK = 0xe0
+const PSRAM_DENSITY_64M = 0x40
+
+// 1 if psram_init succeeded
+static mut psram_ok: u32
+// The two 16 bit Read ID FIFO entries
+static mut psram_id: [u32; 2]
+// M0_TIMING, M0_RFMT, M0_RCMD, M1_TIMING, M1_RFMT, M1_RCMD as boot left them
+static mut psram_boot_regs: [u32; 6]
+
+// Returns 1 in r0, and in psram_ok, if the PSRAM is there and set up,
+// else 0.
+#[link_section = ".ram"]
+fn psram_init() {
+    push(r4, lr)
+    qmi @r4 = peripherals.QMI
+    regs @r0 = &psram_boot_regs
+    v @r1 = qmi.M0_TIMING
+    *regs++ = v
+    v = qmi.M0_RFMT
+    *regs++ = v
+    v = qmi.M0_RCMD
+    *regs++ = v
+    v = qmi.M1_TIMING
+    *regs++ = v
+    v = qmi.M1_RFMT
+    *regs++ = v
+    v = qmi.M1_RCMD
+    *regs++ = v
+
+    io_bank0 @r0 = peripherals.IO_BANK0
+    func @r1 = PSRAM_FUNCSEL
+    *(io_bank0 + (PSRAM_GPIO * 8 + 4)) = func
+    pads_bank0 @r0 = peripherals.PADS_BANK0
+    pad @r1 = PSRAM_PAD
+    *(pads_bank0 + (PSRAM_GPIO * 4 + 4)) = pad
+
+    // Direct mode, then wait for any XIP transfer to finish.
+    csr @r1 = (PSRAM_DIRECT_CLKDIV << 22) | CSR_EN
+    qmi.DIRECT_CSR = csr
+    loop {
+        csr = qmi.DIRECT_CSR
+        #(csr & CSR_BUSY)
+        if #ne goto loop
+    }
+
+    // The chip isn't reset with RP2350, so it may be in QPI mode: leave it,
+    // then reset it. In SPI mode the F5h is two clocks, which it ignores.
+    tx @r0 = TX_NOPUSH | TX_OE | TX_QUAD | 0xf5
+    bl psram_cmd
+    tx @r0 = TX_NOPUSH | 0x66
+    bl psram_cmd
+    tx @r0 = TX_NOPUSH | 0x99
+    bl psram_cmd
+    // tRST, 50 ns before the next command
+    n @r0 = 16
+    loop {
+        #(n -= 1)
+        if #ne goto loop
+    }
+
+    // Read ID: 9Fh and 3 address bytes, then MF ID, KGD and EID, sent
+    // and received 16 bits at a time, low byte first.
+    csr @r1 = qmi.DIRECT_CSR
+    csr |= CSR_ASSERT_CS1N
+    qmi.DIRECT_CSR = csr
+    tx @r0 = TX_NOPUSH | TX_DWIDTH | 0x9f
+    qmi.DIRECT_TX = tx
+    tx = TX_NOPUSH | TX_DWIDTH
+    qmi.DIRECT_TX = tx
+    tx = TX_DWIDTH
+    qmi.DIRECT_TX = tx
+    qmi.DIRECT_TX = tx
+    // Only two RX entries, so the FIFO can't fill and stall.
+    loop {
+        csr = qmi.DIRECT_CSR
+        #(csr & CSR_BUSY)
+        if #ne goto loop
+    }
+    id0 @r2 = qmi.DIRECT_RX
+    id1 @r3 = qmi.DIRECT_RX
+    csr &= !CSR_ASSERT_CS1N
+    qmi.DIRECT_CSR = csr
+    ids @r0 = &psram_id
+    *ids = id0
+    *(ids + 4) = id1
+    expect @r0 = PSRAM_ID0
+    #(id0 - expect)
+    if {
+        if #ne goto fail
+        density @r3 = id1 & PSRAM_DENSITY_MASK
+        #(density - PSRAM_DENSITY_64M)
+        if #eq goto end
+    fail:
+        zero @r0 = 0
+        qmi.DIRECT_CSR = zero
+        goto done
+    }
+
+    // enter QPI mode
+    tx @r0 = TX_NOPUSH | 0x35
+    bl psram_cmd
+
+    v @r0 = PSRAM_M1_TIMING
+    qmi.M1_TIMING = v
+    v = PSRAM_M1_RFMT
+    qmi.M1_RFMT = v
+    v = PSRAM_M1_RCMD
+    qmi.M1_RCMD = v
+    v = PSRAM_M1_WFMT
+    qmi.M1_WFMT = v
+    v = PSRAM_M1_WCMD
+    qmi.M1_WCMD = v
+
+    zero @r0 = 0
+    qmi.DIRECT_CSR = zero
+    xip @r1 = peripherals.XIP_CTRL
+    bits @r2 = XIP_CTRL_WRITABLE_M1
+    atomic_set @r3 = 0x2000
+    *(xip + atomic_set) = bits
+    one @r0 = 1
+done:
+    ok @r1 = &psram_ok
+    *ok = r0
+    pop(r4, pc)
+}
+
+// Send the command byte (with its DIRECT_TX control bits) in tx on its own
+// chip select pulse. Direct mode must be on.
+#[link_section = ".ram"]
+fn psram_cmd(tx: u32) {
+    qmi @r1 = peripherals.QMI
+    csr @r2 = qmi.DIRECT_CSR
+    csr |= CSR_ASSERT_CS1N
+    qmi.DIRECT_CSR = csr
+    qmi.DIRECT_TX = tx
+    loop {
+        csr = qmi.DIRECT_CSR
+        #(csr & CSR_BUSY)
+        if #ne goto loop
+    }
+    csr &= !CSR_ASSERT_CS1N
+    qmi.DIRECT_CSR = csr
+    // tCPH, 18 ns of CS1n high before the next command, is covered by the
+    // APB read and write of DIRECT_CSR that assert it again.
+    bx lr
+}
+
+// Change M1_TIMING, for example its RXDELAY. Only CLKDIV may change while
+// QMI is busy, so first finish an uncached PSRAM read. That doesn't stop
+// core 1 fetching from flash in the meantime, so this is for tests only.
+#[link_section = ".ram"]
+fn psram_set_timing(timing: u32) {
+    p @r1 = 0x15000000 as *u32
+    v @r2 = *p
+    dsb
+    qmi @r1 = peripherals.QMI
+    qmi.M1_TIMING = timing
+    dsb
+    isb
+    bx lr
+}

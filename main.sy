@@ -187,12 +187,15 @@ fn start() {
     bl configure_clk_sys2
     bl configure_clk_peri
     bl configure_clk_usb
-    // USB serial logging, from the usblog crate; needs clk_usb
-    bl usb_init
 
     // release reset for BUSCTRL, IO_BANK0 and PADS_BANK0
     mask @r0 = (1 << 1) | (1 << 6) | (1 << 9)
     bl reset
+    // PSRAM, in psram.sy; before usb_init starts core 1, which runs from
+    // flash
+    bl psram_init
+    // USB serial logging, from the usblog crate; needs clk_usb
+    bl usb_init
 
     // set up pad: 4mA, pull-down, Schmitt input
     pads_bank0 @r0 = peripherals.PADS_BANK0

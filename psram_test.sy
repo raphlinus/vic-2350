@@ -1,0 +1,643 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+// PSRAM tests, run once in demo_init and logged over USB, then a solid
+// blue screen. psram_init has already run, from start in main.sy.
+
+const PSRAM_CACHED = 0x11000000
+const PSRAM_UNCACHED = 0x15000000
+const PSRAM_SIZE = 0x800000
+const PSRAM_WORDS = PSRAM_SIZE / 4
+
+// clk_sys, for the retention waits
+const SYS_HZ = 144000000
+
+// The first mismatch of the last verify
+struct TestResult {
+    errors: u32
+    addr: u32
+    value: u32
+    expect: u32
+}
+
+static mut result: TestResult
+
+static ok_str: [u8; _] = "psram_ok "
+static id0_str: [u8; _] = "id0 "
+static id1_str: [u8; _] = "id1 "
+static boot_str: [u8; _] = "boot M0_TIMING M0_RFMT M0_RCMD M1_TIMING M1_RFMT M1_RCMD"
+static now_str: [u8; _] = "now M1_TIMING M1_RFMT M1_RCMD M1_WFMT M1_WCMD XIP_CTRL"
+static a_str: [u8; _] = "a: address in address, 8 MB, errors "
+static b_str: [u8; _] = "b: xorshift, 8 MB, errors "
+static c8_str: [u8; _] = "c: bytes, 32 KB, errors "
+static c16_str: [u8; _] = "c: halfwords, 32 KB, errors "
+static d_str: [u8; _] = "d: cached writes, 1 MB, errors "
+static e_str: [u8; _] = "e: rxdelay "
+static errors_str: [u8; _] = " errors "
+static f_rand_str: [u8; _] = "f: cycles for 1000 random uncached reads "
+static f_base_str: [u8; _] = "f: cycles for the same loop without reads "
+static f_seq_str: [u8; _] = "f: cycles for 16384 sequential uncached reads "
+static f_cached_str: [u8; _] = "f: cycles for 262144 sequential cached reads "
+static f_fill_str: [u8; _] = "f: cycles to write 8 MB uncached "
+static g1_str: [u8; _] = "g: retention after 1 s, errors "
+static g10_str: [u8; _] = "g: retention after 10 s more, errors "
+static first_str: [u8; _] = "  first at "
+static got_str: [u8; _] = " got "
+static want_str: [u8; _] = " want "
+static fail_str: [u8; _] = "psram_init failed"
+
+fn demo_init() {
+    push(r4, r5, r6, lr)
+    // enable the DWT cycle counter
+    demcr @r0 = &peripherals.PPB.DEMCR
+    v @r1 = *demcr
+    v |= 1 << 24
+    *demcr = v
+    dwt_ctrl @r0 = &peripherals.PPB.DWT_CTRL
+    v = *dwt_ctrl
+    v |= 1
+    *dwt_ctrl = v
+
+    p @r0 = &ok_str
+    len @r1 = count(ok_str)
+    ok @r2 = &psram_ok
+    v @r2 = *ok
+    bl log_kv
+    p @r0 = &id0_str
+    len @r1 = count(id0_str)
+    ids @r2 = &psram_id
+    v @r2 = *ids
+    bl log_kv
+    p @r0 = &id1_str
+    len @r1 = count(id1_str)
+    ids @r2 = &psram_id
+    v @r2 = *(ids + 4)
+    bl log_kv
+
+    p @r0 = &boot_str
+    len @r1 = count(boot_str)
+    bl log_str
+    regs @r4 = &psram_boot_regs
+    n @r5 = count(psram_boot_regs)
+    loop {
+        sp_ @r0 = 32
+        bl log_byte
+        v @r0 = *regs++
+        bl log_hex
+        #(n -= 1)
+        if #ne goto loop
+    }
+    nl @r0 = 10
+    bl log_byte
+
+    p @r0 = &now_str
+    len @r1 = count(now_str)
+    bl log_str
+    qmi @r4 = peripherals.QMI
+    regs @r4 = &qmi.M1_TIMING
+    n @r5 = 5
+    loop {
+        sp_ @r0 = 32
+        bl log_byte
+        v @r0 = *regs++
+        bl log_hex
+        #(n -= 1)
+        if #ne goto loop
+    }
+    sp_ @r0 = 32
+    bl log_byte
+    xip @r0 = peripherals.XIP_CTRL
+    v @r0 = xip.CTRL
+    bl log_hex
+    nl @r0 = 10
+    bl log_byte
+    bl log_flush
+
+    ok @r0 = &psram_ok
+    v @r0 = *ok
+    if {
+        if v != 0 goto end
+        p @r0 = &fail_str
+        len @r1 = count(fail_str)
+        bl log_str
+        goto finish
+    }
+
+    // a: each word holds its own address
+    p @r0 = PSRAM_UNCACHED as *u32
+    n @r1 = PSRAM_WORDS
+    bl fill_addr
+    p @r0 = PSRAM_UNCACHED as *u32
+    n @r1 = PSRAM_WORDS
+    bl verify_addr
+    p @r0 = &a_str
+    len @r1 = count(a_str)
+    bl log_result
+
+    // b: xorshift32 over all of it, timed
+    cyc @r4 = &peripherals.PPB.DWT_CYCCNT
+    t0 @r5 = *cyc
+    p @r0 = PSRAM_UNCACHED as *u32
+    n @r1 = PSRAM_WORDS
+    x @r2 = 0x12345678
+    bl fill_lfsr
+    cyc @r4 = &peripherals.PPB.DWT_CYCCNT
+    t @r6 = *cyc
+    t -= t0
+    p @r0 = PSRAM_UNCACHED as *u32
+    n @r1 = PSRAM_WORDS
+    x @r2 = 0x12345678
+    bl verify_lfsr
+    p @r0 = &b_str
+    len @r1 = count(b_str)
+    bl log_result
+    p @r0 = &f_fill_str
+    len @r1 = count(f_fill_str)
+    v @r2 = r6
+    bl log_kvd
+
+    // c: bytes then halfwords, each byte or halfword its address's low bits
+    p8 @r0 = (PSRAM_UNCACHED + 0x100000) as *u8
+    n @r1 = 0x8000
+    bl fill_bytes
+    p16 @r0 = (PSRAM_UNCACHED + 0x108000) as *u16
+    n @r1 = 0x4000
+    bl fill_halves
+    p @r0 = (PSRAM_UNCACHED + 0x100000) as *u32
+    n @r1 = 0x2000
+    bl verify_bytes
+    p @r0 = &c8_str
+    len @r1 = count(c8_str)
+    bl log_result
+    p @r0 = (PSRAM_UNCACHED + 0x108000) as *u32
+    n @r1 = 0x2000
+    bl verify_halves
+    p @r0 = &c16_str
+    len @r1 = count(c16_str)
+    bl log_result
+
+    // d: write 1 MB through the cache, clean it, read back uncached
+    p @r0 = PSRAM_CACHED as *u32
+    n @r1 = 0x40000
+    x @r2 = 0xcafef00d
+    bl fill_lfsr
+    bl xip_clean
+    p @r0 = PSRAM_UNCACHED as *u32
+    n @r1 = 0x40000
+    x @r2 = 0xcafef00d
+    bl verify_lfsr
+    p @r0 = &d_str
+    len @r1 = count(d_str)
+    bl log_result
+
+    // e: read 256 KB back with each RXDELAY
+    p @r0 = PSRAM_UNCACHED as *u32
+    n @r1 = 0x10000
+    x @r2 = 0x9e3779b9
+    bl fill_lfsr
+    rx @r4 = 0
+    loop {
+        timing @r0 = PSRAM_M1_TIMING & !0x700
+        timing |= rx << 8
+        bl psram_set_timing
+        p @r0 = PSRAM_UNCACHED as *u32
+        n @r1 = 0x10000
+        x @r2 = 0x9e3779b9
+        bl verify_lfsr
+        errors @r5 = r0
+        p @r0 = &e_str
+        len @r1 = count(e_str)
+        bl log_str
+        v @r0 = rx
+        bl log_dec
+        p @r0 = &errors_str
+        len @r1 = count(errors_str)
+        bl log_str
+        v @r0 = errors
+        bl log_dec
+        nl @r0 = 10
+        bl log_byte
+        bl log_flush
+        rx += 1
+        #(rx - 8)
+        if #ne goto loop
+    }
+    timing @r0 = PSRAM_M1_TIMING
+    bl psram_set_timing
+
+    // f: read latency and throughput
+    n @r0 = 1000
+    x @r1 = 0x2545f491
+    bl time_random
+    v @r2 = r0
+    p @r0 = &f_rand_str
+    len @r1 = count(f_rand_str)
+    bl log_kvd
+    n @r0 = 1000
+    x @r1 = 0x2545f491
+    bl time_random_base
+    v @r2 = r0
+    p @r0 = &f_base_str
+    len @r1 = count(f_base_str)
+    bl log_kvd
+    p @r0 = PSRAM_UNCACHED as *u32
+    n @r1 = 16384
+    bl time_seq
+    v @r2 = r0
+    p @r0 = &f_seq_str
+    len @r1 = count(f_seq_str)
+    bl log_kvd
+    // 2 MB in, so none of it is in the cache from d
+    p @r0 = (PSRAM_CACHED + 0x200000) as *u32
+    n @r1 = 262144
+    bl time_seq
+    v @r2 = r0
+    p @r0 = &f_cached_str
+    len @r1 = count(f_cached_str)
+    bl log_kvd
+
+    // g: retention, with the chip deselected and refreshing itself
+    p @r0 = PSRAM_UNCACHED as *u32
+    n @r1 = PSRAM_WORDS
+    x @r2 = 0x0badcafe
+    bl fill_lfsr
+    t @r0 = SYS_HZ
+    bl wait_cycles
+    p @r0 = PSRAM_UNCACHED as *u32
+    n @r1 = PSRAM_WORDS
+    x @r2 = 0x0badcafe
+    bl verify_lfsr
+    p @r0 = &g1_str
+    len @r1 = count(g1_str)
+    bl log_result
+    t @r0 = 10 * SYS_HZ
+    bl wait_cycles
+    p @r0 = PSRAM_UNCACHED as *u32
+    n @r1 = PSRAM_WORDS
+    x @r2 = 0x0badcafe
+    bl verify_lfsr
+    p @r0 = &g10_str
+    len @r1 = count(g10_str)
+    bl log_result
+
+finish:
+    bl log_end
+    pop(r4, r5, r6, pc)
+}
+
+// Log len bytes from p, then v in hex and a newline.
+fn log_kv(p: *u8, len: u32, v: u32) {
+    push(r4, lr)
+    v_saved @r4 = v
+    bl log_str
+    v @r0 = r4
+    bl log_hex
+    nl @r0 = 10
+    bl log_byte
+    bl log_flush
+    pop(r4, pc)
+}
+
+// Log len bytes from p, then v in decimal and a newline.
+fn log_kvd(p: *u8, len: u32, v: u32) {
+    push(r4, lr)
+    v_saved @r4 = v
+    bl log_str
+    v @r0 = r4
+    bl log_dec
+    nl @r0 = 10
+    bl log_byte
+    bl log_flush
+    pop(r4, pc)
+}
+
+// Log len bytes from p, then result's error count, and its first mismatch
+// if there was one.
+fn log_result(p: *u8, len: u32) {
+    push(r4, lr)
+    bl log_str
+    res @r4 = &result
+    v @r0 = res.errors
+    bl log_dec
+    res @r4 = &result
+    v @r0 = res.errors
+    if {
+        if v == 0 goto end
+        p @r0 = &first_str
+        len @r1 = count(first_str)
+        bl log_str
+        v @r0 = res.addr
+        bl log_hex
+        p @r0 = &got_str
+        len @r1 = count(got_str)
+        bl log_str
+        v @r0 = res.value
+        bl log_hex
+        p @r0 = &want_str
+        len @r1 = count(want_str)
+        bl log_str
+        v @r0 = res.expect
+        bl log_hex
+    }
+    nl @r0 = 10
+    bl log_byte
+    bl log_flush
+    pop(r4, pc)
+}
+
+// The test loops run from RAM, so they don't share the XIP cache or QMI
+// with flash.
+
+// Store each word's address in it.
+#[link_section = ".ram"]
+fn fill_addr(p: *u32, n: u32) {
+    loop {
+        v @r2 = p as u32
+        *p++ = v
+        #(n -= 1)
+        if #ne goto loop
+    }
+    bx lr
+}
+
+// Check fill_addr's n words from p, into result. Returns the error count.
+#[link_section = ".ram"]
+fn verify_addr(p: *u32, n: u32) {
+    push(r4, r5)
+    errors @r4 = 0
+    res @r5 = &result
+    res.errors = errors
+    loop {
+        e @r2 = p as u32
+        v @r3 = *p++
+        #(v - e)
+        if {
+            if #eq goto end
+            if {
+                if errors != 0 goto end
+                res.addr = e
+                res.value = v
+                res.expect = e
+            }
+            errors += 1
+        }
+        #(n -= 1)
+        if #ne goto loop
+    }
+    res.errors = errors
+    count_ @r0 = errors
+    pop(r4, r5)
+    bx lr
+}
+
+// Store n words of xorshift32 from seed x.
+#[link_section = ".ram"]
+fn fill_lfsr(p: *u32, n: u32, x: u32) {
+    loop {
+        x ^= x << 13
+        x ^= x >> 17
+        x ^= x << 5
+        *p++ = x
+        #(n -= 1)
+        if #ne goto loop
+    }
+    bx lr
+}
+
+// Check fill_lfsr's n words from p, into result. Returns the error count.
+#[link_section = ".ram"]
+fn verify_lfsr(p: *u32, n: u32, x: u32) {
+    push(r4, r5)
+    errors @r4 = 0
+    res @r5 = &result
+    res.errors = errors
+    loop {
+        x ^= x << 13
+        x ^= x >> 17
+        x ^= x << 5
+        v @r3 = *p++
+        #(v - x)
+        if {
+            if #eq goto end
+            if {
+                if errors != 0 goto end
+                a @r12 = p as u32
+                a -= 4
+                res.addr = a
+                res.value = v
+                res.expect = x
+            }
+            errors += 1
+        }
+        #(n -= 1)
+        if #ne goto loop
+    }
+    res.errors = errors
+    count_ @r0 = errors
+    pop(r4, r5)
+    bx lr
+}
+
+// Store the low byte of each byte's address in it, n bytes.
+#[link_section = ".ram"]
+fn fill_bytes(p: *u8, n: u32) {
+    loop {
+        v @r2 = p as u32
+        *p++ = v
+        #(n -= 1)
+        if #ne goto loop
+    }
+    bx lr
+}
+
+// Store bits 1..17 of each halfword's address in it, n halfwords.
+#[link_section = ".ram"]
+fn fill_halves(p: *u16, n: u32) {
+    loop {
+        v @r2 = (p as u32) >> 1
+        *p++ = v
+        #(n -= 1)
+        if #ne goto loop
+    }
+    bx lr
+}
+
+// Check fill_bytes as n words: the word at a is b, b + 1, b + 2, b + 3
+// with b = a & 0xff, which doesn't carry since a is aligned.
+#[link_section = ".ram"]
+fn verify_bytes(p: *u32, n: u32) {
+    push(r4, r5, r6)
+    errors @r4 = 0
+    res @r5 = &result
+    res.errors = errors
+    k1 @r6 = 0x01010101
+    k2 @r12 = 0x03020100
+    loop {
+        e @r2 = (p as u32)[0..8]
+        e = k2 + e * k1
+        v @r3 = *p++
+        #(v - e)
+        if {
+            if #eq goto end
+            if {
+                if errors != 0 goto end
+                a @r12 = p as u32
+                a -= 4
+                res.addr = a
+                res.value = v
+                res.expect = e
+                k2 @r12 = 0x03020100
+            }
+            errors += 1
+        }
+        #(n -= 1)
+        if #ne goto loop
+    }
+    res.errors = errors
+    count_ @r0 = errors
+    pop(r4, r5, r6)
+    bx lr
+}
+
+// Check fill_halves as n words: the word at a is h, h + 1 with
+// h = a[1..17], which is even since a is aligned.
+#[link_section = ".ram"]
+fn verify_halves(p: *u32, n: u32) {
+    push(r4, r5, r6)
+    errors @r4 = 0
+    res @r5 = &result
+    res.errors = errors
+    k1 @r6 = 0x00010001
+    k2 @r12 = 0x00010000
+    loop {
+        e @r2 = (p as u32)[1..17]
+        e = k2 + e * k1
+        v @r3 = *p++
+        #(v - e)
+        if {
+            if #eq goto end
+            if {
+                if errors != 0 goto end
+                a @r12 = p as u32
+                a -= 4
+                res.addr = a
+                res.value = v
+                res.expect = e
+                k2 @r12 = 0x00010000
+            }
+            errors += 1
+        }
+        #(n -= 1)
+        if #ne goto loop
+    }
+    res.errors = errors
+    count_ @r0 = errors
+    pop(r4, r5, r6)
+    bx lr
+}
+
+// Clean the whole XIP cache by set and way, writing back dirty lines. The
+// maintenance addresses are at the top of the XIP space, so the line tags
+// they leave behind (RP2350-E11) can't alias the QMI windows.
+#[link_section = ".ram"]
+fn xip_clean() {
+    p @r0 = 0x1bffc001 as *u8
+    n @r1 = 0x4000 / 8
+    zero @r2 = 0
+    loop {
+        *p = zero
+        p += 8
+        #(n -= 1)
+        if #ne goto loop
+    }
+    dsb
+    bx lr
+}
+
+// Cycles for n uncached reads at xorshift32 addresses from seed x.
+#[link_section = ".ram"]
+fn time_random(n: u32, x: u32) {
+    push(r4, r5)
+    base @r4 = PSRAM_UNCACHED as *u32
+    mask @r5 = PSRAM_SIZE - 4
+    cyc @r12 = &peripherals.PPB.DWT_CYCCNT
+    t0 @r3 = *cyc
+    loop {
+        x ^= x << 13
+        x ^= x >> 17
+        x ^= x << 5
+        a @r2 = x & mask
+        v @r2 = *(base + a)
+        #(n -= 1)
+        if #ne goto loop
+    }
+    t @r0 = *cyc
+    t -= t0
+    pop(r4, r5)
+    bx lr
+}
+
+// time_random without the reads.
+#[link_section = ".ram"]
+fn time_random_base(n: u32, x: u32) {
+    push(r4, r5)
+    base @r4 = PSRAM_UNCACHED as *u32
+    mask @r5 = PSRAM_SIZE - 4
+    cyc @r12 = &peripherals.PPB.DWT_CYCCNT
+    t0 @r3 = *cyc
+    loop {
+        x ^= x << 13
+        x ^= x >> 17
+        x ^= x << 5
+        a @r2 = x & mask
+        a = base + a
+        #(n -= 1)
+        if #ne goto loop
+    }
+    t @r0 = *cyc
+    t -= t0
+    pop(r4, r5)
+    bx lr
+}
+
+// Cycles for n sequential word reads from p.
+#[link_section = ".ram"]
+fn time_seq(p: *u32, n: u32) {
+    cyc @r12 = &peripherals.PPB.DWT_CYCCNT
+    t0 @r3 = *cyc
+    loop {
+        v @r2 = *p++
+        #(n -= 1)
+        if #ne goto loop
+    }
+    t @r0 = *cyc
+    t -= t0
+    bx lr
+}
+
+// Busy wait for n cycles.
+#[link_section = ".ram"]
+fn wait_cycles(n: u32) {
+    cyc @r1 = &peripherals.PPB.DWT_CYCCNT
+    t0 @r2 = *cyc
+    loop {
+        t @r3 = *cyc
+        t -= t0
+        #(t - n)
+        if #lo goto loop
+    }
+    bx lr
+}
+
+// A solid blue line.
+#[link_section = ".ram"]
+fn demo_line(y: u32, pixels: *u32) {
+    color @r2 = 0x001f001f
+    n @r3 = H_ACTIVE / 2
+    loop {
+        *pixels++ = color
+        #(n -= 1)
+        if #ne goto loop
+    }
+    bx lr
+}
