@@ -106,10 +106,11 @@ static mut err_line: [u32; 11] = [
     ERR_PIXELS, ERR_PIXELS, ERR_PIXELS, ERR_PIXELS,
 ]
 
-// Two line buffers, each an HSTX command followed by 640 RGB565 pixels.
-// The command word is stored at startup.
+// Four line buffers, each an HSTX command followed by 640 RGB565 pixels,
+// so the renderer can get up to three lines ahead, and absorb a stall of
+// about 95 us. The command word is stored at startup.
 const LINE_WORDS = 1 + H_ACTIVE / 2
-const N_LINES = 2
+const N_LINES = 4
 static mut video_lines: [[u32; LINE_WORDS]; N_LINES]
 const LINE_BYTES = LINE_WORDS * 4
 
@@ -121,7 +122,8 @@ struct LineState {
     missed: u32
 }
 
-const QUEUE_SIZE = 4
+// Room for all N_LINES lent lines, with one slot left empty
+const QUEUE_SIZE = 8
 
 struct Dvi {
     // First, so a buffer's state is at p + ix * 8
@@ -257,6 +259,8 @@ fn dvi_init() {
     cmd @r1 = HSTX_TMDS | H_ACTIVE
     *lines = cmd
     *(lines + LINE_BYTES) = cmd
+    *(lines + 2 * LINE_BYTES) = cmd
+    *(lines + 3 * LINE_BYTES) = cmd
     p @r0 = &dvi
     one @r1 = 1
     p.v_ctr = one
@@ -286,7 +290,7 @@ fn dvi_get_line() {
     rd += 1
     rd &= QUEUE_SIZE - 1
     p.queue_rd = rd
-    ix @r2 = y & 1
+    ix @r2 = y & (N_LINES - 1)
     stride @r3 = LINE_BYTES
     pixels @r1 = &video_lines + 4
     pixels += ix * stride
@@ -297,7 +301,7 @@ fn dvi_get_line() {
 // Give line y's buffer back, for the interrupt to send.
 fn dvi_release_line(y: u32) {
     p @r1 = &dvi
-    ix @r0 = y & 1
+    ix @r0 = y & (N_LINES - 1)
     line @r1 = (p + ix * 8) as *LineState
     zero @r2 = 0
     line.lent = zero
@@ -616,7 +620,7 @@ set_sync:
 line_done:
     #(y @r1 = v - V_ACTIVE_START)
     if #lo goto blank
-    ix @r1 = y & 1
+    ix @r1 = y & (N_LINES - 1)
     line @r12 = (p + ix * 8) as *LineState
     l @r0 = line.lent
     m @r12 = line.missed
@@ -648,14 +652,15 @@ set_line:
     ch.read_addr = cmds
     ch.trans_count = len
 
-    // Lend line v + 1's buffer to the renderer, unless it's still lent
-    // from two lines ago, in which case that line shows err_line.
+    // Lend line v + 3's buffer (the one line v - 1 just went out from)
+    // to the renderer, unless it's still lent from N_LINES lines ago, in
+    // which case that line shows err_line.
     p @r0 = &dvi
-    #(y @r1 = v - (V_ACTIVE_START - 1))
+    #(y @r1 = v - (V_ACTIVE_START - (N_LINES - 1)))
     if #lo goto advance
     #(y - V_ACTIVE)
     if #hs goto advance
-    ix @r2 = y & 1
+    ix @r2 = y & (N_LINES - 1)
     line @r12 = (p + ix * 8) as *LineState
     l @r2 = line.lent
     line.missed = l
