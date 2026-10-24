@@ -98,6 +98,7 @@ fn render_swap(list: *DisplayList) {
 }
 
 #[link_section = ".ram"]
+#[align = 4]
 fn render_line(y: u32, buf: *u16) {
     push(buf, r4, r5, r6, r7, r8, r9, lr)
     r @r2 = &render_state
@@ -220,6 +221,7 @@ no_more_active:
             if start == 0 goto end
             push(y, display_payload, ix)
             obj_arg @r0 = obj
+            nop
             blx start
             pop(y @r0, display_payload @r2, ix @r12)
         }
@@ -239,6 +241,7 @@ no_more_active:
     r.active_scratch = active_scratch
     active_end @r7 = active_dst
     y @r5 = y
+    nop
 
     // now actually run the rendering, taking another pass over active list
     while {
@@ -250,6 +253,7 @@ no_more_active:
         // ordered so that no load result is used by the next instruction
         vtable @r4 = active_obj.vtable
         x0 @r2 = active_obj.x0
+        nop
         render @r4 = vtable.render
         x1 @r1 = active_obj.x1
         buf @r3 = *sp // TODO: `sp.buf` or suchlike when we have stack placement

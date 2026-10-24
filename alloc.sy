@@ -99,13 +99,13 @@ candidate2:
 fn free(ptr: *Hole, size: u32) {
     head @r2 = &alloc_head
     size += 7
+    cur @r3 = head.next
     #(size &= !7)
     if #eq {
         size = 8
     }
     // Stop when cur is past ptr or null: cur - 1 >= ptr, unsigned,
     // covers both.
-    cur @r3 = head.next
     prev @r2 = head
     loop {
         t @r4 = cur - 1

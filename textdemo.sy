@@ -112,8 +112,8 @@ fn demo_init() {
 // isn't using, and swap it in.
 fn demo_main() {
     list @r4 = &frame_lists as *DisplayList
-    other @r5 = list + size(DisplayList)
     frame @r8 = 0
+    other @r5 = list + size(DisplayList)
     loop {
         l @r0 = list
         bl dl_clear
@@ -134,8 +134,8 @@ fn demo_main() {
         i @r6 = 0
         loop {
             e @r7 = &text_lines
-            e += i << 4
             rows @r0 = &text_rows
+            e += i << 4
             row @r1 = *(rows + i * 4)
             colors_p @r0 = &text_colors
             idx @r12 = row & 3
