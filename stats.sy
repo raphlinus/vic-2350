@@ -46,34 +46,40 @@ fn demo_line(y: u32, pixels: *u16) {
     bl render_line
     cyccnt @r2 = &peripherals.PPB.DWT_CYCCNT
     t @r3 = *cyccnt
-    t -= t0
+    // The common case, not a new max and not the last line, falls
+    // through, with the loads interleaved.
     s @r0 = &line_stats
+    t -= t0
     sum @r1 = s.sum
+    max @r2 = s.max
     sum += t
     s.sum = sum
-    max @r1 = s.max
     #(t - max)
-    if {
-        if #ls goto end
-        s.max = t
-    }
+    if #hi goto new_max
+max_done:
     // After the last line, the vertical blanking leaves time to log.
     last @r1 = V_ACTIVE - 1
     #(y_saved - last)
-    if {
-        if #ne goto end
-        frames @r1 = s.frames
-        frames += 1
-        s.frames = frames
-        #(frames - REPORT_FRAMES)
-        if #ne goto end
-        // Give the line back first, so the report can't make it late.
-        // render_irq_handler's second release is harmless.
-        y @r0 = r4
-        bl dvi_release_line
-        bl report_stats
-    }
+    if #eq goto last_line
+done:
     pop(r4, r5, r6, pc)
+
+new_max:
+    s.max = t
+    goto max_done
+
+last_line:
+    frames @r1 = s.frames
+    frames += 1
+    s.frames = frames
+    #(frames - REPORT_FRAMES)
+    if #ne goto done
+    // Give the line back first, so the report can't make it late.
+    // render_irq_handler's second release is harmless.
+    y @r0 = r4
+    bl dvi_release_line
+    bl report_stats
+    goto done
 }
 
 fn report_stats() {

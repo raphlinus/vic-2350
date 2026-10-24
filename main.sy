@@ -295,13 +295,14 @@ fn dvi_take_line() {
     p @r3 = &dvi
     rd @r2 = p.queue_rd
     wr @r1 = p.queue_wr
+    // fills the load's delay slot
+    queue @r12 = &p.queue
     if {
         #(rd - wr)
         if #ne goto end
         none @r0 = -1
         bx lr
     }
-    queue @r1 = &p.queue
     y @r0 = *(queue + rd * 4)
     rd += 1
     rd &= QUEUE_SIZE - 1
@@ -330,10 +331,14 @@ fn dvi_release_line(y: u32) {
 #[link_section = ".ram"]
 fn render_irq_handler() {
     push(r4, lr)
+    // Word-aligns the bl that starts each pass, which is branched to; it
+    // folds with the push, so it's free.
+    nop
     loop {
         bl dvi_take_line
         y @r0 = r0
-        #(y + 1)
+        // 16 bit, unlike cmn: the bl returns to it, and the beq folds
+        #(_ @r2 = y + 1)
         if #eq goto break
         pixels @r1 = r1
         saved_y @r4 = y
@@ -629,9 +634,9 @@ fn setup_dma() {
 fn dma_irq_0_handler() {
     p @r0 = &dvi
     pong @r1 = p.dma_pong
-    next @r2 = pong ^ 1
-    p.dma_pong = next
     dma @r2 = peripherals.DMA
+    next @r3 = pong ^ 1
+    p.dma_pong = next
     bit @r3 = 1
     bit <<= pong
     dma.INTR = bit

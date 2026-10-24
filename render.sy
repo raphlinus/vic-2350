@@ -161,14 +161,23 @@ fn render_line(y: u32, buf: *u16) {
         }
         if {
             if active_count == 0 goto end
-loop1:
+            // The common case, an active object that continues and comes
+            // before obj, falls through.
             loop {
                 active_obj @r3 = active_src.obj
+                active_src += 4
                 y1 @r6 = active_obj.y1
                 #(y - y1)
-                if #ne goto break
+                if #eq goto ending
+                // have both active and (maybe) new obj, pick whichever is lower
+                #(obj - active_obj)
+                if #ls goto new_first
+                *active_dst++ = active_obj
+                #(active_count -= 1)
+                if #ne goto loop // loop, but skip reloading obj
+                goto no_more_active
+ending:
                 vtable @r6 = active_obj.vtable
-                active_src += 4
                 end_fn @r6 = vtable.end
                 if {
                     if end_fn == 0 goto end
@@ -181,23 +190,16 @@ loop1:
                 if #ne goto loop
                 goto no_more_active
             }
-            // have both active and (maybe) new obj, pick whichever is lower
-            if {
-                #(obj - active_obj)
-                if #hi goto else
+new_first:
+            // active_obj stays active, and is looked at again
+            active_src -= 4
 store_obj:
-                *active_dst++ = obj
-                ix += 1
-                goto loop
-            } else {
-                *active_dst++ = active_obj
-                active_src += 4
-                #(active_count -= 1)
-                if #ne goto loop1 // loop, but skip reloading obj
-            }
+            *active_dst++ = obj
+            ix += 1
+            goto loop
         }
 no_more_active:
-        #(obj + 1)
+        #(_ @r6 = obj + 1)
         if #ne goto store_obj
     }
 
@@ -243,13 +245,14 @@ no_more_active:
     } loop {
         active_obj @r0 = active.obj
         active += 4
-        x0 @r2 = active_obj.x0
-        x1 @r4 = active_obj.x1
-        y_arg @r1 = y
-        x0x1 @r2 = pkhbt(x0, x1 << 16)
+        // ordered so that no load result is used by the next instruction
         vtable @r4 = active_obj.vtable
-        buf @r3 = *sp // TODO: `sp.buf` or suchlike when we have stack placement
+        x0 @r2 = active_obj.x0
         render @r4 = vtable.render
+        x1 @r1 = active_obj.x1
+        buf @r3 = *sp // TODO: `sp.buf` or suchlike when we have stack placement
+        x0x1 @r2 = pkhbt(x0, x1 << 16)
+        y_arg @r1 = y
         blx render
 
         #(active - active_end)
