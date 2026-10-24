@@ -1,6 +1,10 @@
 // Copyright 2026 Raph Levien
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+use "font.sy"
+use "main.sy"
+use "render.sy"
+
 // Text, with the font in font.sy. A text object's start method compiles
 // its string into Thumb code that renders one row of the text as 1bpp
 // pixels, packed least significant bit first, and that code is run once

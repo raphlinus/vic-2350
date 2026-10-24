@@ -1,6 +1,9 @@
 // Copyright 2026 Raph Levien
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+use "main.sy"
+use "render.sy"
+
 // Text: a background and lines of text in a few colors, including a file
 // list with sizes right aligned in a second column, and a line scrolling
 // sideways a pixel per frame, so its spans start at every bit alignment.

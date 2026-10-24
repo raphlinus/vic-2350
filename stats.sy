@@ -1,6 +1,8 @@
 // Copyright 2026 Raph Levien
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+use "main.sy"
+
 // Render timing for demos that use render.sy: demo_line times each
 // render_line with the DWT cycle counter, and logs the average and
 // maximum cycles per line, and the missed lines, about once per second.

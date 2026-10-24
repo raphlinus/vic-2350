@@ -1,6 +1,9 @@
 // Copyright 2026 Raph Levien
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+use "main.sy"
+use "render.sy"
+
 // Animated rectangles: a background and N_RECTS overlapping rectangles of
 // various sizes that bounce around the screen, built into a new display
 // list each frame.

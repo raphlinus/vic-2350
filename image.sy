@@ -1,6 +1,8 @@
 // Copyright 2026 Raph Levien
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+use "main.sy"
+
 // A 640x480 RGB565 image, compressed with pixel pair delta quantization,
 // from the image branch of pico-dvi-rs. image_data (in image.s) starts with
 // the width and height as u16s, then 256 pixel pair deltas, then the lines.

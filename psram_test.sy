@@ -1,6 +1,9 @@
 // Copyright 2026 Raph Levien
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+use "main.sy"
+use "psram.sy"
+
 // PSRAM tests, run once in demo_init and logged over USB, then a solid
 // blue screen. psram_init has already run, from start in main.sy.
 

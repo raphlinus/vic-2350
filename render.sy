@@ -1,6 +1,8 @@
 // Copyright 2026 Raph Levien
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+use "vec.sy"
+
 // The main renderer
 
 // A list of draw objects: the objects concatenated in draw order in

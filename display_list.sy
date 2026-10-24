@@ -1,6 +1,8 @@
 // Copyright 2026 Raph Levien
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+use "render.sy"
+
 // Building display lists, in thread mode. A list's payload and heads are
 // Vecs (vec.sy), so a list that is cleared and rebuilt each frame keeps its
 // allocations, and a steady scene doesn't allocate. Growing a Vec can't

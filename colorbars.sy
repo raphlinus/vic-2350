@@ -1,6 +1,8 @@
 // Copyright 2026 Raph Levien
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+use "render.sy"
+
 // The colorbars scene from pico-dvi-rs (without the text row), copied
 // into a freshly built display list each frame, to exercise the builder
 // and the swap.
