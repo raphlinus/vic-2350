@@ -8,11 +8,17 @@
 // signal with HSTX. Two chained DMA channels feed HSTX: channel 0 sends
 // each line's horizontal sync, channel 1 its content, either blanking or a
 // line of pixels. A DMA interrupt reprograms the channel that just
-// finished, and hands line buffers to the renderer, which runs in thread
-// mode and gets them with dvi_get_line. This follows the main branch of
-// pico-dvi-rs, without audio. Each demo is its own binary, and provides
-// demo_init, called once before DMA starts, and demo_line(y, pixels),
-// which draws a line. The LED toggles every 30 frames.
+// finished, and hands line buffers to the renderer, which runs in a lower
+// priority interrupt and takes them with dvi_take_line. This follows the
+// main branch of pico-dvi-rs, without audio. Each demo is its own binary,
+// and provides demo_init, called once before DMA starts, demo_main, run
+// in thread mode once DMA has started, and demo_line(y, pixels), which
+// draws a line. The LED toggles every 30 frames.
+//
+// Thread mode is the Cortex-M's ordinary, non-interrupt execution mode.
+// Both interrupts preempt it, so it gets whatever time is left after the
+// DMA interrupt and rendering. That's where a demo does its frame by
+// frame work, such as building the next display list.
 
 // The .image_def and .vectors are in startup.s.
 
@@ -41,6 +47,10 @@ const V_TOTAL = V_ACTIVE_START + V_ACTIVE
 
 // red LED on the Adafruit Fruit Jam
 const LED_PIN = 29
+
+// SPARE_IRQ_5 runs the renderer. System resources are taken from the top,
+// leaving the low numbers for the app.
+const RENDER_IRQ = 51
 
 // HSTX commands
 const HSTX_RAW = 0 << 12
@@ -230,27 +240,34 @@ fn start() {
     bl demo_init
     bl setup_dma
 
+    // The render interrupt is below DMA_IRQ_0 (priority 0), which can then
+    // preempt it. The M33 implements the top 4 bits of each priority byte;
+    // IRQ 51 is the top byte of IPR12.
+    nvic_ipr12 @r2 = &peripherals.PPB.NVIC_IPR12
+    priority @r3 = 0x80 << 24
+    *nvic_ipr12 = priority
+
     // enable interrupts globally
     cpsie(i)
 
-    // unmask DMA_IRQ_0
+    // unmask DMA_IRQ_0 and the render interrupt
     nvic_iser0 @r2 = &peripherals.PPB.NVIC_ISER0
     irq @r3 = 1 << 10
     *nvic_iser0 = irq
+    nvic_iser1 @r2 = &peripherals.PPB.NVIC_ISER1
+    irq = 1 << (RENDER_IRQ - 32)
+    *nvic_iser1 = irq
 
     // start channel 0
     dma @r2 = peripherals.DMA
     chan @r3 = 1
     dma.MULTI_CHAN_TRIGGER = chan
 
+    bl demo_main
+    // Rendering happens in interrupts, so thread mode is idle once the
+    // demo returns.
     loop {
-        bl dvi_get_line
-        y @r0 = r0
-        pixels @r1 = r1
-        push(y)
-        bl demo_line
-        pop(y @r0)
-        bl dvi_release_line
+        wfi
         goto loop
     }
 }
@@ -270,23 +287,19 @@ fn dvi_init() {
     bx lr
 }
 
-// Wait for the next line to render. Returns its number y in r0 and a
-// pointer to its pixels in r1, which belong to the caller until
-// dvi_release_line(y).
-//
-// For future optimization, we probably want to schedule this in an
-// interrupt, rather than doing blocking wait.
-fn dvi_get_line() {
+// Take the next line to render, if there is one. Returns its number y in
+// r0 and a pointer to its pixels in r1, which belong to the caller until
+// dvi_release_line(y), or -1 in r0 if the queue is empty.
+#[link_section = ".ram"]
+fn dvi_take_line() {
     p @r3 = &dvi
     rd @r2 = p.queue_rd
-    loop {
-        wr @r1 = p.queue_wr
+    wr @r1 = p.queue_wr
+    if {
         #(rd - wr)
-        if #ne goto break
-        // The interrupt that fills the queue does sev, so a push between
-        // the check and the wfe isn't missed.
-        wfe
-        goto loop
+        if #ne goto end
+        none @r0 = -1
+        bx lr
     }
     queue @r1 = &p.queue
     y @r0 = *(queue + rd * 4)
@@ -302,6 +315,7 @@ fn dvi_get_line() {
 }
 
 // Give line y's buffer back, for the interrupt to send.
+#[link_section = ".ram"]
 fn dvi_release_line(y: u32) {
     p @r1 = &dvi
     ix @r0 = y & (N_LINES - 1)
@@ -309,6 +323,26 @@ fn dvi_release_line(y: u32) {
     zero @r2 = 0
     line.lent = zero
     bx lr
+}
+
+// Render the lines the DMA interrupt has queued, until the queue is empty.
+// The DMA interrupt pends this one each time it queues a line.
+#[link_section = ".ram"]
+fn render_irq_handler() {
+    push(r4, lr)
+    loop {
+        bl dvi_take_line
+        y @r0 = r0
+        #(y + 1)
+        if #eq goto break
+        pixels @r1 = r1
+        saved_y @r4 = y
+        bl demo_line
+        y @r0 = saved_y
+        bl dvi_release_line
+        goto loop
+    }
+    pop(r4, pc)
 }
 
 fn default_handler() {
@@ -676,7 +710,9 @@ set_line:
     wr += 1
     wr &= QUEUE_SIZE - 1
     p.queue_wr = wr
-    sev
+    ispr @r2 = &peripherals.PPB.NVIC_ISPR1
+    bit @r12 = 1 << (RENDER_IRQ - 32)
+    *ispr = bit
 
 advance:
     v += 1

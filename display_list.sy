@@ -1,0 +1,89 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+// Building display lists, in thread mode. A list's payload and heads are
+// Vecs (vec.sy), so a list that is cleared and rebuilt each frame keeps its
+// allocations, and a steady scene doesn't allocate. Growing a Vec can't
+// happen in an interrupt, so none of this can run in one.
+
+// Empty list, keeping its allocations.
+fn dl_clear(list: *DisplayList) {
+    zero @r1 = 0
+    list.payload.len = zero
+    list.heads.len = zero
+    bx lr
+}
+
+// Append an object of size bytes (a multiple of 4) to list. Returns a
+// pointer to the object's storage, for the caller to fill in, valid until
+// the next dl_alloc. Returns 0 if there's no room, leaving the list's
+// contents unchanged.
+fn dl_alloc(list: *DisplayList, size: u32) {
+    push(r4, r5, r6, lr)
+    list @r4 = list
+    words @r5 = size >> 2
+    v @r0 = &list.heads
+    extra @r1 = 1
+    bl vec_reserve
+    ok @r0 = r0
+    if ok == 0 goto fail
+    v @r0 = &list.payload
+    extra @r1 = words
+    bl vec_reserve
+    ok @r0 = r0
+    if ok == 0 goto fail
+    // the object goes at the end of payload, and its offset at the end of
+    // heads
+    offset @r1 = list.payload.len
+    n @r2 = list.heads.len
+    heads @r3 = list.heads.ptr
+    *(heads + n * 4) = offset
+    n += 1
+    list.heads.len = n
+    payload @r0 = list.payload.ptr
+    obj @r0 = payload + (offset << 2)
+    offset += words
+    list.payload.len = offset
+    pop(r4, r5, r6, pc)
+fail:
+    zero @r0 = 0
+    pop(r4, r5, r6, pc)
+}
+
+// Sort list's heads by y0, keeping draw order among equal y0, as the
+// renderer requires. Insertion sort, good when lists are short.
+fn dl_finish(list: *DisplayList) {
+    push(r4, r5, r6, r7)
+    heads @r1 = list.heads.ptr
+    payload @r2 = list.payload.ptr
+    count @r3 = list.heads.len
+    i @r12 = 1
+    // TODO: this could be more micro-optimized
+    while {
+        #(i - count)
+        if #hs goto break
+    } loop {
+        key @r4 = *(heads + i * 4)
+        key_obj @r5 = (payload + (key << 2)) as *DisplayObj
+        key_y0 @r5 = key_obj.y0
+        // shift entries with a greater y0 up, then put key in the gap
+        p @r6 = heads + (i << 2)
+        loop {
+            #(p - heads)
+            if #eq goto break
+            other @r0 = *(p - 4)
+            other_obj @r7 = (payload + (other << 2)) as *DisplayObj
+            other_y0 @r7 = other_obj.y0
+            #(other_y0 - key_y0)
+            if #ls goto break
+            *p = other; p -= 4
+            goto loop
+        }
+        i += 1
+        #(i - count)
+        *p = key
+        if #lo goto loop
+    }
+    pop(r4, r5, r6, r7)
+    bx lr
+}

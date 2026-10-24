@@ -641,3 +641,8 @@ fn demo_line(y: u32, pixels: *u32) {
     }
     bx lr
 }
+
+// Nothing to do in thread mode
+fn demo_main() {
+    bx lr
+}

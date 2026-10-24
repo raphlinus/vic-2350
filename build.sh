@@ -29,7 +29,8 @@ demo() {
         --gc-sections --no-warn-rwx-segments -z noexecstack -o "build/$1.elf"
 }
 
-demo colorbars "render.sy colorbars.sy pico_alloc.sy" build/fill.o
+demo colorbars "vec.sy render.sy display_list.sy stats.sy colorbars.sy pico_alloc.sy alloc.sy" build/fill.o
+demo rects "vec.sy render.sy display_list.sy stats.sy rects.sy pico_alloc.sy alloc.sy" build/fill.o
 demo image image.sy build/image_data.o
 demo tiles "render_tiles.sy tiles.sy"
 demo psram_test psram_test.sy

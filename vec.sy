@@ -1,0 +1,71 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+// Growable arrays, allocated with alloc.sy. alloc.sy isn't reentrant, so
+// growing a Vec can't happen in an interrupt.
+
+// A growable array of words, like Rust's Vec<u32>. len and cap count words.
+struct Vec {
+    ptr: *u32
+    len: u32
+    cap: u32
+}
+
+// The smallest allocation for a Vec, in words
+const VEC_MIN_CAP = 16
+
+// Make room in v for extra more words, moving it to a bigger allocation if
+// needed. Capacity grows by doubling. Returns nonzero on success, or 0 if
+// there's no room, in which case v is unchanged.
+fn vec_reserve(v: *Vec, extra: u32) {
+    // alloc uses r0-r7 and free r0-r5
+    push(r4, r5, r6, r7, r8, r9, r10, lr)
+    len @r2 = v.len
+    cap @r3 = v.cap
+    needed @r1 = len + extra
+    // Already room: return v, which is nonzero
+    #(needed - cap)
+    if #ls goto done
+    new_cap @r10 = cap << 1
+    #(new_cap - VEC_MIN_CAP)
+    if #lo {
+        new_cap = VEC_MIN_CAP
+    }
+    loop {
+        #(new_cap - needed)
+        if #hs goto break
+        new_cap <<= 1
+        goto loop
+    }
+    v @r8 = v
+    len @r9 = len
+    size @r0 = new_cap << 2
+    align @r1 = 4
+    bl alloc
+    new @r0 = r0 as *u32
+    if new == 0 goto done
+    old @r1 = v.ptr
+    n @r3 = len
+    dst @r2 = new
+    new @r9 = new
+    while {
+        if n == 0 goto break
+    } loop {
+        #(n -= 1)
+        w @r4 = *old++
+        *dst++ = w
+        if #ne goto loop
+    }
+    old @r0 = v.ptr
+    old_cap @r1 = v.cap
+    v.ptr = new
+    v.cap = new_cap
+    if {
+        if old_cap == 0 goto end
+        size @r1 = old_cap << 2
+        bl free
+    }
+    ok @r0 = 1
+done:
+    pop(r4, r5, r6, r7, r8, r9, r10, pc)
+}

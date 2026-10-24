@@ -3,18 +3,36 @@
 
 // The main renderer
 
+// A list of draw objects: the objects concatenated in draw order in
+// payload, and the word offset of each in heads, sorted by y0. Lists are
+// built in thread mode with display_list.sy.
+struct DisplayList {
+    payload: Vec
+    heads: Vec
+}
+
 struct RenderState {
-    display_payload: *u32
-    display_heads: *u32
-    display_count: u32
+    // The list being rendered
+    list: *DisplayList
     y: u32
     display_head_ix: u32
     active: *ActiveEntry
     active_count: u32
     active_scratch: *ActiveEntry
+    // The next list, set by thread mode and taken at the start of a frame
+    swap_cell: *DisplayList
+    // The list replaced by the last swap, which thread mode then owns
+    retired: *DisplayList
 }
 
 static mut render_state: RenderState
+
+// The list before the first swap
+#[link_section = ".ram"]
+static empty_list = DisplayList {
+    payload: Vec { ptr: 0, len: 0, cap: 0 },
+    heads: Vec { ptr: 0, len: 0, cap: 0 },
+}
 
 struct DisplayObj {
     vtable: *DisplayVtable
@@ -43,6 +61,32 @@ fn render_init() {
     r @r0 = &render_state
     minusone @r1 = -1
     r.y = minusone
+    list @r1 = &empty_list
+    r.list = list
+    bx lr
+}
+
+// Make list the display list from the next frame on. Called from thread
+// mode. Waits until the renderer has taken it, then returns the list it
+// replaced, which the caller then owns and can reuse.
+//
+// TODO: the swap is morally atomic, but it only uses plain loads and
+// stores, which is enough while thread mode and the renderer share a
+// core. If the app runs on the other core, publishing and taking need
+// barriers or exclusive accesses, so the list's contents are visible
+// before the pointer to it.
+fn render_swap(list: *DisplayList) {
+    r @r1 = &render_state
+    r.swap_cell = list
+    loop {
+        cell @r0 = r.swap_cell
+        if cell == 0 goto break
+        // The renderer does sev after the swap, so one between the check
+        // and the wfe isn't missed.
+        wfe
+        goto loop
+    }
+    retired @r0 = r.retired
     bx lr
 }
 
@@ -62,6 +106,19 @@ fn render_line(y: u32, buf: *u16) {
         push(y)
         bl pico_reset
         r @r2 = &render_state
+        // Take the next list, if thread mode has set one. Nothing points
+        // into the old one once the active list is cleared below.
+        // TODO: atomics, see render_swap.
+        cell @r0 = r.swap_cell
+        if {
+            if cell == 0 goto end
+            old @r1 = r.list
+            r.retired = old
+            r.list = cell
+            zero @r0 = 0
+            r.swap_cell = zero
+            sev
+        }
         a0 @r0 = &active0
         r.active = a0
         a1 @r0 = &active1
@@ -80,9 +137,10 @@ fn render_line(y: u32, buf: *u16) {
     active_dst @r7 = r.active_scratch
     active_count @r4 = r.active_count
     ix @r12 = r.display_head_ix
-    end @r9 = r.display_count
-    display_heads @r8 = r.display_heads
-    display_payload @r2 = r.display_payload
+    list @r3 = r.list
+    end @r9 = list.heads.len
+    display_heads @r8 = list.heads.ptr
+    display_payload @r2 = list.payload.ptr
     loop {
         // TODO: deal with overflow of active_dst
         if {

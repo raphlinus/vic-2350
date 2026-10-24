@@ -51,3 +51,8 @@ fn demo_line(y: u32, pixels: *u32) {
     pop(r4, r5, r6, r7)
     bx lr
 }
+
+// Nothing to do in thread mode
+fn demo_main() {
+    bx lr
+}

@@ -1,0 +1,187 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+// Animated rectangles: a background and N_RECTS overlapping rectangles of
+// various sizes that bounce around the screen, built into a new display
+// list each frame.
+
+const N_RECTS = 64
+const BG_COLOR = 0x2104
+
+// A rectangle's position, velocity and size. Velocities are signed,
+// stored as u32.
+struct Mover {
+    x: u32
+    y: u32
+    dx: u32
+    dy: u32
+    w: u32
+    h: u32
+    color: u32
+}
+
+static mut movers: [Mover; N_RECTS] = [
+    Mover { x: 194, y: 94, dx: 4, dy: 3, w: 128, h: 134, color: 0xd1c7 },
+    Mover { x: 551, y: 355, dx: -4, dy: 2, w: 60, h: 100, color: 0x25ea },
+    Mover { x: 161, y: 319, dx: -4, dy: 2, w: 110, h: 94, color: 0x901e },
+    Mover { x: 398, y: 237, dx: 2, dy: 1, w: 134, h: 118, color: 0xb52a },
+    Mover { x: 4, y: 339, dx: -3, dy: 1, w: 48, h: 64, color: 0x2537 },
+    Mover { x: 85, y: 362, dx: 1, dy: -1, w: 122, h: 66, color: 0xc90f },
+    Mover { x: 110, y: 205, dx: -3, dy: -1, w: 34, h: 30, color: 0x4ea3 },
+    Mover { x: 214, y: 26, dx: 4, dy: 1, w: 86, h: 174, color: 0x527e },
+    Mover { x: 276, y: 172, dx: -3, dy: -1, w: 40, h: 34, color: 0xca20 },
+    Mover { x: 252, y: 51, dx: -4, dy: -3, w: 86, h: 146, color: 0x57d7 },
+    Mover { x: 521, y: 97, dx: -2, dy: 1, w: 84, h: 130, color: 0xc1da },
+    Mover { x: 276, y: 303, dx: 1, dy: -3, w: 62, h: 92, color: 0x95c4 },
+    Mover { x: 51, y: 21, dx: -2, dy: -2, w: 136, h: 112, color: 0x5479 },
+    Mover { x: 395, y: 37, dx: -3, dy: -3, w: 122, h: 76, color: 0xa989 },
+    Mover { x: 464, y: 65, dx: 4, dy: 2, w: 28, h: 34, color: 0x570c },
+    Mover { x: 233, y: 312, dx: -1, dy: 3, w: 86, h: 112, color: 0x82d9 },
+    Mover { x: 397, y: 247, dx: -3, dy: 1, w: 108, h: 164, color: 0xe5cb },
+    Mover { x: 401, y: 131, dx: 3, dy: 2, w: 72, h: 102, color: 0x55d6 },
+    Mover { x: 64, y: 116, dx: 4, dy: 2, w: 184, h: 94, color: 0xd1b5 },
+    Mover { x: 208, y: 383, dx: -4, dy: -3, w: 30, h: 46, color: 0x7ee4 },
+    Mover { x: 377, y: 271, dx: -2, dy: -3, w: 28, h: 44, color: 0x4b19 },
+    Mover { x: 353, y: 267, dx: -2, dy: 2, w: 152, h: 122, color: 0xeb09 },
+    Mover { x: 492, y: 17, dx: -4, dy: 2, w: 148, h: 112, color: 0x558f },
+    Mover { x: 74, y: 38, dx: 4, dy: 2, w: 96, h: 124, color: 0xa13a },
+    Mover { x: 66, y: 174, dx: 2, dy: -3, w: 156, h: 112, color: 0xb586 },
+    Mover { x: 30, y: 255, dx: -4, dy: 2, w: 118, h: 132, color: 0x25be },
+    Mover { x: 92, y: 327, dx: -3, dy: -1, w: 22, h: 42, color: 0xc90c },
+    Mover { x: 468, y: 225, dx: 4, dy: 2, w: 84, h: 60, color: 0x2721 },
+    Mover { x: 492, y: 11, dx: -1, dy: 3, w: 34, h: 30, color: 0x7b5c },
+    Mover { x: 11, y: 188, dx: 1, dy: -2, w: 100, h: 102, color: 0xe52c },
+    Mover { x: 452, y: 255, dx: -1, dy: -1, w: 64, h: 36, color: 0x1df2 },
+    Mover { x: 205, y: 109, dx: 3, dy: -2, w: 122, h: 80, color: 0xc1d7 },
+    Mover { x: 41, y: 364, dx: -3, dy: -1, w: 44, h: 44, color: 0x9645 },
+    Mover { x: 423, y: 195, dx: 4, dy: 3, w: 108, h: 60, color: 0x1276 },
+    Mover { x: 38, y: 16, dx: 1, dy: 2, w: 132, h: 142, color: 0xea8b },
+    Mover { x: 19, y: 328, dx: -2, dy: 1, w: 80, h: 104, color: 0x6f30 },
+    Mover { x: 144, y: 24, dx: -3, dy: 1, w: 100, h: 144, color: 0x7195 },
+    Mover { x: 79, y: 350, dx: -1, dy: -2, w: 90, h: 108, color: 0xd60b },
+    Mover { x: 37, y: 91, dx: -1, dy: -1, w: 128, h: 90, color: 0x15b8 },
+    Mover { x: 387, y: 81, dx: 3, dy: 3, w: 134, h: 134, color: 0xd0d1 },
+    Mover { x: 66, y: 230, dx: 4, dy: -2, w: 154, h: 112, color: 0x45a1 },
+    Mover { x: 514, y: 407, dx: 2, dy: 1, w: 74, h: 68, color: 0x29be },
+    Mover { x: 126, y: 109, dx: -1, dy: 1, w: 52, h: 30, color: 0xf3ea },
+    Mover { x: 328, y: 134, dx: -4, dy: -1, w: 108, h: 72, color: 0x07d0 },
+    Mover { x: 281, y: 249, dx: -4, dy: -2, w: 64, h: 70, color: 0x9976 },
+    Mover { x: 343, y: 71, dx: 4, dy: -2, w: 94, h: 148, color: 0x9da2 },
+    Mover { x: 450, y: 252, dx: -3, dy: -2, w: 98, h: 76, color: 0x047e },
+    Mover { x: 168, y: 267, dx: 1, dy: -1, w: 126, h: 116, color: 0xd1ed },
+    Mover { x: 155, y: 72, dx: 1, dy: 2, w: 134, h: 116, color: 0x2fc5 },
+    Mover { x: 386, y: 14, dx: -4, dy: 2, w: 30, h: 58, color: 0x61b9 },
+    Mover { x: 95, y: 85, dx: -3, dy: 2, w: 106, h: 180, color: 0xd401 },
+    Mover { x: 252, y: 242, dx: 4, dy: -2, w: 110, h: 126, color: 0x47bb },
+    Mover { x: 268, y: 162, dx: -3, dy: -2, w: 176, h: 98, color: 0xf29a },
+    Mover { x: 23, y: 18, dx: -1, dy: -2, w: 66, h: 50, color: 0x7586 },
+    Mover { x: 510, y: 53, dx: 4, dy: 3, w: 58, h: 72, color: 0x53dc },
+    Mover { x: 447, y: 11, dx: 3, dy: 3, w: 114, h: 84, color: 0xe9c6 },
+    Mover { x: 546, y: 326, dx: -1, dy: 2, w: 38, h: 58, color: 0x3ece },
+    Mover { x: 355, y: 92, dx: 2, dy: 2, w: 72, h: 120, color: 0xa2ba },
+    Mover { x: 99, y: 68, dx: -1, dy: -2, w: 76, h: 38, color: 0xf74a },
+    Mover { x: 431, y: 278, dx: -2, dy: -2, w: 50, h: 32, color: 0x1cf8 },
+    Mover { x: 366, y: 420, dx: 2, dy: -3, w: 24, h: 38, color: 0xe232 },
+    Mover { x: 193, y: 411, dx: -3, dy: 1, w: 94, h: 46, color: 0x4704 },
+    Mover { x: 492, y: 75, dx: -1, dy: -2, w: 90, h: 88, color: 0x5296 },
+    Mover { x: 97, y: 296, dx: -4, dy: -2, w: 40, h: 54, color: 0xbbea },
+]
+
+// Built alternately: one is rendered while the other is built.
+static mut frame_lists: [DisplayList; 2]
+
+fn demo_init() {
+    push(r4, lr)
+    bl stats_init
+    bl init_alloc
+    bl render_init
+    pop(r4, pc)
+}
+
+// Each frame, move the rectangles, build a list in one of frame_lists,
+// which the renderer isn't using, and swap it in.
+fn demo_main() {
+    list @r4 = &frame_lists as *DisplayList
+    other @r5 = list + size(DisplayList)
+    loop {
+        l @r0 = list
+        bl dl_clear
+
+        l @r0 = list
+        sz @r1 = size(Solid)
+        bl dl_alloc
+        obj @r0 = r0 as *u32
+        if {
+            if obj == 0 goto end
+            vt @r1 = &solid_vtable
+            zero @r2 = 0
+            x1y1 @r3 = H_ACTIVE | (V_ACTIVE << 16)
+            color @r12 = BG_COLOR
+            *obj = (vt, zero, x1y1, color)
+        }
+
+        m @r6 = &movers as *Mover
+        n @r7 = N_RECTS
+        loop {
+            l @r0 = list
+            sz @r1 = size(Solid)
+            bl dl_alloc
+            obj @r0 = r0 as *u32
+            if obj == 0 goto break
+            obj @r8 = obj
+
+            // Move, reversing at the edges. A position past either edge
+            // is above the last valid one, as unsigned.
+            x @r0 = m.x
+            dx @r1 = m.dx
+            w @r2 = m.w
+            limit @r12 = H_ACTIVE
+            nx @r3 = x + dx
+            limit -= w
+            #(nx - limit)
+            if {
+                if #ls goto end
+                dx = -dx
+                m.dx = dx
+                nx = x + dx
+            }
+            m.x = nx
+            x0 @r9 = nx
+            x1 @r10 = nx + w
+
+            y @r0 = m.y
+            dy @r1 = m.dy
+            h @r2 = m.h
+            limit = V_ACTIVE
+            ny @r3 = y + dy
+            limit -= h
+            #(ny - limit)
+            if {
+                if #ls goto end
+                dy = -dy
+                m.dy = dy
+                ny = y + dy
+            }
+            m.y = ny
+
+            vt @r0 = &solid_vtable
+            x0y0 @r1 = pkhbt(x0, ny << 16)
+            y1 @r3 = ny + h
+            x1y1 @r2 = pkhbt(x1, y1 << 16)
+            color @r3 = m.color
+            *obj = (vt, x0y0, x1y1, color)
+            m += size(Mover)
+            #(n -= 1)
+            if #ne goto loop
+        }
+
+        l @r0 = list
+        bl dl_finish
+        l @r0 = list
+        bl render_swap
+        t @r0 = list
+        list = other
+        other = t
+        goto loop
+    }
+}
