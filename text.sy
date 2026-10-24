@@ -1,0 +1,510 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+// Text, with the font in font.sy. A text object's start method compiles
+// its string into Thumb code that renders one row of the text as 1bpp
+// pixels, packed least significant bit first, and that code is run once
+// per line. The generated code takes the font row in r0 and the output in
+// r1, uses r2-r4, and for each glyph is:
+//
+//     ldr r4, [r0, #word]          @ the font word holding the glyph
+//     <delay>                      @ the previous glyph's last instruction
+//     ubfx r3, r4, #lsb, #width    @ the glyph's pixels
+//
+// r2 accumulates the output word containing the current position. The
+// delay instruction, which fills the load's delay slot, merges the glyph
+// into r2 with orr r2, r2, r3, lsl #shift. A glyph that crosses a word
+// boundary instead extracts into r4, puts the finished word in r3 and the
+// rest in r2, and its delay is stmia r1!, {r3}. When a glyph ends exactly
+// on a boundary, the next glyph stores r2 before its ubfx, and its delay
+// is movs r2, r3.
+
+// Instruction templates indexed by a 5 bit field, as two halfwords in a
+// word, which don't depend on the font: jit_orr[n] is orr r2, r2, r3,
+// lsl #n, the usual delay, and jit_ubfx[n] is ubfx r3, r4, #n, #0, ready
+// for the glyph's width to be added at bit 16.
+#[link_section = ".ram"]
+static mut jit_orr: [u32; 32]
+#[link_section = ".ram"]
+static mut jit_ubfx: [u32; 32]
+
+// Thumb encodings used by the generator
+const T_MOVS_R2_0 = 0x2200
+const T_MOVS_R2_R3 = 0x001a
+const T_STMIA_R2 = 0xc104
+const T_STMIA_R3 = 0xc108
+const T_BX_LR = 0x4770
+const T_LDR_R4_R0 = 0x6804
+// ubfx r3, r4, #0, #1, both halfwords; add 1 << 24 for Rd = r4
+const T_UBFX_R3_R4 = 0x0300f3c4
+// orr r2, r2, r3, lsl #0; add 0x01010000 for orr r3, r2, r4
+const T_ORR_R2_R2_R3 = 0x0203ea42
+// lsrs r2, r4, #32 - n is T_LSRS_R2_R4_32 - (n << 6)
+const T_LSRS_R2_R4_32 = 0x1022
+
+// Fill jit_orr and jit_ubfx. Call once, before any text is started.
+fn text_init() {
+    orr_t @r0 = &jit_orr
+    ubfx_t @r1 = &jit_ubfx
+    n @r2 = 32
+    loop {
+        #(n -= 1)
+        // n in the second halfword: imm3 in bits 12-14 and imm2 in bits 6-7
+        f @r3 = n & 3
+        hi @r12 = n >> 2
+        f <<= 22
+        f |= hi << 28
+        orr @r12 = T_ORR_R2_R2_R3
+        orr |= f
+        *(orr_t + n * 4) = orr
+        // width - 1 goes in bits 16-20, so take 1 off for the width to add
+        ubfx @r12 = T_UBFX_R3_R4
+        ubfx |= f
+        ubfx -= 1 << 16
+        *(ubfx_t + n * 4) = ubfx
+        if #ne goto loop
+    }
+    bx lr
+}
+
+// Compile n (at least 1) characters of text into code. Returns the end of
+// the code, which takes at most 14 * n + 6 bytes, with 2 more bytes of
+// room needed while generating.
+#[link_section = ".ram"]
+fn jit_text(code: *u16, text: *u8, n: u32) {
+    push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
+    glyphs @r9 = &font_glyphs
+    c @r8 = *text++
+    start @r11 = code
+    orr_t @lr = &jit_orr
+    ubfx_t @r5 = &jit_ubfx
+    glyphs -= FONT_FIRST * 4
+    ldr_base @r10 = T_LDR_R4_R0
+    // Each glyph's ldr goes in slot, ahead of the delay instruction,
+    // which is written as soon as it's known.
+    slot @r3 = code
+    first_delay @r7 = T_MOVS_R2_0
+    *(code + 2) = first_delay
+    code += 4
+    // shift: the glyph's position in the output word
+    shift @r6 = 0
+    loop {
+glyph:
+        // offset | width << 16
+        g @r12 = *(glyphs + c * 4)
+        // the next character, reading one past the end
+        c = *text++
+        // ldr r4, [r0, #offset / 32 words]; the font is narrower than 32
+        // words, so the offset fits. The width lands above bit 16, and
+        // strh leaves it out.
+        word @r4 = g >> 5
+        ldr @r7 = ldr_base + (word << 6)
+        lsb @r4 = g & 31
+        *slot = ldr
+        pair @r4 = *(ubfx_t + lsb * 4)
+        width @r7 = g >> 16
+        // where the glyph ends in the output word
+        last @r12 = shift + width
+        pair += width << 16
+        #(last - 32)
+        *(code as *u32) = pair
+        if #hi goto straddle
+        if shift == 0 goto boundary
+plain:
+        // the delay: orr r2, r2, r3, lsl #shift
+        d @r4 = *(orr_t + shift * 4)
+        shift = last & 31
+        *((code + 6) as *u32) = d
+        slot = code + 4
+        code += 10
+        #(n -= 1)
+        if #ne goto loop
+    }
+finish:
+    // The last slot isn't needed: move the last delay back over it, and
+    // end with stmia r1!, {r2}; bx lr.
+    d @r4 = *((slot + 2) as *u32)
+    code -= 2
+    *(slot as *u32) = d
+    tail @r12 = T_STMIA_R2 | (T_BX_LR << 16)
+    *(code as *u32) = tail
+    code += 4
+    pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
+
+straddle:
+    // ubfx r4, r4, ...; orr r3, r2, r4, lsl #shift;
+    // lsrs r2, r4, #32 - shift; then the delay is stmia r1!, {r3}
+    pair += 1 << 24
+    d @r7 = *(orr_t + shift * 4)
+    *(code as *u32) = pair
+    lsrs @r4 = T_LSRS_R2_R4_32
+    d += 0x01000000
+    lsrs -= shift << 6
+    d += 0x00010000
+    *((code + 4) as *u32) = d
+    stm @r7 = T_STMIA_R3
+    *(code + 8) = lsrs
+    *(code + 12) = stm
+    slot = code + 10
+    code += 14
+    shift = last - 32
+    #(n -= 1)
+    if #ne goto glyph
+    goto finish
+
+boundary:
+    // The previous glyph ended on a word boundary, unless this is the
+    // first glyph: store r2, ubfx, and the delay is movs r2, r3.
+    stm @r7 = T_STMIA_R2
+    #(slot - start)
+    if #eq goto plain
+    *code = stm
+    *((code + 2) as *u32) = pair
+    movs @r7 = T_MOVS_R2_R3
+    *(code + 8) = movs
+    slot = code + 6
+    code += 10
+    shift = last & 31
+    #(n -= 1)
+    if #ne goto glyph
+    goto finish
+}
+
+// A text object: this header, then the text, len bytes, padded to a word.
+// Its height is FONT_HEIGHT. Use text_add to make one.
+struct Text {
+    vtable: *DisplayVtable
+    x0: u16
+    y0: u16
+    x1: u16
+    y1: u16
+    // The RGB565 pixel pairs for each 2 bits n of a row, first pixel in
+    // the low half, a 1 bit being the foreground: bg bg, fg bg, bg fg and
+    // fg fg.
+    pairs: [u32; 4]
+    len: u32
+    // of the whole text, in pixels; x1 may clip it
+    width: u32
+    // Set by text_start: the scratch block, which holds the row's bits
+    // and then the code; and the y the bits were made for.
+    scratch: *u32
+    bits: *u32
+    code: *u8
+    row_y: u32
+}
+
+#[link_section = ".ram"]
+static text_vtable = DisplayVtable {
+    render: text_render,
+    start: text_start,
+    end: text_end,
+}
+
+// Allocate the scratch block and compile the text. If there's no room, scratch is 0, and the text renders as its
+// background color.
+#[link_section = ".ram"]
+fn text_start(self: *Text) {
+    push(r4, r5, r6, lr)
+    self @r4 = self
+    width @r1 = self.width
+    len @r2 = self.len
+    // the bits, plus a word that the funnel shift in text_render reads
+    words @r5 = width + 31
+    words >>= 5
+    words += 1
+    // the bits, and at most 14 * len + 8 bytes of code
+    k @r3 = 14
+    size @r0 = len * k
+    size += 8
+    size += words << 2
+    bl pico_alloc
+    bits @r0 = r0 as *u32
+    self.scratch = bits
+    if bits == 0 goto done
+    self.bits = bits
+    code @r5 = bits + (words << 2)
+    text @r1 = self as *u8
+    text += size(Text)
+    len @r2 = self.len
+    arg @r0 = code
+    bl jit_text
+    code += 1
+    self.code = code
+    none @r0 = -1
+    self.row_y = none
+    // the code is fetched from RAM that was just written
+    dsb
+    isb
+done:
+    pop(r4, r5, r6, pc)
+}
+
+#[link_section = ".ram"]
+fn text_end(self: *Text) {
+    p @r0 = self.scratch
+    goto pico_free
+}
+
+// Render the span x0..x1 of line y. The first span of a line runs the
+// generated code to make the row's bits; then each span expands its bits
+// to pixels, 2 bits at a time, with the object's pixel pairs.
+#[link_section = ".ram"]
+fn text_render(self: *Text, y: u32, x1x0: u32, buf: *u16) {
+    push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
+    self @r5 = self
+    x1x0 @r6 = x1x0
+    buf @r7 = buf
+    scratch @r4 = self.scratch
+    row_y @r0 = self.row_y
+    // too far for cbz
+    #(scratch - 0)
+    ox0 @r9 = self.x0
+    if #eq goto no_scratch
+    #(y - row_y)
+    t @r8 = &self.pairs
+    if {
+        if #eq goto end
+        self.row_y = y
+        y0 @r2 = self.y0
+        stride @r3 = FONT_STRIDE
+        row @r0 = &font_bits
+        d @r2 = y - y0
+        row += d * stride
+        bits @r1 = self.bits
+        code @r2 = self.code
+        // uses r0-r4
+        blx code
+    }
+
+    x0 @r0 = x1x0[0..16]
+    x1 @r1 = x1x0 >> 16
+    // one pixel first if x0 is odd, so dst is word aligned
+    #(x0 & 1)
+    n @r10 = x1 - x0
+    b @r2 = x0 - ox0
+    bits @r3 = self.bits
+    dst @r7 = buf + (x0 << 1)
+    if {
+        if #eq goto end
+        i @r1 = b >> 5
+        w0 @r1 = *(bits + i * 4)
+        s0 @r4 = b & 31
+        w0 >>= s0
+        v @r1 = w0 & 1
+        pix @r1 = *((t + v * 4) as *u16)
+        b += 1
+        *dst++ = pix
+        n -= 1
+    }
+    // Funnel shift: each window of 32 bits starting at b is
+    // (cur >> s) | (next << (32 - s)), where cur and next are successive
+    // words of bits. With s = 0, the shift by 32 gives 0.
+    // 32 pixels at a time; n is biased by -32
+    i @r1 = b >> 5
+    #(n -= 32)
+    p @r9 = bits + (i << 2)
+    s @r11 = b & 31
+    cur @lr = *p
+    rs @r12 = 32 - s
+    dst32 @r7 = dst as *u32
+    // the first window
+    next @r4 = *(p + 4)
+    lo @r5 = cur >> s
+    p += 4
+    cur = next
+    hi @r4 = next << rs
+    w @r6 = lo | hi
+    if #lo goto tail
+    // Each group of 8 pixels extracts four 2 bit fields, loads their pairs,
+    // and stores them. Between the last load and the store goes a step
+    // toward the next window.
+    loop {
+        f0 @r0 = w[0..2]
+        f1 @r1 = w[2..4]
+        f2 @r2 = w[4..6]
+        f3 @r3 = w[6..8]
+        q0 @r0 = *(t + f0 * 4)
+        q1 @r1 = *(t + f1 * 4)
+        q2 @r2 = *(t + f2 * 4)
+        q3 @r3 = *(t + f3 * 4)
+        *dst32++ = (q0, q1, q2, q3)
+        f0 @r0 = w[8..10]
+        f1 @r1 = w[10..12]
+        f2 @r2 = w[12..14]
+        f3 @r3 = w[14..16]
+        q0 @r0 = *(t + f0 * 4)
+        q1 @r1 = *(t + f1 * 4)
+        q2 @r2 = *(t + f2 * 4)
+        q3 @r3 = *(t + f3 * 4)
+        lo @r5 = cur >> s
+        *dst32++ = (q0, q1, q2, q3)
+        f0 @r0 = w[16..18]
+        f1 @r1 = w[18..20]
+        f2 @r2 = w[20..22]
+        f3 @r3 = w[22..24]
+        q0 @r0 = *(t + f0 * 4)
+        q1 @r1 = *(t + f1 * 4)
+        q2 @r2 = *(t + f2 * 4)
+        q3 @r3 = *(t + f3 * 4)
+        cur = *(p + 4)
+        *dst32++ = (q0, q1, q2, q3)
+        f0 @r0 = w[24..26]
+        f1 @r1 = w[26..28]
+        f2 @r2 = w[28..30]
+        f3 @r3 = w[30..32]
+        q0 @r0 = *(t + f0 * 4)
+        q1 @r1 = *(t + f1 * 4)
+        q2 @r2 = *(t + f2 * 4)
+        q3 @r3 = *(t + f3 * 4)
+        hi @r4 = cur << rs
+        *dst32++ = (q0, q1, q2, q3)
+        #(n -= 32)
+        w @r6 = lo | hi
+        p += 4
+        if #hs goto loop
+    }
+
+tail:
+    // The last 0 to 31 pixels, all in the window w. rem is the pixels
+    // left, biased by -4: n + 28 carries when at least 4 are left.
+    #(rem @r1 = n + 28)
+    f0 @r4 = w[0..2]
+    if #lo goto pairs
+    loop {
+        f1 @r3 = w[2..4]
+        q0 @r2 = *(t + f0 * 4)
+        q1 @r3 = *(t + f1 * 4)
+        w >>= 4
+        #(rem -= 4)
+        f0 @r4 = w[0..2]
+        *dst32++ = (q0, q1)
+        if #hs goto loop
+    }
+pairs:
+    // with the bias, the low two bits of rem are the pixels left
+    #(rem & 2)
+    q0 @r2 = *(t + f0 * 4)
+    if #eq goto single
+    w >>= 2
+    *dst32++ = q0
+single:
+    #(rem & 1)
+    f0 @r4 = w & 1
+    if #eq goto done
+    pix @r2 = *((t + f0 * 4) as *u16)
+    *(dst32 as *u16) = pix
+done:
+    pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
+
+no_scratch:
+    x0 @r0 = x1x0[0..16]
+    x1 @r2 = x1x0 >> 16
+    count @r2 = x1 - x0
+    pairs @r1 = &self.pairs
+    color @r1 = *pairs
+    dst @r0 = buf + (x0 << 1)
+    bl fill_16
+    pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
+}
+
+// The width in pixels of the len characters at s.
+fn text_width(s: *u8, len: u32) {
+    // glyph widths, the high halves of font_glyphs
+    widths @r2 = (&font_glyphs + 2) as *u16
+    widths -= FONT_FIRST * 4
+    width @r3 = 0
+    while {
+        if len == 0 goto break
+    } loop {
+        c @r12 = *s++
+        #(len -= 1)
+        w @r12 = *(widths + c * 4)
+        width += w
+        if #ne goto loop
+    }
+    result @r0 = width
+    bx lr
+}
+
+// Append a text object to list, for the len characters at s, at x, y
+// (packed as x | y << 16) in colors fg | bg << 16. The text is cut off at
+// the right edge of the screen. Called from thread mode.
+fn text_add(list: *DisplayList, xy: u32, colors: u32, s: *u8, len: u32) {
+    push(r4, r5, r6, r7, r8, r9, lr)
+    list @r4 = list
+    xy @r5 = xy
+    colors @r6 = colors
+    s @r7 = s
+    // the fifth argument, past the 7 registers pushed above
+    len @r9 = *(sp + 28)
+    // Count the characters that are at least partly on screen, and their
+    // width.
+    x0 @r0 = xy[0..16]
+    room @r1 = H_ACTIVE - x0
+    // glyph widths, the high halves of font_glyphs
+    widths @r2 = (&font_glyphs + 2) as *u16
+    widths -= FONT_FIRST * 4
+    p @r3 = s
+    end @r9 = s + len
+    width @r8 = 0
+    w @r12 = 0
+    loop {
+        width += w
+        #(width - room)
+        // may load one past the end, unused
+        c @r0 = *p
+        if #hs goto break
+        #(p - end)
+        w = *(widths + c * 4)
+        if #eq goto break
+        p += 1
+        goto loop
+    }
+    len @r9 = p - s
+    l @r0 = list
+    sz @r1 = len + size(Text) + 3
+    sz &= !3
+    bl dl_alloc
+    obj @r0 = r0 as *Text
+    if obj == 0 goto done
+    vt @r1 = &text_vtable
+    obj.vtable = vt
+    x @r1 = xy[0..16]
+    obj.x0 = x
+    y @r2 = xy >> 16
+    obj.y0 = y
+    x1 @r3 = x + width
+    room @r12 = H_ACTIVE
+    #(x1 - room)
+    if #hi {
+        x1 = room
+    }
+    obj.x1 = x1
+    y += FONT_HEIGHT
+    obj.y1 = y
+    // the pixel pairs; fg bg is colors itself
+    pairs @r1 = &obj.pairs
+    bg @r2 = colors >> 16
+    pair0 @r2 = pkhbt(bg, bg << 16)
+    pair1 @r3 = colors
+    pair2 @r12 = ror(colors, 16)
+    fg @lr = colors[0..16]
+    pair3 @lr = pkhbt(fg, fg << 16)
+    *pairs = (pair0, pair1, pair2, pair3)
+    obj.len = len
+    obj.width = width
+    // copy the text
+    dst @r1 = obj as *u8
+    dst += size(Text)
+    n @r3 = len
+    while {
+        if n == 0 goto break
+    } loop {
+        c @r2 = *s++
+        #(n -= 1)
+        *dst++ = c
+        if #ne goto loop
+    }
+done:
+    pop(r4, r5, r6, r7, r8, r9, pc)
+}

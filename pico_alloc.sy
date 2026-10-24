@@ -3,8 +3,10 @@
 
 // A really tiny bitmap allocator, suitable for renderer temporaries.
 
-const N_BLOCKS = 16
-const LOG_BLOCK_SIZE = 7
+// 31 blocks keeps the masks, such as the initial free mask
+// (1 << N_BLOCKS) - 1, within a word without special cases.
+const N_BLOCKS = 31
+const LOG_BLOCK_SIZE = 8
 const BLOCK_SIZE = 1 << LOG_BLOCK_SIZE
 static mut pico_heap: [u32; N_BLOCKS * BLOCK_SIZE / 4]
 // free mask is last

@@ -1,0 +1,186 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+// Text: a background and lines of text in a few colors, including a file
+// list with sizes right aligned in a second column, and a line scrolling
+// sideways a pixel per frame, so its spans start at every bit alignment.
+// Built into a new display list each frame.
+
+const TEXT_TOP = 24
+const TEXT_LEFT = 8
+// the right edge of the second column
+const COLUMN_RIGHT = 200
+const LINE_PITCH = 16
+const BG_COLOR = 0x0841
+
+static t0: [u8; _] = "vic-2350: text rendered by code compiled at the start of each text object"
+static t1: [u8; _] = "scrolling: The quick brown fox jumps over the lazy dog."
+static t2: [u8; _] = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+static t4: [u8; _] = "README.md"
+static c4: [u8; _] = "1214"
+static t5: [u8; _] = "LICENSE-APACHE"
+static c5: [u8; _] = "10847"
+static t6: [u8; _] = "LICENSE-MIT"
+static c6: [u8; _] = "1023"
+static t7: [u8; _] = "alloc.sy"
+static c7: [u8; _] = "4410"
+static t8: [u8; _] = "colorbars.sy"
+static c8: [u8; _] = "3920"
+static t9: [u8; _] = "display_list.sy"
+static c9: [u8; _] = "2731"
+static t10: [u8; _] = "fill.sy"
+static c10: [u8; _] = "1797"
+static t11: [u8; _] = "font.sy"
+static c11: [u8; _] = "5265"
+static t12: [u8; _] = "main.sy"
+static c12: [u8; _] = "20514"
+static t13: [u8; _] = "pico_alloc.sy"
+static c13: [u8; _] = "1675"
+static t14: [u8; _] = "rects.sy"
+static c14: [u8; _] = "6123"
+static t15: [u8; _] = "render.sy"
+static c15: [u8; _] = "8790"
+static t16: [u8; _] = "stats.sy"
+static c16: [u8; _] = "3086"
+static t17: [u8; _] = "text.sy"
+static c17: [u8; _] = "14562"
+static t18: [u8; _] = "vec.sy"
+static c18: [u8; _] = "1934"
+static t20: [u8; _] = "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW"
+static t21: [u8; _] = "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii"
+static t22: [u8; _] = "Mixed: AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz 0123456789"
+static t23: [u8; _] = "Every glyph, every alignment, and the right edge clips this line, which is far too long to fit"
+static t24: [u8; _] = "The end."
+
+const N_TEXT = 23
+
+// Each line's text, and the text of its second column, if any, as
+// pointer and length
+static text_lines: [u32; N_TEXT * 4] = [
+    &t0, count(t0), 0, 0,
+    &t1, count(t1), 0, 0,
+    &t2, count(t2), 0, 0,
+    &t4, count(t4), &c4, count(c4),
+    &t5, count(t5), &c5, count(c5),
+    &t6, count(t6), &c6, count(c6),
+    &t7, count(t7), &c7, count(c7),
+    &t8, count(t8), &c8, count(c8),
+    &t9, count(t9), &c9, count(c9),
+    &t10, count(t10), &c10, count(c10),
+    &t11, count(t11), &c11, count(c11),
+    &t12, count(t12), &c12, count(c12),
+    &t13, count(t13), &c13, count(c13),
+    &t14, count(t14), &c14, count(c14),
+    &t15, count(t15), &c15, count(c15),
+    &t16, count(t16), &c16, count(c16),
+    &t17, count(t17), &c17, count(c17),
+    &t18, count(t18), &c18, count(c18),
+    &t20, count(t20), 0, 0,
+    &t21, count(t21), 0, 0,
+    &t22, count(t22), 0, 0,
+    &t23, count(t23), 0, 0,
+    &t24, count(t24), 0, 0,
+]
+static text_rows: [u32; N_TEXT] = [
+    0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24,
+]
+
+// fg | bg << 16, chosen by row & 3
+static text_colors: [u32; 4] = [
+    0xffff | (BG_COLOR << 16),
+    0xffe0 | (BG_COLOR << 16),
+    0x07ff | (BG_COLOR << 16),
+    0x0000 | (0xc618 << 16),
+]
+
+// Built alternately: one is rendered while the other is built.
+static mut frame_lists: [DisplayList; 2]
+
+fn demo_init() {
+    push(r4, lr)
+    bl stats_init
+    bl init_alloc
+    bl render_init
+    bl text_init
+    pop(r4, pc)
+}
+
+// Each frame, build a list in one of frame_lists, which the renderer
+// isn't using, and swap it in.
+fn demo_main() {
+    list @r4 = &frame_lists as *DisplayList
+    other @r5 = list + size(DisplayList)
+    frame @r8 = 0
+    loop {
+        l @r0 = list
+        bl dl_clear
+
+        l @r0 = list
+        sz @r1 = size(Solid)
+        bl dl_alloc
+        obj @r0 = r0 as *u32
+        if {
+            if obj == 0 goto end
+            vt @r1 = &solid_vtable
+            zero @r2 = 0
+            x1y1 @r3 = H_ACTIVE | (V_ACTIVE << 16)
+            color @r12 = BG_COLOR
+            *obj = (vt, zero, x1y1, color)
+        }
+
+        i @r6 = 0
+        loop {
+            e @r7 = &text_lines
+            e += i << 4
+            rows @r0 = &text_rows
+            row @r1 = *(rows + i * 4)
+            colors_p @r0 = &text_colors
+            idx @r12 = row & 3
+            colors @r9 = *(colors_p + idx * 4)
+            y @r10 = row * LINE_PITCH
+            y += TEXT_TOP
+            // the second line scrolls
+            x @r12 = TEXT_LEFT
+            if {
+                #(i - 1)
+                if #ne goto end
+                dx @r0 = frame & 63
+                x += dx
+            }
+            xy @r1 = pkhbt(x, y << 16)
+            (s @r3, len @r12) = *e
+            l @r0 = list
+            c @r2 = colors
+            push(len)
+            bl text_add
+            sp += 4
+
+            // the second column, right aligned
+            (s @r0, len @r1) = *(e + 8)
+            if len == 0 goto next
+            bl text_width
+            x @r12 = COLUMN_RIGHT - r0
+            xy @r1 = pkhbt(x, y << 16)
+            (s @r3, len @r12) = *(e + 8)
+            l @r0 = list
+            c @r2 = colors
+            push(len)
+            bl text_add
+            sp += 4
+next:
+            i += 1
+            #(i - N_TEXT)
+            if #ne goto loop
+        }
+
+        l @r0 = list
+        bl dl_finish
+        l @r0 = list
+        bl render_swap
+        t @r0 = list
+        list = other
+        other = t
+        frame += 1
+        goto loop
+    }
+}

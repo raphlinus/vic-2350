@@ -135,9 +135,8 @@ fn demo_main() {
             x @r0 = m.x
             dx @r1 = m.dx
             w @r2 = m.w
-            limit @r12 = H_ACTIVE
+            limit @r12 = H_ACTIVE - w
             nx @r3 = x + dx
-            limit -= w
             #(nx - limit)
             if {
                 if #ls goto end
@@ -152,9 +151,8 @@ fn demo_main() {
             y @r0 = m.y
             dy @r1 = m.dy
             h @r2 = m.h
-            limit = V_ACTIVE
+            limit @r12 = V_ACTIVE - h
             ny @r3 = y + dy
-            limit -= h
             #(ny - limit)
             if {
                 if #ls goto end

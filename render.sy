@@ -40,13 +40,19 @@ struct DisplayObj {
     y0: u16
     x1: u16
     y1: u16
-    scratch: u32 // optional, only if vtable.start != 0
 }
 
 // These are actually function pointers, but we haven't built out the types yet.
+//
+// start(obj) is called on the object's first line and end(obj) after its
+// last; either may be 0. An object that needs scratch memory allocates it
+// in start with pico_alloc and frees it in end. end isn't called for an
+// object still active at the end of the frame, since pico_reset at the
+// start of the next one reclaims everything.
 struct DisplayVtable {
     render: *u8
     start: *u8
+    end: *u8
 }
 
 struct ActiveEntry {
@@ -72,9 +78,8 @@ fn render_init() {
 //
 // TODO: the swap is morally atomic, but it only uses plain loads and
 // stores, which is enough while thread mode and the renderer share a
-// core. If the app runs on the other core, publishing and taking need
-// barriers or exclusive accesses, so the list's contents are visible
-// before the pointer to it.
+// core. If the app runs on the other core, we may need to use proper
+// atomic ordering.
 fn render_swap(list: *DisplayList) {
     r @r1 = &render_state
     r.swap_cell = list
@@ -164,13 +169,12 @@ loop1:
                 if #ne goto break
                 vtable @r6 = active_obj.vtable
                 active_src += 4
-                // drop scratch alloc if vtable.start != 0
-                start @r6 = vtable.start
+                end_fn @r6 = vtable.end
                 if {
-                    if start == 0 goto end
+                    if end_fn == 0 goto end
                     push(y, active_src, display_payload, ix)
-                    buf @r0 = active_obj.scratch
-                    bl pico_free
+                    obj_arg @r0 = active_obj
+                    blx end_fn
                     pop(y @r0, active_src @r1, display_payload @r2, ix @r12)
                 }
                 #(active_count -= 1)
@@ -213,10 +217,6 @@ no_more_active:
             push(y, display_payload, ix)
             obj_arg @r0 = obj
             blx start
-            bl pico_alloc
-            // should we deal with allocation failure here? We could make
-            // the draw object handle it.
-            obj.scratch = r0
             pop(y @r0, display_payload @r2, ix @r12)
         }
         old_ix += 1
@@ -285,4 +285,5 @@ fn solid_render(self: *Solid, y: u32, x1x0: u32, buf: *u16) {
 static solid_vtable = DisplayVtable {
     render: solid_render,
     start: 0,
+    end: 0,
 }
