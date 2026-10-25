@@ -15,12 +15,15 @@ set -e
 
 ELF=${1:?usage: tools/run.sh ELF [timeout_seconds]}
 TIMEOUT=${2:-10}
-if [ -z "$PICOTOOL" ]; then
-    PICOTOOL=$(command -v picotool || echo "$HOME/dl/picotool/build/picotool")
+PICOTOOL=${PICOTOOL:-picotool}
+if ! command -v "$PICOTOOL" >/dev/null; then
+    echo "run.sh: picotool not found; install it or set PICOTOOL" >&2
+    exit 2
 fi
 
+# macOS names the port cu.usbmodem*, Linux ttyACM*
 find_port() {
-    ls /dev/cu.usbmodem* 2>/dev/null | head -n 1
+    ls /dev/cu.usbmodem* /dev/ttyACM* 2>/dev/null | head -n 1
 }
 
 in_bootsel() {
@@ -45,7 +48,8 @@ if ! in_bootsel; then
         exit 2
     fi
     # Opening at 1200 baud and closing (dropping DTR) reboots into BOOTSEL.
-    stty -f "$port" 1200 2>/dev/null || true
+    # BSD stty takes -f, GNU stty -F
+    stty -f "$port" 1200 2>/dev/null || stty -F "$port" 1200 2>/dev/null || true
     if ! wait_for in_bootsel 10; then
         echo "run.sh: $port didn't reboot into BOOTSEL" >&2
         exit 2

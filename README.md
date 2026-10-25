@@ -16,6 +16,29 @@ The heart of vic-2350 is a beam racing renderer, inspired by 80s hardware. The R
 
 This project is a continuation of [pico-dvi-rs], with a much greater emphasis on bare metal programming.
 
+## Building
+
+The build needs:
+
+- Rust, with the `thumbv8m.main-none-eabihf` target
+- [symbolasm], checked out next to this repo as `../symbolasm`
+- The `arm-none-eabi` binutils (only `as` and `ld` are used)
+- Python 3
+
+Then `./build.sh` builds each demo into `build/<demo>.elf`. Set `SYMBOLASM` to use a symbolasm checkout somewhere else.
+
+The RP2350 register definitions come from the [rp235x-pac] crate, which the build fetches along with the other Rust dependencies. Set `SVD` to use a different `RP2350.svd`.
+
+## Running
+
+Put the board in BOOTSEL mode, then run, for example:
+
+```
+tools/run.sh build/colorbars.elf
+```
+
+This loads the demo with [picotool] and prints its log over USB serial. Development has been on macOS; Linux should work but hasn't been tested.
+
 ## License
 
 Licensed under either of
@@ -30,3 +53,5 @@ at your option.
 [symbolasm]: https://github.com/raphlinus/symbolasm
 [VIC-II chip]: https://en.wikipedia.org/wiki/MOS_Technology_VIC-II
 [pico-dvi-rs]: https://github.com/DusterTheFirst/pico-dvi-rs
+[rp235x-pac]: https://crates.io/crates/rp235x-pac
+[picotool]: https://github.com/raspberrypi/picotool

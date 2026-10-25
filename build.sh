@@ -4,8 +4,7 @@
 
 set -e
 
-SYMBOLASM=${SYMBOLASM:-$HOME/garden/symbolasm}
-SVD=${SVD:-$HOME/dl/pico-sdk/src/rp2350/hardware_regs/RP2350.svd}
+SYMBOLASM=${SYMBOLASM:-../symbolasm}
 TILESET=${TILESET:-maps/alien_world.png}
 
 python3 tools/tiles.py "$TILESET" maps/colony.tmx > tiles.sy
@@ -14,6 +13,13 @@ mkdir -p build
 # USB serial logging (USBLOG ring, usb_init, USBCTRL_IRQ), a Rust staticlib
 (cd usblog && cargo build -q --release)
 USBLOG=usblog/target/thumbv8m.main-none-eabihf/release/libusblog.a
+# The register definitions come with the rp235x-pac crate usblog depends on
+if [ -z "$SVD" ]; then
+    SVD=$(cd usblog && cargo metadata -q --format-version 1 | python3 -c '
+import json, os, sys
+pac = next(p for p in json.load(sys.stdin)["packages"] if p["name"] == "rp235x-pac")
+print(os.path.join(os.path.dirname(pac["manifest_path"]), "svd", "RP2350.svd"))')
+fi
 cargo run -q --manifest-path "$SYMBOLASM/Cargo.toml" -- fill.sy > build/fill.s
 arm-none-eabi-as -mcpu=cortex-m33 -o build/fill.o build/fill.s
 arm-none-eabi-as -mcpu=cortex-m33 -o build/startup.o startup.s
