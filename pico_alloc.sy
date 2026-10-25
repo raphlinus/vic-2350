@@ -14,7 +14,7 @@ static mut pico_masks: [u32; N_BLOCKS + 1]
 
 // Must be called before first allocation
 #[link_section = ".ram"]
-fn pico_reset() {
+fn[abi = loose] pico_reset() {
     masks @r0 = &pico_masks
     free @r1 = (1 << N_BLOCKS) - 1
     *(masks + N_BLOCKS * 4) = free
@@ -23,7 +23,7 @@ fn pico_reset() {
 
 // Assumes size != 0
 #[link_section = ".ram"]
-fn pico_alloc(size: u32) {
+fn pico_alloc(size: u32) -> addr: *u8 {
     masks @r1 = &pico_masks
     size -= 1
     mask @r3 = 2
@@ -39,6 +39,8 @@ fn pico_alloc(size: u32) {
         }
     }
     mask -= 1
+    // size is 0 here, which is the result if there's no room
+    addr = size
     if {
         if free == 0 goto end
         free = rbit(free)
@@ -49,7 +51,7 @@ fn pico_alloc(size: u32) {
         *(masks + N_BLOCKS * 4) = free
         heap @r0 = &pico_heap
         *(masks + ix * 4) = mask
-        addr @r0 = heap + (ix << LOG_BLOCK_SIZE)
+        addr = heap + (ix << LOG_BLOCK_SIZE)
     }
     bx lr
 }

@@ -3,6 +3,10 @@
 
 use "main.sy"
 use "render.sy"
+use "alloc.sy"
+use "display_list.sy"
+use "stats.sy"
+use "text.sy"
 
 // Text: a background and lines of text in a few colors, including a file
 // list with sizes right aligned in a second column, and a line scrolling
@@ -101,10 +105,10 @@ static mut frame_lists: [DisplayList; 2]
 
 fn demo_init() {
     push(r4, lr)
-    bl stats_init
-    bl init_alloc
-    bl render_init
-    bl text_init
+    call stats_init()
+    call init_alloc()
+    call render_init()
+    call text_init()
     pop(r4, pc)
 }
 
@@ -116,12 +120,11 @@ fn demo_main() {
     other @r5 = list + size(DisplayList)
     loop {
         l @r0 = list
-        bl dl_clear
+        call dl_clear(l)
 
         l @r0 = list
         sz @r1 = size(Solid)
-        bl dl_alloc
-        obj @r0 = r0 as *u32
+        obj @r0 = call dl_alloc(l, sz)
         if {
             if obj == 0 goto end
             vt @r1 = &solid_vtable
@@ -154,22 +157,24 @@ fn demo_main() {
             (s @r3, len @r12) = *e
             l @r0 = list
             c @r2 = colors
-            push(len)
-            bl text_add
-            sp += 4
+            // lr pads the stack argument to keep sp 8 byte aligned
+            push(len, lr)
+            call text_add(l, xy, c, s, sp.len)
+            sp += 8
 
             // the second column, right aligned
             (s @r0, len @r1) = *(e + 8)
             if len == 0 goto next
-            bl text_width
-            x @r12 = COLUMN_RIGHT - r0
+            w @r0 = call text_width(s, len)
+            x @r12 = COLUMN_RIGHT - w
             xy @r1 = pkhbt(x, y << 16)
             (s @r3, len @r12) = *(e + 8)
             l @r0 = list
             c @r2 = colors
-            push(len)
-            bl text_add
-            sp += 4
+            // lr pads the stack argument to keep sp 8 byte aligned
+            push(len, lr)
+            call text_add(l, xy, c, s, sp.len)
+            sp += 8
 next:
             i += 1
             #(i - N_TEXT)
@@ -177,9 +182,9 @@ next:
         }
 
         l @r0 = list
-        bl dl_finish
+        call dl_finish(l)
         l @r0 = list
-        bl render_swap
+        call render_swap(l)
         t @r0 = list
         list = other
         other = t

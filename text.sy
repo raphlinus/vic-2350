@@ -4,6 +4,8 @@
 use "font.sy"
 use "main.sy"
 use "render.sy"
+use "display_list.sy"
+use "pico_alloc.sy"
 
 // Text, with the font in font.sy. A text object's start method compiles
 // its string into Thumb code that renders one row of the text as 1bpp
@@ -222,8 +224,8 @@ fn text_start(self: *Text) {
     words += 1
     size += 8
     size += words << 2
-    bl pico_alloc
-    bits @r0 = r0 as *u32
+    addr @r0 = call pico_alloc(size)
+    bits @r0 = addr as *u32
     self.scratch = bits
     if bits == 0 goto done
     self.bits = bits
@@ -232,7 +234,7 @@ fn text_start(self: *Text) {
     text += size(Text)
     len @r2 = self.len
     arg @r0 = code
-    bl jit_text
+    call jit_text(arg, text, len)
     code += 1
     self.code = code
     none @r0 = -1
@@ -247,7 +249,7 @@ done:
 #[link_section = ".ram"]
 fn text_end(self: *Text) {
     p @r0 = self.scratch
-    goto pico_free
+    #[tail] call pico_free(p)
 }
 
 // Render the span x0..x1 of line y. The first span of a line runs the
@@ -409,13 +411,13 @@ no_scratch:
     pairs @r1 = &self.pairs
     color @r1 = *pairs
     dst @r0 = buf + (x0 << 1)
-    bl fill_16
-    pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
+    pop(r4, r5, r6, r7, r8, r9, r10, r11, lr)
+    #[tail] call fill_16(dst, color, count)
 }
 
 // The width in pixels of the len characters at s.
 #[align = 4]
-fn text_width(s: *u8, len: u32) {
+fn text_width(s: *u8, len: u32) -> result {
     // glyph widths, the high halves of font_glyphs
     widths @r2 = (&font_glyphs + 2) as *u16
     widths -= FONT_FIRST * 4
@@ -438,14 +440,15 @@ fn text_width(s: *u8, len: u32) {
 // the right edge of the screen. Called from thread mode.
 #[align = 4]
 fn text_add(list: *DisplayList, xy: u32, colors: u32, s: *u8, len: u32) {
-    push(r4, r5, r6, r7, r8, r9, lr)
+    // r10 keeps sp 8 byte aligned for dl_alloc
+    push(r4, r5, r6, r7, r8, r9, r10, lr)
     list @r4 = list
     nop
     xy @r5 = xy
     colors @r6 = colors
     s @r7 = s
-    // the fifth argument, past the 7 registers pushed above
-    len @r9 = *(sp + 28)
+    // the fifth argument, on the stack
+    len @r9 = sp.len
     // Count the characters that are at least partly on screen, and their
     // width.
     x0 @r0 = xy[0..16]
@@ -473,8 +476,8 @@ fn text_add(list: *DisplayList, xy: u32, colors: u32, s: *u8, len: u32) {
     l @r0 = list
     sz @r1 = len + size(Text) + 3
     sz &= !3
-    bl dl_alloc
-    obj @r0 = r0 as *Text
+    block @r0 = call dl_alloc(l, sz)
+    obj @r0 = block as *Text
     if obj == 0 goto done
     vt @r1 = &text_vtable
     obj.vtable = vt
@@ -515,5 +518,5 @@ fn text_add(list: *DisplayList, xy: u32, colors: u32, s: *u8, len: u32) {
         if #ne goto loop
     }
 done:
-    pop(r4, r5, r6, r7, r8, r9, pc)
+    pop(r4, r5, r6, r7, r8, r9, r10, pc)
 }

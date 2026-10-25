@@ -120,11 +120,11 @@ fn psram_init() {
     // The chip isn't reset with RP2350, so it may be in QPI mode: leave it,
     // then reset it. In SPI mode the F5h is two clocks, which it ignores.
     tx @r0 = TX_NOPUSH | TX_OE | TX_QUAD | 0xf5
-    bl psram_cmd
+    call psram_cmd(tx)
     tx @r0 = TX_NOPUSH | 0x66
-    bl psram_cmd
+    call psram_cmd(tx)
     tx @r0 = TX_NOPUSH | 0x99
-    bl psram_cmd
+    call psram_cmd(tx)
     // tRST, 50 ns before the next command
     n @r0 = 16
     loop {
@@ -172,7 +172,7 @@ fn psram_init() {
 
     // enter QPI mode
     tx @r0 = TX_NOPUSH | 0x35
-    bl psram_cmd
+    call psram_cmd(tx)
 
     v @r0 = PSRAM_M1_TIMING
     qmi.M1_TIMING = v

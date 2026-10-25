@@ -3,6 +3,7 @@
 
 use "main.sy"
 use "psram.sy"
+use "log.sy"
 
 // PSRAM tests, run once in demo_init and logged over USB, then a solid
 // blue screen. psram_init has already run, from start in main.sy.
@@ -65,56 +66,56 @@ fn demo_init() {
     len @r1 = count(ok_str)
     ok @r2 = &psram_ok
     v @r2 = *ok
-    bl log_kv
+    call log_kv(p, len, v)
     p @r0 = &id0_str
     len @r1 = count(id0_str)
     ids @r2 = &psram_id
     v @r2 = *ids
-    bl log_kv
+    call log_kv(p, len, v)
     p @r0 = &id1_str
     len @r1 = count(id1_str)
     ids @r2 = &psram_id
     v @r2 = *(ids + 4)
-    bl log_kv
+    call log_kv(p, len, v)
 
     p @r0 = &boot_str
     len @r1 = count(boot_str)
-    bl log_str
+    call log_str(p, len)
     regs @r4 = &psram_boot_regs
     n @r5 = count(psram_boot_regs)
     loop {
         sp_ @r0 = 32
-        bl log_byte
+        call log_byte(sp_)
         v @r0 = *regs++
-        bl log_hex
+        call log_hex(v)
         #(n -= 1)
         if #ne goto loop
     }
     nl @r0 = 10
-    bl log_byte
+    call log_byte(nl)
 
     p @r0 = &now_str
     len @r1 = count(now_str)
-    bl log_str
+    call log_str(p, len)
     qmi @r4 = peripherals.QMI
     regs @r4 = &qmi.M1_TIMING
     n @r5 = 5
     loop {
         sp_ @r0 = 32
-        bl log_byte
+        call log_byte(sp_)
         v @r0 = *regs++
-        bl log_hex
+        call log_hex(v)
         #(n -= 1)
         if #ne goto loop
     }
     sp_ @r0 = 32
-    bl log_byte
+    call log_byte(sp_)
     xip @r0 = peripherals.XIP_CTRL
     v @r0 = xip.CTRL
-    bl log_hex
+    call log_hex(v)
     nl @r0 = 10
-    bl log_byte
-    bl log_flush
+    call log_byte(nl)
+    call log_flush()
 
     ok @r0 = &psram_ok
     v @r0 = *ok
@@ -122,20 +123,20 @@ fn demo_init() {
         if v != 0 goto end
         p @r0 = &fail_str
         len @r1 = count(fail_str)
-        bl log_str
+        call log_str(p, len)
         goto finish
     }
 
     // a: each word holds its own address
     p @r0 = PSRAM_UNCACHED as *u32
     n @r1 = PSRAM_WORDS
-    bl fill_addr
+    call fill_addr(p, n)
     p @r0 = PSRAM_UNCACHED as *u32
     n @r1 = PSRAM_WORDS
-    bl verify_addr
+    call verify_addr(p, n)
     p @r0 = &a_str
     len @r1 = count(a_str)
-    bl log_result
+    call log_result(p, len)
 
     // b: xorshift32 over all of it, timed
     cyc @r4 = &peripherals.PPB.DWT_CYCCNT
@@ -143,148 +144,148 @@ fn demo_init() {
     p @r0 = PSRAM_UNCACHED as *u32
     n @r1 = PSRAM_WORDS
     x @r2 = 0x12345678
-    bl fill_lfsr
+    call fill_lfsr(p, n, x)
     cyc @r4 = &peripherals.PPB.DWT_CYCCNT
     t @r6 = *cyc
     t -= t0
     p @r0 = PSRAM_UNCACHED as *u32
     n @r1 = PSRAM_WORDS
     x @r2 = 0x12345678
-    bl verify_lfsr
+    call verify_lfsr(p, n, x)
     p @r0 = &b_str
     len @r1 = count(b_str)
-    bl log_result
+    call log_result(p, len)
     p @r0 = &f_fill_str
     len @r1 = count(f_fill_str)
     v @r2 = r6
-    bl log_kvd
+    call log_kvd(p, len, v)
 
     // c: bytes then halfwords, each byte or halfword its address's low bits
     p8 @r0 = (PSRAM_UNCACHED + 0x100000) as *u8
     n @r1 = 0x8000
-    bl fill_bytes
+    call fill_bytes(p8, n)
     p16 @r0 = (PSRAM_UNCACHED + 0x108000) as *u16
     n @r1 = 0x4000
-    bl fill_halves
+    call fill_halves(p16, n)
     p @r0 = (PSRAM_UNCACHED + 0x100000) as *u32
     n @r1 = 0x2000
-    bl verify_bytes
+    call verify_bytes(p, n)
     p @r0 = &c8_str
     len @r1 = count(c8_str)
-    bl log_result
+    call log_result(p, len)
     p @r0 = (PSRAM_UNCACHED + 0x108000) as *u32
     n @r1 = 0x2000
-    bl verify_halves
+    call verify_halves(p, n)
     p @r0 = &c16_str
     len @r1 = count(c16_str)
-    bl log_result
+    call log_result(p, len)
 
     // d: write 1 MB through the cache, clean it, read back uncached
     p @r0 = PSRAM_CACHED as *u32
     n @r1 = 0x40000
     x @r2 = 0xcafef00d
-    bl fill_lfsr
-    bl xip_clean
+    call fill_lfsr(p, n, x)
+    call xip_clean()
     p @r0 = PSRAM_UNCACHED as *u32
     n @r1 = 0x40000
     x @r2 = 0xcafef00d
-    bl verify_lfsr
+    call verify_lfsr(p, n, x)
     p @r0 = &d_str
     len @r1 = count(d_str)
-    bl log_result
+    call log_result(p, len)
 
     // e: read 256 KB back with each RXDELAY
     p @r0 = PSRAM_UNCACHED as *u32
     n @r1 = 0x10000
     x @r2 = 0x9e3779b9
-    bl fill_lfsr
+    call fill_lfsr(p, n, x)
     rx @r4 = 0
     loop {
         timing @r0 = PSRAM_M1_TIMING & !0x700
         timing |= rx << 8
-        bl psram_set_timing
+        call psram_set_timing(timing)
         p @r0 = PSRAM_UNCACHED as *u32
         n @r1 = 0x10000
         x @r2 = 0x9e3779b9
-        bl verify_lfsr
-        errors @r5 = r0
+        n_errors @r0 = call verify_lfsr(p, n, x)
+        errors @r5 = n_errors
         p @r0 = &e_str
         len @r1 = count(e_str)
-        bl log_str
+        call log_str(p, len)
         v @r0 = rx
-        bl log_dec
+        call log_dec(v)
         p @r0 = &errors_str
         len @r1 = count(errors_str)
-        bl log_str
+        call log_str(p, len)
         v @r0 = errors
-        bl log_dec
+        call log_dec(v)
         nl @r0 = 10
-        bl log_byte
-        bl log_flush
+        call log_byte(nl)
+        call log_flush()
         rx += 1
         #(rx - 8)
         if #ne goto loop
     }
     timing @r0 = PSRAM_M1_TIMING
-    bl psram_set_timing
+    call psram_set_timing(timing)
 
     // f: read latency and throughput
     n @r0 = 1000
     x @r1 = 0x2545f491
-    bl time_random
-    v @r2 = r0
+    t @r0 = call time_random(n, x)
+    v @r2 = t
     p @r0 = &f_rand_str
     len @r1 = count(f_rand_str)
-    bl log_kvd
+    call log_kvd(p, len, v)
     n @r0 = 1000
     x @r1 = 0x2545f491
-    bl time_random_base
-    v @r2 = r0
+    t @r0 = call time_random_base(n, x)
+    v @r2 = t
     p @r0 = &f_base_str
     len @r1 = count(f_base_str)
-    bl log_kvd
+    call log_kvd(p, len, v)
     p @r0 = PSRAM_UNCACHED as *u32
     n @r1 = 16384
-    bl time_seq
-    v @r2 = r0
+    t @r0 = call time_seq(p, n)
+    v @r2 = t
     p @r0 = &f_seq_str
     len @r1 = count(f_seq_str)
-    bl log_kvd
+    call log_kvd(p, len, v)
     // 2 MB in, so none of it is in the cache from d
     p @r0 = (PSRAM_CACHED + 0x200000) as *u32
     n @r1 = 262144
-    bl time_seq
-    v @r2 = r0
+    t @r0 = call time_seq(p, n)
+    v @r2 = t
     p @r0 = &f_cached_str
     len @r1 = count(f_cached_str)
-    bl log_kvd
+    call log_kvd(p, len, v)
 
     // g: retention, with the chip deselected and refreshing itself
     p @r0 = PSRAM_UNCACHED as *u32
     n @r1 = PSRAM_WORDS
     x @r2 = 0x0badcafe
-    bl fill_lfsr
+    call fill_lfsr(p, n, x)
     t @r0 = SYS_HZ
-    bl wait_cycles
+    call wait_cycles(t)
     p @r0 = PSRAM_UNCACHED as *u32
     n @r1 = PSRAM_WORDS
     x @r2 = 0x0badcafe
-    bl verify_lfsr
+    call verify_lfsr(p, n, x)
     p @r0 = &g1_str
     len @r1 = count(g1_str)
-    bl log_result
+    call log_result(p, len)
     t @r0 = 10 * SYS_HZ
-    bl wait_cycles
+    call wait_cycles(t)
     p @r0 = PSRAM_UNCACHED as *u32
     n @r1 = PSRAM_WORDS
     x @r2 = 0x0badcafe
-    bl verify_lfsr
+    call verify_lfsr(p, n, x)
     p @r0 = &g10_str
     len @r1 = count(g10_str)
-    bl log_result
+    call log_result(p, len)
 
 finish:
-    bl log_end
+    call log_end()
     pop(r4, r5, r6, pc)
 }
 
@@ -292,12 +293,12 @@ finish:
 fn log_kv(p: *u8, len: u32, v: u32) {
     push(r4, lr)
     v_saved @r4 = v
-    bl log_str
+    call log_str(p, len)
     v @r0 = r4
-    bl log_hex
+    call log_hex(v)
     nl @r0 = 10
-    bl log_byte
-    bl log_flush
+    call log_byte(nl)
+    call log_flush()
     pop(r4, pc)
 }
 
@@ -305,12 +306,12 @@ fn log_kv(p: *u8, len: u32, v: u32) {
 fn log_kvd(p: *u8, len: u32, v: u32) {
     push(r4, lr)
     v_saved @r4 = v
-    bl log_str
+    call log_str(p, len)
     v @r0 = r4
-    bl log_dec
+    call log_dec(v)
     nl @r0 = 10
-    bl log_byte
-    bl log_flush
+    call log_byte(nl)
+    call log_flush()
     pop(r4, pc)
 }
 
@@ -318,33 +319,33 @@ fn log_kvd(p: *u8, len: u32, v: u32) {
 // if there was one.
 fn log_result(p: *u8, len: u32) {
     push(r4, lr)
-    bl log_str
+    call log_str(p, len)
     res @r4 = &result
     v @r0 = res.errors
-    bl log_dec
+    call log_dec(v)
     res @r4 = &result
     v @r0 = res.errors
     if {
         if v == 0 goto end
         p @r0 = &first_str
         len @r1 = count(first_str)
-        bl log_str
+        call log_str(p, len)
         v @r0 = res.addr
-        bl log_hex
+        call log_hex(v)
         p @r0 = &got_str
         len @r1 = count(got_str)
-        bl log_str
+        call log_str(p, len)
         v @r0 = res.value
-        bl log_hex
+        call log_hex(v)
         p @r0 = &want_str
         len @r1 = count(want_str)
-        bl log_str
+        call log_str(p, len)
         v @r0 = res.expect
-        bl log_hex
+        call log_hex(v)
     }
     nl @r0 = 10
-    bl log_byte
-    bl log_flush
+    call log_byte(nl)
+    call log_flush()
     pop(r4, pc)
 }
 
@@ -365,7 +366,7 @@ fn fill_addr(p: *u32, n: u32) {
 
 // Check fill_addr's n words from p, into result. Returns the error count.
 #[link_section = ".ram"]
-fn verify_addr(p: *u32, n: u32) {
+fn verify_addr(p: *u32, n: u32) -> n_errors {
     push(r4, r5)
     errors @r4 = 0
     res @r5 = &result
@@ -388,7 +389,7 @@ fn verify_addr(p: *u32, n: u32) {
         if #ne goto loop
     }
     res.errors = errors
-    count_ @r0 = errors
+    n_errors = errors
     pop(r4, r5)
     bx lr
 }
@@ -409,7 +410,7 @@ fn fill_lfsr(p: *u32, n: u32, x: u32) {
 
 // Check fill_lfsr's n words from p, into result. Returns the error count.
 #[link_section = ".ram"]
-fn verify_lfsr(p: *u32, n: u32, x: u32) {
+fn verify_lfsr(p: *u32, n: u32, x: u32) -> n_errors {
     push(r4, r5)
     errors @r4 = 0
     res @r5 = &result
@@ -436,7 +437,7 @@ fn verify_lfsr(p: *u32, n: u32, x: u32) {
         if #ne goto loop
     }
     res.errors = errors
-    count_ @r0 = errors
+    n_errors = errors
     pop(r4, r5)
     bx lr
 }
@@ -468,7 +469,7 @@ fn fill_halves(p: *u16, n: u32) {
 // Check fill_bytes as n words: the word at a is b, b + 1, b + 2, b + 3
 // with b = a & 0xff, which doesn't carry since a is aligned.
 #[link_section = ".ram"]
-fn verify_bytes(p: *u32, n: u32) {
+fn verify_bytes(p: *u32, n: u32) -> n_errors {
     push(r4, r5, r6)
     errors @r4 = 0
     res @r5 = &result
@@ -497,7 +498,7 @@ fn verify_bytes(p: *u32, n: u32) {
         if #ne goto loop
     }
     res.errors = errors
-    count_ @r0 = errors
+    n_errors = errors
     pop(r4, r5, r6)
     bx lr
 }
@@ -505,7 +506,7 @@ fn verify_bytes(p: *u32, n: u32) {
 // Check fill_halves as n words: the word at a is h, h + 1 with
 // h = a[1..17], which is even since a is aligned.
 #[link_section = ".ram"]
-fn verify_halves(p: *u32, n: u32) {
+fn verify_halves(p: *u32, n: u32) -> n_errors {
     push(r4, r5, r6)
     errors @r4 = 0
     res @r5 = &result
@@ -534,7 +535,7 @@ fn verify_halves(p: *u32, n: u32) {
         if #ne goto loop
     }
     res.errors = errors
-    count_ @r0 = errors
+    n_errors = errors
     pop(r4, r5, r6)
     bx lr
 }
@@ -559,7 +560,7 @@ fn xip_clean() {
 
 // Cycles for n uncached reads at xorshift32 addresses from seed x.
 #[link_section = ".ram"]
-fn time_random(n: u32, x: u32) {
+fn time_random(n: u32, x: u32) -> t {
     push(r4, r5)
     base @r4 = PSRAM_UNCACHED as *u32
     mask @r5 = PSRAM_SIZE - 4
@@ -574,7 +575,7 @@ fn time_random(n: u32, x: u32) {
         #(n -= 1)
         if #ne goto loop
     }
-    t @r0 = *cyc
+    t = *cyc
     t -= t0
     pop(r4, r5)
     bx lr
@@ -582,7 +583,7 @@ fn time_random(n: u32, x: u32) {
 
 // time_random without the reads.
 #[link_section = ".ram"]
-fn time_random_base(n: u32, x: u32) {
+fn time_random_base(n: u32, x: u32) -> t {
     push(r4, r5)
     base @r4 = PSRAM_UNCACHED as *u32
     mask @r5 = PSRAM_SIZE - 4
@@ -597,7 +598,7 @@ fn time_random_base(n: u32, x: u32) {
         #(n -= 1)
         if #ne goto loop
     }
-    t @r0 = *cyc
+    t = *cyc
     t -= t0
     pop(r4, r5)
     bx lr
@@ -605,7 +606,7 @@ fn time_random_base(n: u32, x: u32) {
 
 // Cycles for n sequential word reads from p.
 #[link_section = ".ram"]
-fn time_seq(p: *u32, n: u32) {
+fn time_seq(p: *u32, n: u32) -> t {
     cyc @r12 = &peripherals.PPB.DWT_CYCCNT
     t0 @r3 = *cyc
     loop {
@@ -613,7 +614,7 @@ fn time_seq(p: *u32, n: u32) {
         #(n -= 1)
         if #ne goto loop
     }
-    t @r0 = *cyc
+    t = *cyc
     t -= t0
     bx lr
 }

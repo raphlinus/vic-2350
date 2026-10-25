@@ -28,9 +28,9 @@ fn init_alloc() {
     bx lr
 }
 
-// Allocate size bytes aligned to align (a power of two). Returns the block
-// in r0, or 0 if there's no room.
-fn alloc(size: u32, align: u32) {
+// Allocate size bytes aligned to align (a power of two). Returns the block,
+// or 0 if there's no room.
+fn[abi = loose] alloc(size: u32, align: u32) -> block: *u8 {
     head @r2 = &alloc_head
     size += 7
     cur @r3 = head.next
@@ -60,7 +60,7 @@ try_again:
         if #ne goto loop
     }
 fail:
-    ret @r0 = 0
+    block = 0
     bx lr
 candidate:
     tmp @r6 = prev
@@ -91,12 +91,12 @@ candidate2:
         next = alloc_end
     }
     prev.next = next
-    r0 = cur
+    block = cur
     bx lr
 }
 
 // Free a block allocated with this size.
-fn free(ptr: *Hole, size: u32) {
+fn[abi = loose] free(ptr: *Hole, size: u32) {
     head @r2 = &alloc_head
     size += 7
     cur @r3 = head.next

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use "main.sy"
+use "render.sy"
+use "log.sy"
 
 // Render timing for demos that use render.sy: demo_line times each
 // render_line with the DWT cycle counter, and logs the average and
@@ -40,12 +42,12 @@ fn stats_init() {
 }
 
 #[link_section = ".ram"]
-fn demo_line(y: u32, pixels: *u16) {
+fn demo_line(y: u32, pixels: *u32) {
     push(r4, r5, r6, lr)
     y_saved @r4 = y
     cyccnt @r2 = &peripherals.PPB.DWT_CYCCNT
     t0 @r5 = *cyccnt
-    bl render_line
+    call render_line(y, pixels)
     cyccnt @r2 = &peripherals.PPB.DWT_CYCCNT
     t @r3 = *cyccnt
     // The common case, not a new max and not the last line, falls
@@ -79,8 +81,8 @@ last_line:
     // Give the line back first, so the report can't make it late.
     // render_irq_handler's second release is harmless.
     y @r0 = r4
-    bl dvi_release_line
-    bl report_stats
+    call dvi_release_line(y)
+    call report_stats()
     goto done
 }
 
@@ -88,27 +90,27 @@ fn report_stats() {
     push(r4, r5, r6, lr)
     p @r0 = &avg_str
     len @r1 = count(avg_str)
-    bl log_str
+    call log_str(p, len)
     s @r4 = &line_stats
     sum @r0 = s.sum
     lines @r1 = V_ACTIVE * REPORT_FRAMES
     avg @r0 = sum / lines
-    bl log_dec
+    call log_dec(avg)
     p @r0 = &max_str
     len @r1 = count(max_str)
-    bl log_str
+    call log_str(p, len)
     s @r4 = &line_stats
     max @r0 = s.max
-    bl log_dec
+    call log_dec(max)
     p @r0 = &missed_str
     len @r1 = count(missed_str)
-    bl log_str
+    call log_str(p, len)
     d @r0 = &dvi
     missed @r0 = d.missed_lines
-    bl log_dec
+    call log_dec(missed)
     nl @r0 = 10
-    bl log_byte
-    bl log_flush
+    call log_byte(nl)
+    call log_flush()
     s @r4 = &line_stats
     zero @r0 = 0
     s.frames = zero
@@ -120,7 +122,7 @@ fn report_stats() {
     #(reports - END_REPORTS)
     if {
         if #ne goto end
-        bl log_end
+        call log_end()
     }
     pop(r4, r5, r6, pc)
 }

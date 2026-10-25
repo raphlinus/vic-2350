@@ -20,19 +20,17 @@ fn dl_clear(list: *DisplayList) {
 // pointer to the object's storage, for the caller to fill in, valid until
 // the next dl_alloc. Returns 0 if there's no room, leaving the list's
 // contents unchanged.
-fn dl_alloc(list: *DisplayList, size: u32) {
+fn dl_alloc(list: *DisplayList, size: u32) -> obj: *u32 {
     push(r4, r5, r6, lr)
     list @r4 = list
     words @r5 = size >> 2
     v @r0 = &list.heads
     extra @r1 = 1
-    bl vec_reserve
-    ok @r0 = r0
+    ok @r0 = call vec_reserve(v, extra)
     if ok == 0 goto fail
     v @r0 = &list.payload
     extra @r1 = words
-    bl vec_reserve
-    ok @r0 = r0
+    ok @r0 = call vec_reserve(v, extra)
     if ok == 0 goto fail
     // the object goes at the end of payload, and its offset at the end of
     // heads
@@ -43,12 +41,12 @@ fn dl_alloc(list: *DisplayList, size: u32) {
     n += 1
     list.heads.len = n
     payload @r0 = list.payload.ptr
-    obj @r0 = payload + (offset << 2)
+    obj = payload + (offset << 2)
     offset += words
     list.payload.len = offset
     pop(r4, r5, r6, pc)
 fail:
-    zero @r0 = 0
+    obj = 0
     pop(r4, r5, r6, pc)
 }
 

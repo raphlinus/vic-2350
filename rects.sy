@@ -3,6 +3,9 @@
 
 use "main.sy"
 use "render.sy"
+use "alloc.sy"
+use "display_list.sy"
+use "stats.sy"
 
 // Animated rectangles: a background and N_RECTS overlapping rectangles of
 // various sizes that bounce around the screen, built into a new display
@@ -95,9 +98,9 @@ static mut frame_lists: [DisplayList; 2]
 
 fn demo_init() {
     push(r4, lr)
-    bl stats_init
-    bl init_alloc
-    bl render_init
+    call stats_init()
+    call init_alloc()
+    call render_init()
     pop(r4, pc)
 }
 
@@ -108,12 +111,11 @@ fn demo_main() {
     other @r5 = list + size(DisplayList)
     loop {
         l @r0 = list
-        bl dl_clear
+        call dl_clear(l)
 
         l @r0 = list
         sz @r1 = size(Solid)
-        bl dl_alloc
-        obj @r0 = r0 as *u32
+        obj @r0 = call dl_alloc(l, sz)
         if {
             if obj == 0 goto end
             vt @r1 = &solid_vtable
@@ -128,8 +130,7 @@ fn demo_main() {
         loop {
             l @r0 = list
             sz @r1 = size(Solid)
-            bl dl_alloc
-            obj @r0 = r0 as *u32
+            obj @r0 = call dl_alloc(l, sz)
             if obj == 0 goto break
             obj @r8 = obj
 
@@ -177,9 +178,9 @@ fn demo_main() {
         }
 
         l @r0 = list
-        bl dl_finish
+        call dl_finish(l)
         l @r0 = list
-        bl render_swap
+        call render_swap(l)
         t @r0 = list
         list = other
         other = t

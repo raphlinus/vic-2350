@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use "vec.sy"
+use "pico_alloc.sy"
+
+// In fill.sy, which is assembled on its own
+symbol fill_16: fn(dst: *u16, color, count)
 
 // The main renderer
 
@@ -112,7 +116,7 @@ fn render_line(y: u32, buf: *u16) {
         // and incrementing by 1 each scan line
         if #hs goto end
         push(y)
-        bl pico_reset
+        call pico_reset()
         r @r2 = &render_state
         // Take the next list, if thread mode has set one. Nothing points
         // into the old one once the active list is cleared below.
@@ -160,7 +164,7 @@ fn render_line(y: u32, buf: *u16) {
             #(y - y0)
             if #eq goto end
         } else {
-            obj = -1
+            obj @r5 = -1
         }
         if {
             if active_count == 0 goto end
@@ -256,7 +260,7 @@ no_more_active:
         nop
         render @r4 = vtable.render
         x1 @r1 = active_obj.x1
-        buf @r3 = *sp // TODO: `sp.buf` or suchlike when we have stack placement
+        buf @r3 = sp.buf
         x0x1 @r2 = pkhbt(x0, x1 << 16)
         y_arg @r1 = y
         blx render
@@ -287,7 +291,7 @@ fn solid_render(self: *Solid, y: u32, x1x0: u32, buf: *u16) {
     x1 @r2 = x1x0[16..32]
     count @r2 = x1 - x0
     dst @r0 = buf + x0 * 2
-    goto fill_16
+    #[tail] call fill_16(dst, color, count)
 }
 
 #[link_section = ".ram"]

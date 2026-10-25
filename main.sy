@@ -1,6 +1,8 @@
 // Copyright 2026 Raph Levien
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+use "psram.sy"
+
 // Bring up the 12 MHz crystal and run clk_sys and clk_peri at 144 MHz from
 // PLL_SYS, clk_usb at 48 MHz from PLL_SYS / 3, and clk_hstx at 126 MHz from
 // PLL_USB (the routing suggested in RP2350 datasheet 8.6.1, though 8.6.3
@@ -27,6 +29,14 @@ symbol _data_start: *u32
 symbol _data_size_words: u32
 symbol _bss_start: *u32
 symbol _bss_size_words: u32
+
+// In the usblog Rust library
+symbol usb_init: fn()
+
+// Each demo defines these; see above
+symbol demo_init: fn()
+symbol demo_main: fn()
+symbol demo_line: fn(y: u32, pixels: *u32)
 
 // PLL_USB is derived from PLL_SYS in the SVD, so it isn't in peripherals
 const PLL_USB = 0x40058000
@@ -188,24 +198,24 @@ fn start() {
 
     // reset DMA and HSTX
     mask @r0 = (1 << 2) | (1 << 3)
-    bl assert_reset
+    call assert_reset(mask)
 
-    bl configure_clk_sys1
-    bl init_xosc
-    bl init_plls
-    bl configure_clk_ref
-    bl configure_clk_sys2
-    bl configure_clk_peri
-    bl configure_clk_usb
+    call configure_clk_sys1()
+    call init_xosc()
+    call init_plls()
+    call configure_clk_ref()
+    call configure_clk_sys2()
+    call configure_clk_peri()
+    call configure_clk_usb()
 
     // release reset for BUSCTRL, IO_BANK0 and PADS_BANK0
     mask @r0 = (1 << 1) | (1 << 6) | (1 << 9)
-    bl reset
+    call reset(mask)
     // PSRAM, in psram.sy; before usb_init starts core 1, which runs from
     // flash
-    bl psram_init
+    call psram_init()
     // USB serial logging, from the usblog crate; needs clk_usb
-    bl usb_init
+    call usb_init()
 
     // set up pad: 4mA, pull-down, Schmitt input
     pads_bank0 @r0 = peripherals.PADS_BANK0
@@ -230,15 +240,15 @@ fn start() {
     priority @r1 = (1 << 8) | (1 << 12)
     busctrl.BUS_PRIORITY = priority
 
-    bl dvi_init
+    call dvi_init()
 
-    bl configure_clk_hstx
+    call configure_clk_hstx()
     // release reset for DMA and HSTX
     mask @r0 = (1 << 2) | (1 << 3)
-    bl reset
-    bl setup_hstx
-    bl demo_init
-    bl setup_dma
+    call reset(mask)
+    call setup_hstx()
+    call demo_init()
+    call setup_dma()
 
     // The render interrupt is below DMA_IRQ_0 (priority 0), which can then
     // preempt it. The M33 implements the top 4 bits of each priority byte;
@@ -263,7 +273,7 @@ fn start() {
     chan @r3 = 1
     dma.MULTI_CHAN_TRIGGER = chan
 
-    bl demo_main
+    call demo_main()
     // Rendering happens in interrupts, so thread mode is idle once the
     // demo returns.
     loop {
@@ -291,7 +301,7 @@ fn dvi_init() {
 // r0 and a pointer to its pixels in r1, which belong to the caller until
 // dvi_release_line(y), or -1 in r0 if the queue is empty.
 #[link_section = ".ram"]
-fn dvi_take_line() {
+fn dvi_take_line() -> (y: u32, pixels: *u32) {
     p @r3 = &dvi
     rd @r2 = p.queue_rd
     wr @r1 = p.queue_wr
@@ -300,18 +310,19 @@ fn dvi_take_line() {
     if {
         #(rd - wr)
         if #ne goto end
-        none @r0 = -1
+        // pixels means nothing when y is -1
+        y = -1
+        pixels @r1 = r1
         bx lr
     }
-    y @r0 = *(queue + rd * 4)
+    y = *(queue + rd * 4)
     rd += 1
     rd &= QUEUE_SIZE - 1
     p.queue_rd = rd
     ix @r2 = y & (N_LINES - 1)
     stride @r3 = LINE_BYTES
-    pixels @r1 = &video_lines + 4
+    pixels = &video_lines + 4
     pixels += ix * stride
-    y_out @r0 = y
     bx lr
 }
 
@@ -335,16 +346,14 @@ fn render_irq_handler() {
     // folds with the push, so it's free.
     nop
     loop {
-        bl dvi_take_line
-        y @r0 = r0
+        (y @r0, pixels @r1) = call dvi_take_line()
         // 16 bit, unlike cmn: the bl returns to it, and the beq folds
         #(_ @r2 = y + 1)
         if #eq goto break
-        pixels @r1 = r1
         saved_y @r4 = y
-        bl demo_line
+        call demo_line(y, pixels)
         y @r0 = saved_y
-        bl dvi_release_line
+        call dvi_release_line(y)
         goto loop
     }
     pop(r4, pc)
@@ -378,21 +387,22 @@ fn init_xosc() {
 }
 
 fn init_plls() {
-    push(lr)
+    // r4 keeps sp 8 byte aligned for the calls
+    push(r4, lr)
     // reset PLL_SYS and PLL_USB
     mask @r0 = (1 << 14) | (1 << 15)
-    bl reset
+    call reset(mask)
     // VCO = 12 MHz * 120 = 1440 MHz, 1440 / (5 * 2) = 144 MHz
     pll @r0 = peripherals.PLL_SYS
     fbdiv @r1 = 120
     prim @r2 = (5 << 16) | (2 << 12)
-    bl init_pll
+    call init_pll(pll, fbdiv, prim)
     // VCO = 12 MHz * 126 = 1512 MHz, 1512 / (6 * 2) = 126 MHz
     pll @r0 = PLL_USB
     fbdiv @r1 = 126
     prim @r2 = (6 << 16) | (2 << 12)
-    bl init_pll
-    pop(pc)
+    call init_pll(pll, fbdiv, prim)
+    pop(r4, pc)
 }
 
 // Start a PLL that is out of reset, with REFDIV 1. prim has POSTDIV1 in

@@ -68,11 +68,11 @@ fn log_str(p: *u8, len: u32) {
         if len == 0 goto break
     } loop {
         b @r0 = *p++
-        bl log_byte
+        call log_byte(b)
         #(len -= 1)
         if #ne goto loop
     }
-    bl log_flush
+    call log_flush()
     pop(r4, r5, r6, pc)
 }
 
@@ -90,11 +90,11 @@ fn log_hex(v: u32) {
             d += 7
         }
         d += 48
-        bl log_byte
+        call log_byte(d)
         #(n -= 1)
         if #ne goto loop
     }
-    bl log_flush
+    call log_flush()
     pop(r4, r5, r6, pc)
 }
 
@@ -118,11 +118,11 @@ fn log_dec(v: u32) {
     loop {
         end -= 1
         b @r0 = *((end as *u8) + 0)
-        bl log_byte
+        call log_byte(b)
         #(end - start)
         if #ne goto loop
     }
-    bl log_flush
+    call log_flush()
     pop(r4, r5, r6, pc)
 }
 
@@ -130,5 +130,5 @@ fn log_dec(v: u32) {
 fn log_end() {
     p @r0 = &log_end_str
     len @r1 = count(log_end_str)
-    goto log_str
+    #[tail] call log_str(p, len)
 }

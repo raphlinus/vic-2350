@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use "render.sy"
+use "alloc.sy"
+use "display_list.sy"
+use "stats.sy"
 
 // The colorbars scene from pico-dvi-rs (without the text row), copied
 // into a freshly built display list each frame, to exercise the builder
@@ -40,9 +43,9 @@ static mut frame_lists: [DisplayList; 2]
 
 fn demo_init() {
     push(r4, lr)
-    bl stats_init
-    bl init_alloc
-    bl render_init
+    call stats_init()
+    call init_alloc()
+    call render_init()
     pop(r4, pc)
 }
 
@@ -53,14 +56,13 @@ fn demo_main() {
     other @r5 = list + size(DisplayList)
     loop {
         l @r0 = list
-        bl dl_clear
+        call dl_clear(l)
         src @r6 = &colorbars as *u32
         n @r7 = N_COLORBARS
         loop {
             l @r0 = list
             sz @r1 = size(Solid)
-            bl dl_alloc
-            obj @r0 = r0 as *u32
+            obj @r0 = call dl_alloc(l, sz)
             if obj == 0 goto break
             (a @r1, b @r2, c @r3, d @r12) = *src++
             *obj = (a, b, c, d)
@@ -68,9 +70,9 @@ fn demo_main() {
             if #ne goto loop
         }
         l @r0 = list
-        bl dl_finish
+        call dl_finish(l)
         l @r0 = list
-        bl render_swap
+        call render_swap(l)
         t @r0 = list
         list = other
         other = t
