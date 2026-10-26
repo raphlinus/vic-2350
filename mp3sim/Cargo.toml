@@ -1,0 +1,12 @@
+[package]
+name = "mp3sim"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+
+[dependencies]
+m33 = { path = "../../symbolasm/m33" }
+mp3dec = { path = "../../mp3dec" }
+
+[profile.release]
+debug = true
