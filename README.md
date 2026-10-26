@@ -47,6 +47,8 @@ This loads the demo with [picotool] and prints its log over USB serial. Developm
 cd mp3sim && cargo run -r -- song.mp3
 ```
 
+With `--cycles`, it also estimates cycles per function and per line, from the emulator's instruction counts and the cycles per instruction of `symbolasm --analyze`. Some of mp3.sy's FP code was scheduled with `tools/sched.py`, which reorders a straight-line block so that no result is used by the very next instruction.
+
 ## License
 
 Licensed under either of

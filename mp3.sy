@@ -68,7 +68,10 @@ struct Mp3Decoder {
     pad: u32
     reserv_buf: [u8; 512]
     mdct_overlap: [f32; 576]
-    qmf_state: [f32; 960]
+    // the synthesis buffer: 960 floats of QMF history, kept from granule
+    // to granule, then each granule's 1152 new values, also scratch for
+    // mp3_reorder
+    syn: [f32; 2112]
 }
 
 // A bit reader: pos and limit count bits from buf
@@ -111,7 +114,6 @@ struct Mp3Scratch {
     // [[u8; 39]; 2], padded
     ist_pos: [u8; 80]
     grbuf: [f32; 1152]
-    syn: [f32; 2112]
     maindata: [u8; 4864]
 }
 
@@ -145,42 +147,78 @@ fn mp3_init() {
     #[tail] call mp3_zero(p, n)
 }
 
-// Zero n words at p, n a nonzero multiple of 4
+// Zero n words at p, n a nonzero multiple of 4: 8 at a time, then 4 if
+// left
 #[link_section = ".ram"]
 fn mp3_zero(p: *u32, n) {
+    push(r4, r5, r6, r7, lr)
     a @r2 = 0
     b @r3 = 0
-    c @r12 = 0
+    c @r4 = 0
+    d @r5 = 0
+    e @r6 = 0
+    f @r7 = 0
+    g @r12 = 0
+    h @lr = 0
+    #(n -= 8)
+    if #lo goto four
     loop {
-        *p++ = (a, b, c)
-        *p++ = a
-        #(n -= 4)
-        if #ne goto loop
+        #(n -= 8)
+        *p++ = (a, b, c, d, e, f, g, h)
+        if #hs goto loop
     }
-    bx lr
+four:
+    #(n += 8)
+    if #eq goto done
+    *p++ = (a, b, c, d)
+done:
+    pop(r4, r5, r6, r7, pc)
 }
 
-// Copy n words from src to dst, n a nonzero multiple of 4
+// Copy n words from src to dst, n a nonzero multiple of 4: 8 at a time,
+// then 4 if left
 #[link_section = ".ram"]
 fn mp3_copy_words(dst: *u32, src: *u32, n) {
-    push(r4, r5)
+    push(r4, r5, r6, r7, r8, lr)
+    #(n -= 8)
+    if #lo goto four
     loop {
-        (a @r3, b @r4, c @r5, d @r12) = *src++
-        *dst++ = (a, b, c, d)
-        #(n -= 4)
-        if #ne goto loop
+        #(n -= 8)
+        (a @r3, b @r4, c @r5, d @r6, e @r7, f @r8, g @r12, h @lr) = *src++
+        *dst++ = (a, b, c, d, e, f, g, h)
+        if #hs goto loop
     }
-    pop(r4, r5)
-    bx lr
+four:
+    #(n += 8)
+    if #eq goto done
+    (a @r3, b @r4, c @r5, d @r6) = *src++
+    *dst++ = (a, b, c, d)
+done:
+    pop(r4, r5, r6, r7, r8, pc)
 }
 
-// Copy n bytes from src to dst
+// Copy n bytes from src to dst, 8 at a time with word loads and stores,
+// which may be unaligned
 #[link_section = ".text"]
 fn mp3_copy(dst: *u8, src: *u8, n) {
+    #(n -= 8)
+    if #lo goto tail
+    loop {
+        a @r3 = *(src as *u32)
+        b @r12 = *((src + 4) as *u32)
+        src += 8
+        *(dst as *u32) = a
+        *((dst + 4) as *u32) = b
+        dst += 8
+        #(n -= 8)
+        if #hs goto loop
+    }
+tail:
+    n += 8
     if n == 0 goto done
     loop {
-        b @r3 = *src++
-        *dst++ = b
+        c @r3 = *src++
+        *dst++ = c
         #(n -= 1)
         if #ne goto loop
     }
@@ -357,11 +395,11 @@ fn mp3_hdr_frame_size(h, free) -> n {
 fn mp3_match_frame(mp3: *u8, len, frame_bytes) -> ok {
     push(r4, r5, r6, r7, r8, lr)
     q @r4 = mp3
-    end @r5 = mp3 + len
+    end @r8 = mp3 + len
     fb @r6 = frame_bytes
     h0 @r7 = *(mp3 as *u32)
     h0 = rev(h0)
-    nmatch @r8 = 0
+    nmatch @r5 = 0
     loop {
         h @r0 = *(q as *u32)
         h = rev(h)
@@ -396,8 +434,8 @@ done:
 fn mp3_find_frame(mp3: *u8, len, ffb: *u32) -> (ix, size) {
     push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
     sp -= 12 (pad, other, fb2)
-    base @r4 = mp3
-    n @r5 = len
+    base @r9 = mp3
+    n @r8 = len
     ffp @r6 = ffb
     i @r7 = 0
     loop {
@@ -405,7 +443,7 @@ fn mp3_find_frame(mp3: *u8, len, ffb: *u32) -> (ix, size) {
         #(t - n)
         if #hs goto break
         hp @r0 = base + i
-        h @r8 = *(hp as *u32)
+        h @r5 = *(hp as *u32)
         h = rev(h)
         a @r0 = h
         ok @r0 = call mp3_hdr_valid(a)
@@ -414,7 +452,7 @@ fn mp3_find_frame(mp3: *u8, len, ffb: *u32) -> (ix, size) {
         a @r0 = h
         f @r1 = *ffp
         b @r0 = call mp3_hdr_frame_bytes(a, f)
-        fb @r9 = b
+        fb @r4 = b
         a @r0 = h
         p @r0 = call mp3_hdr_padding(a)
         sp.pad = p
@@ -501,45 +539,27 @@ done:
     pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
 }
 
-// Read n bits, up to 24, or 0 past the limit
+// Read n bits, up to 24, or 0 past the limit. Reads the 4 bytes from the
+// first bit's, which may be up to 3 past the last bit.
 #[link_section = ".text"]
 fn mp3_bs_get_bits(bs: *Mp3Bs, n) -> v {
-    push(r4, r5)
-    pos @r2 = bs.pos
-    s @r3 = pos & 7
-    ix @r12 = pos >> 3
-    pos += n
-    bs.pos = pos
-    lim @r4 = bs.limit
-    #(pos - lim)
+    pos @r12 = bs.pos
+    lim @r3 = bs.limit
+    np @r2 = pos + n
+    bs.pos = np
+    #(np - lim)
     if #hi goto zero
-    p @r4 = bs.buf
-    p += ix
-    next @r12 = *p++
-    mask @r5 = 0xff
-    mask >>= s
-    next &= mask
-    shl @r3 = s + n
-    v = 0
-    while {
-        #(shl - 8)
-        if #ls goto break
-    } loop {
-        shl -= 8
-        t @r5 = next << shl
-        v |= t
-        next = *p++
-        #(shl - 8)
-        if #hi goto loop
-    }
-    shl = 8 - shl
-    next >>= shl
-    v |= next
-    pop(r4, r5)
+    p @r3 = bs.buf
+    ix @r2 = pos >> 3
+    w @r2 = *((p + ix) as *u32)
+    s @r3 = pos & 7
+    w = rev(w)
+    w <<= s
+    t @r3 = 32 - n
+    v = w >> t
     bx lr
 zero:
     v = 0
-    pop(r4, r5)
     bx lr
 }
 
@@ -548,12 +568,12 @@ zero:
 fn mp3_decode_frame(mp3: *u8, len, pcm: *i16, info: *Mp3Info) -> n {
     push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
     sp -= 12 (bsf: Mp3Bs)
-    src @r4 = mp3
-    n_src @r5 = len
+    src @r8 = mp3
+    n_src @r9 = len
     out @r6 = pcm
     inf @r7 = info
-    dec @r8 = &mp3_decoder
-    size @r9 = 0
+    dec @r4 = &mp3_decoder
+    size @r5 = 0
     // If this continues the last frame's stream, it should start with a
     // frame, followed by the next one's header
     if {
@@ -668,12 +688,12 @@ mismatch:
     m @r1 = mdb
     b @r0 = &sp.bsf
     ok @r0 = call mp3_restore_reservoir(b, m)
-    success @r9 = ok
+    success @r5 = ok
     if {
         if ok == 0 goto end
         nch @r7 = inf.channels
         // the granule index, times channels
-        gi @r5 = 0
+        gi @r9 = 0
         ngr @r10 = 1
         #(h & HDR_MPEG1)
         if #ne {
@@ -724,12 +744,12 @@ done:
 fn mp3_restore_reservoir(bs: *Mp3Bs, main_data_begin) -> ok {
     push(r4, r5, r6, r7, r8, r9, r10, lr)
     b @r4 = bs
-    mdb @r5 = main_data_begin
+    mdb @r8 = main_data_begin
     dec @r6 = &mp3_decoder
     s @r7 = &mp3_scratch
     pos @r0 = b.pos
     lim @r1 = b.limit
-    fbytes @r8 = lim - pos
+    fbytes @r5 = lim - pos
     fbytes >>= 3
     res @r2 = dec.reserv
     have @r9 = res
@@ -750,7 +770,7 @@ fn mp3_restore_reservoir(bs: *Mp3Bs, main_data_begin) -> ok {
     src @r1 = buf + (pos >> 3)
     cnt @r2 = fbytes
     call mp3_copy(d, src, cnt)
-    total @r10 = have + fbytes
+    total @r3 = have + fbytes
     md @r0 = &mp3_scratch.maindata as *u8
     s.bs.buf = md
     zero @r1 = 0
@@ -816,11 +836,11 @@ fn mp3_save_reservoir() {
 fn mp3_read_side_info(bs: *Mp3Bs, h) -> mdb {
     push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
     sp -= 4 (tables)
-    b @r4 = bs
-    hh @r6 = h
+    b @r6 = bs
+    hh @r10 = h
     gr @r5 = &mp3_scratch.gr_info as *Mp3Gr
     // the sample rate index, mpeg1 ones last, less 1 but at least 0
-    sr @r10 = h[10..12]
+    sr @r4 = h[10..12]
     t @r0 = h[19..20]
     t2 @r1 = h[20..21]
     t += t2
@@ -1086,16 +1106,16 @@ fn mp3_decode_scalefactors(gr: *Mp3Gr, ist: *u8, ch) {
     push(s16)
     sp -= 48 (iscf: [u8; 40], sizes: [u8; 4], pad)
     g @r4 = gr
-    ip @r5 = ist
-    d @r6 = &mp3_decoder
-    hh @r6 = d.header
+    ip @r8 = ist
+    d @r9 = &mp3_decoder
+    hh @r9 = d.header
     c @r7 = ch
     // iscf = 0
     z @r0 = 0
     z1 @r1 = 0
     z2 @r2 = 0
-    z3 @r3 = 0
-    p @r12 = &sp.iscf as *u32
+    z3 @r12 = 0
+    p @r3 = &sp.iscf as *u32
     *p++ = (z, z1, z2, z3)
     *p++ = (z, z1, z2, z3)
     *p++ = (z, z1)
@@ -1112,10 +1132,10 @@ fn mp3_decode_scalefactors(gr: *Mp3Gr, ist: *u8, ch) {
         k += 1
     }
     part @r10 = &mp3_scf_partitions as *u8
-    t @r3 = k << 5
+    t @r12 = k << 5
     t -= k << 2
     part += t
-    scfsi @r9 = g.scfsi
+    scfsi @r6 = g.scfsi
     if {
         #(hh & HDR_MPEG1)
         if #eq goto else
@@ -1140,7 +1160,7 @@ fn mp3_decode_scalefactors(gr: *Mp3Gr, ist: *u8, ch) {
             sfc >>= 1
             mp += 12
         }
-        mods @r8 = mp
+        mods @r5 = mp
         szp @r7 = &sp.sizes as *u8
         // the sizes, from the last, as digits of sfc in the bases from
         // mp3_mod, until it goes negative
@@ -1149,8 +1169,8 @@ fn mp3_decode_scalefactors(gr: *Mp3Gr, ist: *u8, ch) {
             if #lt goto break
         } loop {
             prod @r2 = 1
-            g3 @r3 = *(mods + 3)
-            q @r12 = sfc / prod
+            g3 @r12 = *(mods + 3)
+            q @r3 = sfc / prod
             q2 @r11 = q / g3
             q = q - q2 * g3
             *(szp + 3) = q
@@ -1186,10 +1206,10 @@ fn mp3_decode_scalefactors(gr: *Mp3Gr, ist: *u8, ch) {
     // read_scalefactors: up to 4 partitions, of count scalefactors of
     // sizes[i] bits each. A partition with its scfsi bit set (bit 3 of
     // this) reuses the last granule's, which ist holds.
-    this @r9 = scfsi
-    dp @r6 = &sp.iscf as *u8
+    this @r6 = scfsi
+    dp @r9 = &sp.iscf as *u8
     sz @r7 = &sp.sizes as *u8
-    i @r8 = 4
+    i @r5 = 4
     loop {
         cnt @r11 = *part++
         #(cnt - 0)
@@ -1251,9 +1271,9 @@ fn mp3_decode_scalefactors(gr: *Mp3Gr, ist: *u8, ch) {
         sh @r1 = g.scalefac_scale
         sh = 2 - sh
         sgp @r2 = &g.subblock_gain as *u8
-        sg0 @r3 = *sgp
+        sg0 @r12 = *sgp
         sg0 <<= sh
-        sg1 @r12 = *(sgp + 1)
+        sg1 @r3 = *(sgp + 1)
         sg1 <<= sh
         sg2 @lr = *(sgp + 2)
         sg2 <<= sh
@@ -1280,8 +1300,8 @@ fn mp3_decode_scalefactors(gr: *Mp3Gr, ist: *u8, ch) {
         if pf == 0 goto end
         isp @r2 = &sp.iscf as *u8
         isp += 11
-        pre @r3 = &mp3_preamp as *u8
-        n @r12 = 10
+        pre @r12 = &mp3_preamp as *u8
+        n @r3 = 10
         loop {
             x @r1 = *isp
             y @r0 = *pre++
@@ -1308,11 +1328,11 @@ fn mp3_decode_scalefactors(gr: *Mp3Gr, ist: *u8, ch) {
     keep @s16 = gain
     shift @r7 = g.scalefac_scale
     shift += 1
-    n @r8 = g.n_long_sfb
+    n @r5 = g.n_long_sfb
     ns @r0 = g.n_short_sfb
     n += ns
-    isp @r6 = &sp.iscf as *u8
-    out @r9 = &mp3_scratch.scf as *f32
+    isp @r9 = &sp.iscf as *u8
+    out @r6 = &mp3_scratch.scf as *f32
     loop {
         x @r0 = *isp++
         x <<= shift
@@ -1336,7 +1356,7 @@ fn mp3_huffman(dst: *f32, gr: *Mp3Gr, limit) {
     sp -= 16 (ireg: *u8, bands, lim, c1)
     sp.lim = limit
     big @r6 = gr.big_values
-    sfb @r7 = gr.sfbtab
+    sfb @r10 = gr.sfbtab
     c1t @r2 = gr.count1_table
     sp.c1 = c1t
     ts @r2 = &gr.table_select as *u8
@@ -1346,7 +1366,7 @@ fn mp3_huffman(dst: *f32, gr: *Mp3Gr, limit) {
     // bits used of those loaded, less 8, at most -1 after a refill.
     bsp @r2 = &mp3_scratch.bs
     pos @r4 = bsp.pos
-    ptr @r5 = bsp.buf
+    ptr @r9 = bsp.buf
     t @r2 = pos >> 3
     ptr += t
     cache @r3 = *(ptr as *u32)
@@ -1365,7 +1385,7 @@ fn mp3_huffman(dst: *f32, gr: *Mp3Gr, limit) {
         if #le goto break
     } loop {
         ts @r2 = sp.ireg
-        tab @r12 = *ts
+        tab @r5 = *ts
         nb @r1 = *(ts + 3)
         ts += 1
         sp.ireg = ts
@@ -1373,71 +1393,62 @@ fn mp3_huffman(dst: *f32, gr: *Mp3Gr, limit) {
         sp.bands = nb
         hi @r2 = &mp3_huff_index as *u16
         off @r2 = *(hi + tab * 2)
-        cb @r9 = &mp3_huff_tabs as *i16
+        cb @r12 = &mp3_huff_tabs as *i16
         cb = cb + (off << 1)
         lb @r2 = &mp3_linbits as *u8
-        linbits @r10 = *(lb + tab)
+        linbits @r7 = *(lb + tab)
         if {
             #(linbits - 0)
             if #ne goto else
             loop {
-                np @r12 = *sfb++
+                np @r5 = *sfb++
                 np >>= 1
                 pairs @r11 = big
                 #(pairs - np)
                 if #gt {
                     pairs = np
                 }
+                // each pair's first lookup is at the end of the one before
+                t @r2 = cache >> 27
+                leaf @r1 = *(cb + t * 2)
                 one = *scf++
                 big -= np
                 #(pairs - 0)
                 if #le goto band_done
                 loop {
-                    t @r2 = cache >> 27
-                    leaf @r1 = *(cb + t * 2)
-                    w @r12 = 5
-                    while {
-                        #(leaf - 0)
-                        if #ge goto break
-                    } loop {
-                        cache <<= w
-                        shift += w
-                        w = leaf & 7
-                        t = 32 - w
-                        t = cache >> t
-                        t -= (leaf as i32) >> 3
-                        leaf = *(cb + t * 2)
-                        #(leaf - 0)
-                        if #lt goto loop
-                    }
+                    // a longer code needs more lookups, after the loop
+                    #(leaf - 0)
+                    if #lt goto long_code
+                have_leaf:
                     t = leaf >> 8
                     cache <<= t
                     shift += t
-                    // two values, the first in the low 4 bits
+                    // two values, the first in the low 4 bits, each with a
+                    // sign bit after it when it's nonzero. linbits is 0
+                    // here, so its register is free.
                     lsb @r2 = leaf & 15
-                    m @r12 = (cache as i32) >> 31
+                    lsb2 @r7 = (leaf as u32)[4..8]
+                    m @r5 = (cache as i32) >> 31
                     m = lsb + (m << 4)
-                    a @r12 = pow + (m << 2)
+                    #(lsb - 0)
+                    if #ne {
+                        cache <<= 1
+                        shift += 1
+                    }
+                    a @r5 = pow + (m << 2)
+                    m2 @r1 = (cache as i32) >> 31
                     v @s0 = *a
+                    m2 = lsb2 + (m2 << 4)
                     v = v * one
-                    *dst++ = v
-                    #(lsb - 0)
+                    #(lsb2 - 0)
                     if #ne {
                         cache <<= 1
                         shift += 1
                     }
-                    lsb @r2 = (leaf as u32)[4..8]
-                    m @r12 = (cache as i32) >> 31
-                    m = lsb + (m << 4)
-                    a @r12 = pow + (m << 2)
-                    v = *a
-                    v = v * one
+                    a2 @r5 = pow + (m2 << 2)
                     *dst++ = v
-                    #(lsb - 0)
-                    if #ne {
-                        cache <<= 1
-                        shift += 1
-                    }
+                    v2 @s1 = *a2
+                    v2 = v2 * one
                     while {
                         #(shift - 0)
                         if #lt goto break
@@ -1448,6 +1459,9 @@ fn mp3_huffman(dst: *f32, gr: *Mp3Gr, limit) {
                         #(shift -= 8)
                         if #ge goto loop
                     }
+                    t @r2 = cache >> 27
+                    leaf @r1 = *(cb + t * 2)
+                    *dst++ = v2
                     #(pairs -= 1)
                     if #ne goto loop
                 }
@@ -1462,7 +1476,7 @@ band_done:
             goto end
         } else {
             loop {
-                np @r12 = *sfb++
+                np @r5 = *sfb++
                 np >>= 1
                 pairs @r11 = big
                 #(pairs - np)
@@ -1476,7 +1490,7 @@ band_done:
                 loop {
                     t @r2 = cache >> 27
                     leaf @r1 = *(cb + t * 2)
-                    w @r12 = 5
+                    w @r5 = 5
                     while {
                         #(leaf - 0)
                         if #ge goto break
@@ -1492,169 +1506,98 @@ band_done:
                         if #lt goto loop
                     }
                     t = leaf >> 8
+                    // the two values, the first in the low 4 bits; a bit
+                    // above them ends the loop
+                    leaf = (leaf as u32)[0..8]
+                    leaf |= 256
                     cache <<= t
                     shift += t
-                    lsb @r2 = leaf & 15
-                    // l3_pow_43 of 15 plus linbits more bits, then the sign
-                    if {
-                        #(lsb - 15)
-                        if #ne goto else
-                        t @r12 = 32 - linbits
-                        x @r2 = cache >> t
-                        x += 15
-                        cache <<= linbits
-                        shift += linbits
-                        while {
-                            #(shift - 0)
-                            if #lt goto break
-                        } loop {
-                            b @r12 = *ptr++
-                            b <<= shift
-                            cache |= b
-                            #(shift -= 8)
-                            if #ge goto loop
-                        }
+                    loop {
+                        lsb @r2 = leaf & 15
+                        // l3_pow_43 of 15 plus linbits more bits, then the sign
                         if {
-                            #(x - 129)
-                            if #hs goto else
-                            a @r12 = pow + (x << 2)
-                            v @s0 = *a
-                            goto end
-                        } else {
-                            k @r12 = &mp3_pow43_k as *f32
-                            (c16 @s1, c256 @s2, c43 @s3, c29 @s4) = *k
-                            mult @s5 = c256
-                            #(x - 1024)
-                            if #lo {
-                                mult = c16
-                                x <<= 3
+                            #(lsb - 15)
+                            if #ne goto else
+                            t @r5 = 32 - linbits
+                            x @r2 = cache >> t
+                            x += 15
+                            cache <<= linbits
+                            shift += linbits
+                            while {
+                                #(shift - 0)
+                                if #lt goto break
+                            } loop {
+                                b @r5 = *ptr++
+                                b <<= shift
+                                cache |= b
+                                #(shift -= 8)
+                                if #ge goto loop
                             }
-                            sign @r12 = x << 1
-                            sign &= 64
-                            nu @lr = x & 63
-                            nu -= sign
-                            ni @s6 = nu
-                            fnu @s6 = i32_to_f32(ni)
-                            de @lr = x & !63
-                            de += sign
-                            di @s7 = de
-                            fde @s7 = i32_to_f32(di)
-                            x += sign
-                            x >>= 6
-                            frac @s6 = fnu / fde
-                            sc @s7 = c43
-                            sc += frac * c29
-                            sc2 @s8 = 1.0
-                            sc2 += frac * sc
-                            sc2 = sc2 * mult
-                            pow @lr = &mp3_pow43 as *f32
-                            pow += 16 * 4
-                            a @r12 = pow + (x << 2)
-                            v @s0 = *a
-                            v = v * sc2
-                        }
-                        v = one * v
-                        #(cache - 0)
-                        if #mi {
-                            v = -v
-                        }
-                        *dst++ = v
-                        cache <<= 1
-                        shift += 1
-                        goto end
-                    } else {
-                        m @r12 = (cache as i32) >> 31
-                        m = lsb + (m << 4)
-                        a @r12 = pow + (m << 2)
-                        v @s0 = *a
-                        v = v * one
-                        *dst++ = v
-                        #(lsb - 0)
-                        if #ne {
+                            if {
+                                #(x - 129)
+                                if #hs goto else
+                                a @r5 = pow + (x << 2)
+                                v @s0 = *a
+                                goto end
+                            } else {
+                                k @r5 = &mp3_pow43_k as *f32
+                                (c16 @s1, c256 @s2, c43 @s3, c29 @s4) = *k
+                                mult @s5 = c256
+                                #(x - 1024)
+                                if #lo {
+                                    mult = c16
+                                    x <<= 3
+                                }
+                                sign @r5 = x << 1
+                                sign &= 64
+                                nu @lr = x & 63
+                                nu -= sign
+                                ni @s6 = nu
+                                fnu @s6 = i32_to_f32(ni)
+                                de @lr = x & !63
+                                de += sign
+                                di @s7 = de
+                                fde @s7 = i32_to_f32(di)
+                                x += sign
+                                x >>= 6
+                                frac @s6 = fnu / fde
+                                sc @s7 = c43
+                                sc += frac * c29
+                                sc2 @s8 = 1.0
+                                sc2 += frac * sc
+                                sc2 = sc2 * mult
+                                pow @lr = &mp3_pow43 as *f32
+                                pow += 16 * 4
+                                a @r5 = pow + (x << 2)
+                                v @s0 = *a
+                                v = v * sc2
+                            }
+                            v = one * v
+                            #(cache - 0)
+                            if #mi {
+                                v = -v
+                            }
+                            *dst++ = v
                             cache <<= 1
                             shift += 1
-                        }
-                    }
-                    lsb @r2 = (leaf as u32)[4..8]
-                    // l3_pow_43 of 15 plus linbits more bits, then the sign
-                    if {
-                        #(lsb - 15)
-                        if #ne goto else
-                        t @r12 = 32 - linbits
-                        x @r2 = cache >> t
-                        x += 15
-                        cache <<= linbits
-                        shift += linbits
-                        while {
-                            #(shift - 0)
-                            if #lt goto break
-                        } loop {
-                            b @r12 = *ptr++
-                            b <<= shift
-                            cache |= b
-                            #(shift -= 8)
-                            if #ge goto loop
-                        }
-                        if {
-                            #(x - 129)
-                            if #hs goto else
-                            a @r12 = pow + (x << 2)
-                            v @s0 = *a
+                            leaf >>= 4
                             goto end
                         } else {
-                            k @r12 = &mp3_pow43_k as *f32
-                            (c16 @s1, c256 @s2, c43 @s3, c29 @s4) = *k
-                            mult @s5 = c256
-                            #(x - 1024)
-                            if #lo {
-                                mult = c16
-                                x <<= 3
+                            m @r5 = (cache as i32) >> 31
+                            m = lsb + (m << 4)
+                            #(lsb - 0)
+                            if #ne {
+                                cache <<= 1
+                                shift += 1
                             }
-                            sign @r12 = x << 1
-                            sign &= 64
-                            nu @lr = x & 63
-                            nu -= sign
-                            ni @s6 = nu
-                            fnu @s6 = i32_to_f32(ni)
-                            de @lr = x & !63
-                            de += sign
-                            di @s7 = de
-                            fde @s7 = i32_to_f32(di)
-                            x += sign
-                            x >>= 6
-                            frac @s6 = fnu / fde
-                            sc @s7 = c43
-                            sc += frac * c29
-                            sc2 @s8 = 1.0
-                            sc2 += frac * sc
-                            sc2 = sc2 * mult
-                            pow @lr = &mp3_pow43 as *f32
-                            pow += 16 * 4
-                            a @r12 = pow + (x << 2)
+                            a @r5 = pow + (m << 2)
+                            leaf >>= 4
                             v @s0 = *a
-                            v = v * sc2
+                            v = v * one
+                            *dst++ = v
                         }
-                        v = one * v
-                        #(cache - 0)
-                        if #mi {
-                            v = -v
-                        }
-                        *dst++ = v
-                        cache <<= 1
-                        shift += 1
-                        goto end
-                    } else {
-                        m @r12 = (cache as i32) >> 31
-                        m = lsb + (m << 4)
-                        a @r12 = pow + (m << 2)
-                        v @s0 = *a
-                        v = v * one
-                        *dst++ = v
-                        #(lsb - 0)
-                        if #ne {
-                            cache <<= 1
-                            shift += 1
-                        }
+                        #(leaf - 16)
+                        if #hs goto loop
                     }
                     while {
                         #(shift - 0)
@@ -1683,95 +1626,79 @@ lin_band_done:
     }
     // the count1 region, values of 0 or 1 in quads, until the limit
     np @r6 = 1 - big
-    cb1 @r9 = &mp3_tab32 as *u8
-    c1 @r12 = sp.c1
+    cb1 @r12 = &mp3_tab32 as *u8
+    c1 @r5 = sp.c1
     #(c1 - 0)
     if #eq goto tab32
     cb1 = &mp3_tab33 as *u8
 tab32:
-    lim24 @r10 = sp.lim
+    lim24 @r7 = sp.lim
     lim24 += 24
     base @r11 = &mp3_scratch.maindata as *u8
+    // each value is one with the sign bit after it, so as bits
+    onebits @r5 = to_bits(one)
     loop {
         t @r2 = cache >> 28
         leaf @r1 = *(cb1 + t)
+        pb @lr = ptr - base
         if {
             #(leaf & 8)
             if #ne goto end
             t = cache << 4
-            w @r12 = leaf & 3
+            w @lr = leaf & 3
             w = 32 - w
             t >>= w
             t += leaf >> 3
             leaf = *(cb1 + t)
+            pb @lr = ptr - base
         }
         t = leaf & 7
         cache <<= t
         shift += t
         // stop past the limit
-        t = ptr - base
-        t = shift + (t << 3)
+        t = shift + (pb << 3)
         #(t - lim24)
-        if #hi goto break
+        if #hi goto count1_done
+        // a new band, with a new scale, after the loop
         #(np -= 1)
-        if #ne goto have0
-        np = *sfb++
-        #(np >>= 1)
-        if #eq goto break
-        one = *scf++
+        if #eq goto band0
 have0:
         if {
             #(leaf & 128)
             if #eq goto end
-            v @s0 = one
-            #(cache - 0)
-            if #mi {
-                v = -one
-            }
-            *dst = v
+            sg @r2 = cache & 0x80000000
+            sg ^= onebits
+            *(dst as *u32) = sg
             cache <<= 1
             shift += 1
         }
         if {
             #(leaf & 64)
             if #eq goto end
-            v @s0 = one
-            #(cache - 0)
-            if #mi {
-                v = -one
-            }
-            *(dst + 4) = v
+            sg @r2 = cache & 0x80000000
+            sg ^= onebits
+            *((dst + 4) as *u32) = sg
             cache <<= 1
             shift += 1
         }
         #(np -= 1)
-        if #ne goto have1
-        np = *sfb++
-        #(np >>= 1)
-        if #eq goto break
-        one = *scf++
+        if #eq goto band1
 have1:
         if {
             #(leaf & 32)
             if #eq goto end
-            v @s0 = one
-            #(cache - 0)
-            if #mi {
-                v = -one
-            }
-            *(dst + 8) = v
+            sg @r2 = cache & 0x80000000
+            sg ^= onebits
+            *((dst + 8) as *u32) = sg
             cache <<= 1
             shift += 1
         }
         if {
             #(leaf & 16)
             if #eq goto end
-            v @s0 = one
-            #(cache - 0)
-            if #mi {
-                v = -one
-            }
-            *(dst + 12) = v
+            sg @r2 = cache & 0x80000000
+            sg ^= onebits
+            *((dst + 12) as *u32) = sg
             cache <<= 1
             shift += 1
         }
@@ -1788,34 +1715,67 @@ have1:
         dst += 16
         goto loop
     }
+count1_done:
     bsp @r0 = &mp3_scratch.bs
     lim @r1 = sp.lim
     bsp.pos = lim
     sp += 16
     pop(s16)
     pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
+    // The rest of a code longer than 5 bits, for the pair loop above: each
+    // negative leaf gives the next lookup's width and offset.
+long_code:
+    w @r5 = 5
+    loop {
+        cache <<= w
+        shift += w
+        w = leaf & 7
+        t = 32 - w
+        t = cache >> t
+        t -= (leaf as i32) >> 3
+        leaf = *(cb + t * 2)
+        #(leaf - 0)
+        if #lt goto loop
+    }
+    goto have_leaf
+    // The next band in the count1 region, before its first or third value
+band0:
+    np = *sfb++
+    #(np >>= 1)
+    if #eq goto count1_done
+    one = *scf++
+    onebits = to_bits(one)
+    goto have0
+band1:
+    np = *sfb++
+    #(np >>= 1)
+    if #eq goto count1_done
+    one = *scf++
+    onebits = to_bits(one)
+    goto have1
 }
+
 // Decode granule gi (times nch) of all channels into mp3_scratch.grbuf,
 // as frequency lines through the IMDCT
 #[link_section = ".text"]
 fn mp3_l3_decode(gi, nch) {
     push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
     sp -= 4
-    g0 @r5 = &mp3_scratch.gr_info as *Mp3Gr
+    g0 @r9 = &mp3_scratch.gr_info as *Mp3Gr
     t @r2 = size(Mp3Gr)
     t = gi * t
     g0 += t
-    n @r6 = nch
+    n @r8 = nch
     // scalefactors and Huffman decoding
-    gr @r8 = g0
-    ist @r9 = &mp3_scratch.ist_pos as *u8
+    gr @r4 = g0
+    ist @r10 = &mp3_scratch.ist_pos as *u8
     gp @r11 = &mp3_scratch.grbuf as *f32
     ch @r7 = 0
     loop {
         bsp @r0 = &mp3_scratch.bs
         pos @r0 = bsp.pos
         len @r1 = gr.part_23_length
-        lim @r10 = pos + len
+        lim @r5 = pos + len
         a @r0 = gr
         i @r1 = ist
         c @r2 = ch
@@ -1833,7 +1793,7 @@ fn mp3_l3_decode(gi, nch) {
     }
     // stereo
     dec @r0 = &mp3_decoder
-    h @r9 = dec.header
+    h @r10 = dec.header
     if {
         #(h & HDR_I_STEREO)
         if #eq goto else
@@ -1851,11 +1811,11 @@ fn mp3_l3_decode(gi, nch) {
     // reorder, antialias, IMDCT
     gr = g0
     gp = &mp3_scratch.grbuf as *f32
-    ov @r4 = &mp3_decoder.mdct_overlap as *f32
+    ov @r6 = &mp3_decoder.mdct_overlap as *f32
     ch = 0
     loop {
         // the long bands of a mixed block, 4 at 8 kHz
-        nlb @r10 = 0
+        nlb @r5 = 0
         if {
             m @r0 = gr.mixed_block_flag
             if m == 0 goto end
@@ -1948,7 +1908,7 @@ fn mp3_intensity_stereo(gr: *Mp3Gr) {
     push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
     push(s16)
     sp -= 16 (max_band: [u32; 3], saved)
-    g @r4 = gr
+    g @r5 = gr
     // the last nonzero band of the right channel, per window
     m @r0 = -1
     mb @r1 = &sp.max_band as *u32
@@ -1958,11 +1918,11 @@ fn mp3_intensity_stereo(gr: *Mp3Gr) {
     nl @r0 = g.n_long_sfb
     ns @r1 = g.n_short_sfb
     nsfb @r9 = nl + ns
-    p @r5 = &mp3_scratch.grbuf as *u32
+    p @r8 = &mp3_scratch.grbuf as *u32
     p += 576 * 4
     sfb @r6 = g.sfbtab
     i @r7 = 0
-    m3 @r8 = 0
+    m3 @r4 = 0
     while {
         #(i - nsfb)
         if #hs goto break
@@ -2021,7 +1981,7 @@ next_band:
     if #ne {
         blocks = 3
     }
-    ist @r5 = &mp3_scratch.ist_pos as *u8
+    ist @r8 = &mp3_scratch.ist_pos as *u8
     ist += 39
     dflt @r11 = 0
     #(h & HDR_MPEG1)
@@ -2059,7 +2019,7 @@ next_band:
         if #eq goto end
         s = 1.41421356
     }
-    l @r4 = &mp3_scratch.grbuf as *f32
+    l @r5 = &mp3_scratch.grbuf as *f32
     i = 0
     m3 = 0
     loop {
@@ -2127,22 +2087,23 @@ next_band:
 }
 
 // Reorder short blocks, from window by window to line by line, through
-// mp3_scratch.syn
+// the scratch part of mp3_decoder.syn
 #[link_section = ".text"]
 fn mp3_reorder(grbuf: *u32, sfb: *u8) {
     push(grbuf, r4, r5, r6, r7, lr)
     src @r0 = grbuf
-    d @r2 = &mp3_scratch.syn as *u32
+    d @r2 = &mp3_decoder.syn as *u32
+    d += 960 * 4
     loop {
         len @r3 = *sfb
         sfb += 3
         if len == 0 goto break
-        l4 @r12 = len << 2
+        l4 @r6 = len << 2
         l8 @lr = len << 3
         loop {
             a @r4 = *src
             b @r5 = *(src + l4)
-            c @r6 = *(src + l8)
+            c @r7 = *(src + l8)
             *d++ = (a, b, c)
             src += 4
             #(len -= 1)
@@ -2151,13 +2112,15 @@ fn mp3_reorder(grbuf: *u32, sfb: *u8) {
         src += l8
         goto loop
     }
-    s @r1 = &mp3_scratch.syn as *u32
+    s @r1 = &mp3_decoder.syn as *u32
+    s += 960 * 4
     n @r2 = d - s
     n >>= 2
     g @r0 = sp.grbuf
     call mp3_copy_words(g, s, n)
     pop(r0, r4, r5, r6, r7, pc)
 }
+
 // The alias reduction butterflies between each pair of long bands
 #[link_section = ".ram"]
 fn mp3_antialias(grbuf: *f32, nbands) {
@@ -2167,73 +2130,70 @@ fn mp3_antialias(grbuf: *f32, nbands) {
     t @r2 = &mp3_aa as *f32
     (cs0 @s16, cs1 @s17, cs2 @s18, cs3 @s19, cs4 @s20, cs5 @s21, cs6 @s22, cs7 @s23, ca0 @s24, ca1 @s25, ca2 @s26, ca3 @s27, ca4 @s28, ca5 @s29, ca6 @s30, ca7 @s31) = *t
     p @r0 = grbuf + 18 * 4
+    // The 8 butterflies of a band boundary, 4 at a time: u at p up, d at
+    // p - 4 down, x = u cs - d ca to u and y = u ca + d cs to d
     loop {
-        u @s0 = *p
-        d @s1 = *(p - 4)
-        x @s2 = u * cs0
-        x -= d * ca0
-        y @s3 = u * ca0
-        y += d * cs0
-        *p = x
-        *(p - 4) = y
-        u @s4 = *(p + 4)
-        d @s5 = *(p - 8)
-        x @s6 = u * cs1
-        x -= d * ca1
-        y @s7 = u * ca1
-        y += d * cs1
-        *(p + 4) = x
-        *(p - 8) = y
-        u @s0 = *(p + 8)
-        d @s1 = *(p - 12)
-        x @s2 = u * cs2
-        x -= d * ca2
-        y @s3 = u * ca2
-        y += d * cs2
-        *(p + 8) = x
-        *(p - 12) = y
-        u @s4 = *(p + 12)
-        d @s5 = *(p - 16)
-        x @s6 = u * cs3
-        x -= d * ca3
-        y @s7 = u * ca3
-        y += d * cs3
-        *(p + 12) = x
-        *(p - 16) = y
-        u @s0 = *(p + 16)
-        d @s1 = *(p - 20)
-        x @s2 = u * cs4
-        x -= d * ca4
-        y @s3 = u * ca4
-        y += d * cs4
-        *(p + 16) = x
-        *(p - 20) = y
-        u @s4 = *(p + 20)
-        d @s5 = *(p - 24)
-        x @s6 = u * cs5
-        x -= d * ca5
-        y @s7 = u * ca5
-        y += d * cs5
-        *(p + 20) = x
-        *(p - 24) = y
-        u @s0 = *(p + 24)
-        d @s1 = *(p - 28)
-        x @s2 = u * cs6
-        x -= d * ca6
-        y @s3 = u * ca6
-        y += d * cs6
-        *(p + 24) = x
-        *(p - 28) = y
-        u @s4 = *(p + 28)
-        d @s5 = *(p - 32)
-        x @s6 = u * cs7
-        x -= d * ca7
-        y @s7 = u * ca7
-        y += d * cs7
-        *(p + 28) = x
-        *(p - 32) = y
-        p += 18 * 4
         #(nbands -= 1)
+        q @r2 = p - 16
+        pu @r3 = p + 16
+        qd @r12 = p - 32
+        (u0 @s0, u1 @s1, u2 @s2, u3 @s3) = *p
+        (d3 @s4, d2 @s5, d1 @s6, d0 @s7) = *q
+        x0 @s8 = u0 * cs0
+        t0 @s15 = d0 * ca0
+        dc0 @s7 = d0 * cs0
+        ua0 @s0 = u0 * ca0
+        x0 = x0 - t0
+        y0 @s15 = ua0 + dc0
+        x1 @s9 = u1 * cs1
+        t1 @s14 = d1 * ca1
+        dc1 @s6 = d1 * cs1
+        ua1 @s1 = u1 * ca1
+        x1 = x1 - t1
+        y1 @s14 = ua1 + dc1
+        x2 @s10 = u2 * cs2
+        t2 @s13 = d2 * ca2
+        dc2 @s5 = d2 * cs2
+        ua2 @s2 = u2 * ca2
+        x2 = x2 - t2
+        y2 @s13 = ua2 + dc2
+        x3 @s11 = u3 * cs3
+        t3 @s12 = d3 * ca3
+        dc3 @s4 = d3 * cs3
+        ua3 @s3 = u3 * ca3
+        x3 = x3 - t3
+        y3 @s12 = ua3 + dc3
+        *p = (x0, x1, x2, x3)
+        *q = (y3, y2, y1, y0)
+        (u4 @s0, u5 @s1, u6 @s2, u7 @s3) = *pu
+        (d7 @s4, d6 @s5, d5 @s6, d4 @s7) = *qd
+        x4 @s8 = u4 * cs4
+        t4 @s15 = d4 * ca4
+        dc4 @s7 = d4 * cs4
+        ua4 @s0 = u4 * ca4
+        x4 = x4 - t4
+        y4 @s15 = ua4 + dc4
+        x5 @s9 = u5 * cs5
+        t5 @s14 = d5 * ca5
+        dc5 @s6 = d5 * cs5
+        ua5 @s1 = u5 * ca5
+        x5 = x5 - t5
+        y5 @s14 = ua5 + dc5
+        x6 @s10 = u6 * cs6
+        t6 @s13 = d6 * ca6
+        dc6 @s5 = d6 * cs6
+        ua6 @s2 = u6 * ca6
+        x6 = x6 - t6
+        y6 @s13 = ua6 + dc6
+        x7 @s11 = u7 * cs7
+        t7 @s12 = d7 * ca7
+        dc7 @s4 = d7 * cs7
+        ua7 @s3 = u7 * ca7
+        x7 = x7 - t7
+        y7 @s12 = ua7 + dc7
+        *pu = (x4, x5, x6, x7)
+        *qd = (y7, y6, y5, y4)
+        p += 18 * 4
         if #ne goto loop
     }
     pop(s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31)
@@ -2241,80 +2201,72 @@ done:
     bx lr
 }
 
-// The 9 point DCT at y, in place
+// The 9 point DCT at y, in place, scheduled by tools/sched.py
 #[link_section = ".ram"]
 fn mp3_dct9(y: *f32) {
+    (e0 @s0, o1 @s1, e2 @s2, o3 @s3, e4 @s4, o5 @s5, e6 @s6, o7 @s7, e8 @s8) = *y
+    half @s9 = 0.5
     k @r1 = &mp3_dct9_k as *f32
-    e0 @s0 = *y
-    e2 @s2 = *(y + 8)
-    e4 @s4 = *(y + 16)
-    e6 @s6 = *(y + 24)
-    e8 @s8 = *(y + 32)
-    half @s12 = 0.5
-    t0 @s9 = e6 * half
-    t0 = e0 + t0
-    e0 = e0 - e6
-    c @s13 = *(k + 4)
+    t0 @s10 = e6 * half
     t4 @s11 = e4 + e2
-    t4 = t4 * c
-    c = *(k + 8)
-    t2 @s10 = e8 + e2
-    t2 = t2 * c
-    c = *(k + 12)
-    e6 = e4 - e8
-    e6 = e6 * c
-    d @s13 = e8 - e2
-    e4 = e4 + d
-    d = e4 * half
-    e2 = e0 - d
-    d = e4 + e0
+    t2 @s12 = e8 + e2
+    d @s2 = e8 - e2
+    t0 @s10 = e0 + t0
+    e0 @s0 = e0 - e6
+    t0_3 @s6 = o5 + o1
+    e6 @s8 = e4 - e8
+    e4 @s4 = e4 + d
+    t4_3 @s2 = o5 - o7
+    o1_2 @s5 = o1 - o5
+    t2_3 @s1 = o1 + o7
+    o1 @s5 = o1_2 - o7
+    c @s7 = *(k + 4)
+    t4 @s11 = t4 * c
+    c @s7 = *(k + 8)
+    t2 @s12 = t2 * c
+    c3 @s7 = *(k + 16)
+    o3 @s3 = o3 * c3
+    o1 @s5 = o1 * c3
+    c @s7 = *(k + 20)
+    t0_4 @s6 = t0_3 * c
+    c @s7 = *(k + 24)
+    t4_4 @s2 = t4_3 * c
+    c @s7 = *(k + 12)
+    e6 @s8 = e6 * c
+    c @s7 = *(k + 28)
+    t2_4 @s1 = t2_3 * c
+    d @s9 = e4 * half
+    e8 @s7 = t0 - t2
+    e2 @s9 = e0 - d
+    d @s4 = e4 + e0
+    e0 @s0 = t0 - t4
+    e4 @s10 = t0 + t4
+    o5 @s11 = t0_4 - o3
+    e0 @s0 = e0 + t2
+    o7 @s12 = t4_4 - o3
+    o3 @s2 = t4_4 + o3
+    e8 @s7 = e8 + e6
+    e4 @s10 = e4 - e6
+    o5 @s11 = o5 - t2_4
+    o7 @s12 = o7 - t0_4
+    o3 @s2 = o3 - t2_4
+    d_4 @s1 = e4 - o7
+    d_5 @s3 = e2 + o1
+    d_6 @s6 = e0 - o3
+    d_7 @s8 = e8 + o5
+    d_8 @s7 = e8 - o5
+    d_9 @s0 = e0 + o3
+    d_10 @s9 = e2 - o1
+    d_11 @s10 = e4 + o7
     *(y + 16) = d
-    e8 = t0 - t2
-    e8 = e8 + e6
-    e0 = t0 - t4
-    e0 = e0 + t2
-    e4 = t0 + t4
-    e4 = e4 - e6
-    o1 @s1 = *(y + 4)
-    o3 @s3 = *(y + 12)
-    o5 @s5 = *(y + 20)
-    o7 @s7 = *(y + 28)
-    c3 @s14 = *(k + 16)
-    o3 = o3 * c3
-    c @s13 = *(k + 20)
-    t0 @s9 = o5 + o1
-    t0 = t0 * c
-    c = *(k + 24)
-    t4 @s11 = o5 - o7
-    t4 = t4 * c
-    c = *(k + 28)
-    t2 @s10 = o1 + o7
-    t2 = t2 * c
-    o1 = o1 - o5
-    o1 = o1 - o7
-    o1 = o1 * c3
-    o5 = t0 - o3
-    o5 = o5 - t2
-    o7 = t4 - o3
-    o7 = o7 - t0
-    o3 = t4 + o3
-    o3 = o3 - t2
-    d @s13 = e4 - o7
-    *y = d
-    d = e2 + o1
-    *(y + 4) = d
-    d = e0 - o3
-    *(y + 8) = d
-    d = e8 + o5
-    *(y + 12) = d
-    d = e8 - o5
-    *(y + 20) = d
-    d = e0 + o3
-    *(y + 24) = d
-    d = e2 - o1
-    *(y + 28) = d
-    d = e4 + o7
-    *(y + 32) = d
+    *y = d_4
+    *(y + 4) = d_5
+    *(y + 8) = d_6
+    *(y + 12) = d_7
+    *(y + 20) = d_8
+    *(y + 24) = d_9
+    *(y + 28) = d_10
+    *(y + 32) = d_11
     bx lr
 }
 
@@ -2325,227 +2277,265 @@ fn mp3_imdct36(grbuf: *f32, overlap: *f32, window: *f32, nbands) {
     sp -= 72 (co: [f32; 9], si: [f32; 9])
     g @r4 = grbuf
     ov @r5 = overlap
-    win @r6 = window
+    win @r8 = window
     n @r7 = nbands
-    tw @r8 = &mp3_twid9 as *f32
+    tw @r6 = &mp3_twid9 as *f32
     loop {
+        // the DCT inputs, scheduled by tools/sched.py
         q @r0 = &sp.co as *f32
-        x @s0 = *g
-        x = -x
-        *q = x
-        x = *(g + 68)
-        *(q + 36) = x
         ga @r1 = g + 4
-        (xa @s0, xb @s1, xc @s2, xd @s3) = *ga
-        v @s4 = xa - xb
-        *(q + 68) = v
-        v = xa + xb
-        *(q + 4) = v
-        v = xd - xc
-        *(q + 64) = v
-        v = xc + xd
-        v = -v
-        *(q + 8) = v
+        x @s0 = *g
+        (xa @s1, xb @s2, xc @s3, xd @s4) = *ga
         ga @r1 = g + 20
-        (xa @s0, xb @s1, xc @s2, xd @s3) = *ga
-        v @s4 = xa - xb
-        *(q + 60) = v
-        v = xa + xb
-        *(q + 12) = v
-        v = xd - xc
-        *(q + 56) = v
-        v = xc + xd
-        v = -v
-        *(q + 16) = v
+        v @s5 = xc + xd
+        (xa2 @s6, xb2 @s7, xc2 @s8, xd2 @s9) = *ga
         ga @r1 = g + 36
-        (xa @s0, xb @s1, xc @s2, xd @s3) = *ga
-        v @s4 = xa - xb
-        *(q + 52) = v
-        v = xa + xb
-        *(q + 20) = v
-        v = xd - xc
-        *(q + 48) = v
-        v = xc + xd
-        v = -v
-        *(q + 24) = v
+        v9 @s10 = xc2 + xd2
+        (xa3 @s11, xb3 @s12, xc3 @s13, xd3 @s14) = *ga
+        v3 @s4 = xd - xc
+        v8 @s9 = xd2 - xc2
+        *(q + 64) = v3
         ga @r1 = g + 52
-        (xa @s0, xb @s1, xc @s2, xd @s3) = *ga
-        v @s4 = xa - xb
-        *(q + 44) = v
-        v = xa + xb
-        *(q + 28) = v
-        v = xd - xc
-        *(q + 40) = v
-        v = xc + xd
-        v = -v
+        v14 @s3 = xc3 + xd3
+        v13 @s14 = xd3 - xc3
+        x @s0 = -x
+        v1 @s4 = xa - xb
+        v2 @s1 = xa + xb
+        v @s5 = -v
+        v6 @s2 = xa2 - xb2
+        v7 @s6 = xa2 + xb2
+        v10 @s10 = -v9
+        v11 @s7 = xa3 - xb3
+        v12 @s11 = xa3 + xb3
+        v15 @s3 = -v14
+        x3 @s8 = *(g + 68)
+        *q = x
+        *(q + 36) = x3
+        *(q + 68) = v1
+        *(q + 4) = v2
+        *(q + 8) = v
+        *(q + 60) = v6
+        *(q + 12) = v7
+        *(q + 56) = v8
+        *(q + 16) = v10
+        *(q + 52) = v11
+        (xa @s4, xb @s5, xc @s6, xd @s7) = *ga
+        v @s0 = xc + xd
+        v16 @s1 = xa - xb
+        v17 @s4 = xa + xb
+        v18 @s7 = xd - xc
+        v @s0 = -v
+        *(q + 20) = v12
+        *(q + 48) = v13
+        *(q + 24) = v15
+        *(q + 44) = v16
+        *(q + 28) = v17
+        *(q + 40) = v18
         *(q + 32) = v
         call mp3_dct9(q)
         q @r0 = &sp.si as *f32
         call mp3_dct9(q)
-        // the odd si are negated, folded into the signs below
+        // the odd si are negated, folded into the signs below. The 9
+        // twiddles, windows and overlap-adds, scheduled by tools/sched.py.
         q @r0 = &sp.co as *f32
-        ovl @s0 = *ov
+        t @s0 = *tw
         c @s1 = *q
         s @s2 = *(q + 36)
-        t @s3 = *tw
-        t9 @s4 = *(tw + 36)
-        sum @s5 = c * t9
-        sum += s * t
-        o @s6 = c * t
-        o -= s * t9
+        t9 @s3 = *(tw + 36)
+        c2 @s4 = *(q + 4)
+        s_2 @s5 = *(q + 40)
+        t2 @s6 = *(tw + 4)
+        t9_2 @s7 = *(tw + 40)
+        c3 @s8 = *(q + 8)
+        s_3 @s9 = *(q + 44)
+        t3 @s10 = *(tw + 8)
+        t9_3 @s11 = *(tw + 44)
+        sum @s12 = c * t9
+        o @s1 = c * t
+        pr @s0 = s * t
+        pr2 @s2 = s * t9
+        sum3 @s3 = c2 * t9_2
+        sum @s12 = sum + pr
+        pr @s0 = s_2 * t2
+        o3 @s4 = c2 * t2
+        sum5 @s6 = c3 * t9_3
+        sum4 @s3 = sum3 - pr
+        pr @s0 = s_3 * t3
+        pr6 @s5 = s_2 * t9_2
+        sum6 @s6 = sum5 + pr
+        ovl @s0 = *ov
+        wi @s7 = *win
+        o5 @s8 = c3 * t3
+        w9 @s10 = *(win + 36)
+        pr @s9 = s_3 * t9_3
+        ovl2 @s11 = *(ov + 4)
+        o @s1 = o - pr2
+        wi2 @s2 = *(win + 4)
+        o4 @s4 = o3 + pr6
+        w9_2 @s5 = *(win + 40)
+        o6 @s8 = o5 - pr
+        ovl3 @s9 = *(ov + 8)
         *ov = o
-        wi @s1 = *win
-        w9 @s2 = *(win + 36)
-        lo @s3 = ovl * wi
-        lo -= sum * w9
-        hi @s4 = ovl * w9
-        hi += sum * wi
+        c @s1 = *(q + 12)
+        *(ov + 4) = o4
+        s @s4 = *(q + 48)
+        *(ov + 8) = o6
+        wi3 @s8 = *(win + 8)
+        w9_3 @s13 = *(win + 44)
+        ovl4 @s14 = *(ov + 12)
+        lo @s15 = ovl * wi
+        hi @s0 = ovl * w9
+        pr @s10 = sum * w9
+        pr4 @s12 = sum * wi
+        lo @s15 = lo - pr
+        hi @s0 = hi + pr4
         *g = lo
+        t @s7 = *(tw + 12)
         *(g + 68) = hi
-        ovl @s8 = *(ov + 4)
-        c @s9 = *(q + 4)
-        s @s10 = *(q + 40)
-        t @s11 = *(tw + 4)
-        t9 @s12 = *(tw + 40)
-        sum @s13 = c * t9
-        sum -= s * t
-        o @s14 = c * t
-        o += s * t9
-        *(ov + 4) = o
-        wi @s9 = *(win + 4)
-        w9 @s10 = *(win + 40)
-        lo @s11 = ovl * wi
-        lo -= sum * w9
-        hi @s12 = ovl * w9
-        hi += sum * wi
-        *(g + 4) = lo
-        *(g + 64) = hi
-        ovl @s0 = *(ov + 8)
-        c @s1 = *(q + 8)
-        s @s2 = *(q + 44)
-        t @s3 = *(tw + 8)
-        t9 @s4 = *(tw + 44)
-        sum @s5 = c * t9
-        sum += s * t
-        o @s6 = c * t
-        o -= s * t9
-        *(ov + 8) = o
-        wi @s1 = *(win + 8)
-        w9 @s2 = *(win + 44)
-        lo @s3 = ovl * wi
-        lo -= sum * w9
-        hi @s4 = ovl * w9
-        hi += sum * wi
-        *(g + 8) = lo
-        *(g + 60) = hi
-        ovl @s8 = *(ov + 12)
-        c @s9 = *(q + 12)
-        s @s10 = *(q + 48)
-        t @s11 = *(tw + 12)
-        t9 @s12 = *(tw + 48)
-        sum @s13 = c * t9
-        sum -= s * t
-        o @s14 = c * t
-        o += s * t9
+        t9 @s0 = *(tw + 48)
+        c5 @s10 = *(q + 16)
+        s_5 @s12 = *(q + 52)
+        sum @s15 = c * t9
+        o @s1 = c * t
+        pr @s7 = s * t
+        pr14 @s4 = s * t9
+        sum @s15 = sum - pr
+        o @s1 = o + pr14
+        wi @s0 = *(win + 12)
         *(ov + 12) = o
-        wi @s9 = *(win + 12)
-        w9 @s10 = *(win + 48)
-        lo @s11 = ovl * wi
-        lo -= sum * w9
-        hi @s12 = ovl * w9
-        hi += sum * wi
-        *(g + 12) = lo
-        *(g + 56) = hi
-        ovl @s0 = *(ov + 16)
-        c @s1 = *(q + 16)
-        s @s2 = *(q + 52)
-        t @s3 = *(tw + 16)
-        t9 @s4 = *(tw + 52)
-        sum @s5 = c * t9
-        sum += s * t
-        o @s6 = c * t
-        o -= s * t9
+        w9 @s1 = *(win + 48)
+        ovl @s4 = *(ov + 16)
+        lo @s7 = ovl2 * wi2
+        hi @s11 = ovl2 * w9_2
+        pr @s5 = sum4 * w9_2
+        pr8 @s3 = sum4 * wi2
+        lo @s7 = lo - pr
+        hi @s11 = hi + pr8
+        *(g + 4) = lo
+        t @s2 = *(tw + 16)
+        *(g + 64) = hi
+        t9 @s3 = *(tw + 52)
+        c @s5 = *(q + 20)
+        s @s7 = *(q + 56)
+        sum9 @s11 = c5 * t9
+        o @s10 = c5 * t
+        pr @s2 = s_5 * t
+        pr18 @s12 = s_5 * t9
+        sum10 @s11 = sum9 + pr
+        o @s10 = o - pr18
+        wi5 @s2 = *(win + 16)
         *(ov + 16) = o
-        wi @s1 = *(win + 16)
-        w9 @s2 = *(win + 52)
-        lo @s3 = ovl * wi
-        lo -= sum * w9
-        hi @s4 = ovl * w9
-        hi += sum * wi
-        *(g + 16) = lo
-        *(g + 52) = hi
-        ovl @s8 = *(ov + 20)
-        c @s9 = *(q + 20)
-        s @s10 = *(q + 56)
-        t @s11 = *(tw + 20)
-        t9 @s12 = *(tw + 56)
-        sum @s13 = c * t9
-        sum -= s * t
-        o @s14 = c * t
-        o += s * t9
+        w9_5 @s3 = *(win + 52)
+        ovl6 @s10 = *(ov + 20)
+        lo @s12 = ovl3 * wi3
+        hi @s9 = ovl3 * w9_3
+        pr @s13 = sum6 * w9_3
+        pr12 @s6 = sum6 * wi3
+        lo @s12 = lo - pr
+        hi @s9 = hi + pr12
+        *(g + 8) = lo
+        t @s6 = *(tw + 20)
+        *(g + 60) = hi
+        t9 @s8 = *(tw + 56)
+        c7 @s9 = *(q + 24)
+        s_7 @s12 = *(q + 60)
+        sum11 @s13 = c * t9
+        o @s5 = c * t
+        pr @s6 = s * t
+        pr22 @s7 = s * t9
+        sum12 @s13 = sum11 - pr
+        o @s5 = o + pr22
+        wi6 @s6 = *(win + 20)
         *(ov + 20) = o
-        wi @s9 = *(win + 20)
-        w9 @s10 = *(win + 56)
-        lo @s11 = ovl * wi
-        lo -= sum * w9
-        hi @s12 = ovl * w9
-        hi += sum * wi
-        *(g + 20) = lo
-        *(g + 48) = hi
-        ovl @s0 = *(ov + 24)
-        c @s1 = *(q + 24)
-        s @s2 = *(q + 60)
-        t @s3 = *(tw + 24)
-        t9 @s4 = *(tw + 60)
-        sum @s5 = c * t9
-        sum += s * t
-        o @s6 = c * t
-        o -= s * t9
+        w9_6 @s5 = *(win + 56)
+        ovl7 @s7 = *(ov + 24)
+        lo @s8 = ovl4 * wi
+        hi @s14 = ovl4 * w9
+        pr @s1 = sum * w9
+        pr16 @s15 = sum * wi
+        lo @s8 = lo - pr
+        hi @s14 = hi + pr16
+        *(g + 12) = lo
+        t @s0 = *(tw + 24)
+        *(g + 56) = hi
+        t9 @s1 = *(tw + 60)
+        c @s8 = *(q + 28)
+        s @s14 = *(q + 64)
+        sum @s15 = c7 * t9
+        o @s9 = c7 * t
+        pr @s0 = s_7 * t
+        pr26 @s12 = s_7 * t9
+        sum @s15 = sum + pr
+        o @s9 = o - pr26
+        wi @s0 = *(win + 24)
         *(ov + 24) = o
-        wi @s1 = *(win + 24)
-        w9 @s2 = *(win + 60)
-        lo @s3 = ovl * wi
-        lo -= sum * w9
-        hi @s4 = ovl * w9
-        hi += sum * wi
+        w9 @s1 = *(win + 60)
+        ovl8 @s9 = *(ov + 28)
+        lo @s12 = ovl * wi5
+        hi @s4 = ovl * w9_5
+        pr @s3 = sum10 * w9_5
+        pr20 @s11 = sum10 * wi5
+        lo @s12 = lo - pr
+        hi @s4 = hi + pr20
+        *(g + 16) = lo
+        t @s2 = *(tw + 28)
+        *(g + 52) = hi
+        t9 @s3 = *(tw + 64)
+        c9 @s4 = *(q + 32)
+        s_9 @s11 = *(q + 68)
+        sum15 @s12 = c * t9
+        o @s8 = c * t
+        pr @s2 = s * t
+        pr30 @s14 = s * t9
+        sum16 @s12 = sum15 - pr
+        o @s8 = o + pr30
+        wi8 @s2 = *(win + 28)
+        *(ov + 28) = o
+        w9_8 @s3 = *(win + 64)
+        ovl @s8 = *(ov + 32)
+        lo @s14 = ovl6 * wi6
+        hi @s10 = ovl6 * w9_6
+        pr @s5 = sum12 * w9_6
+        pr24 @s13 = sum12 * wi6
+        lo @s14 = lo - pr
+        hi @s10 = hi + pr24
+        *(g + 20) = lo
+        t @s5 = *(tw + 32)
+        *(g + 48) = hi
+        t9 @s6 = *(tw + 68)
+        sum17 @s10 = c9 * t9
+        o @s4 = c9 * t
+        pr @s5 = s_9 * t
+        pr34 @s11 = s_9 * t9
+        sum18 @s10 = sum17 + pr
+        wi9 @s5 = *(win + 32)
+        o @s4 = o - pr34
+        w9_9 @s6 = *(win + 68)
+        *(ov + 32) = o
+        lo @s4 = ovl7 * wi
+        hi @s7 = ovl7 * w9
+        pr @s1 = sum * w9
+        pr28 @s15 = sum * wi
+        lo15 @s0 = ovl8 * wi8
+        lo @s4 = lo - pr
+        pr @s1 = sum16 * w9_8
+        hi15 @s9 = ovl8 * w9_8
+        pr32 @s12 = sum16 * wi8
+        lo17 @s2 = ovl * wi9
+        pr35 @s3 = sum18 * w9_9
+        hi17 @s8 = ovl * w9_9
+        pr36 @s10 = sum18 * wi9
+        hi @s7 = hi + pr28
+        lo16 @s0 = lo15 - pr
+        hi16 @s9 = hi15 + pr32
+        lo18 @s2 = lo17 - pr35
+        hi18 @s8 = hi17 + pr36
         *(g + 24) = lo
         *(g + 44) = hi
-        ovl @s8 = *(ov + 28)
-        c @s9 = *(q + 28)
-        s @s10 = *(q + 64)
-        t @s11 = *(tw + 28)
-        t9 @s12 = *(tw + 64)
-        sum @s13 = c * t9
-        sum -= s * t
-        o @s14 = c * t
-        o += s * t9
-        *(ov + 28) = o
-        wi @s9 = *(win + 28)
-        w9 @s10 = *(win + 64)
-        lo @s11 = ovl * wi
-        lo -= sum * w9
-        hi @s12 = ovl * w9
-        hi += sum * wi
-        *(g + 28) = lo
-        *(g + 40) = hi
-        ovl @s0 = *(ov + 32)
-        c @s1 = *(q + 32)
-        s @s2 = *(q + 68)
-        t @s3 = *(tw + 32)
-        t9 @s4 = *(tw + 68)
-        sum @s5 = c * t9
-        sum += s * t
-        o @s6 = c * t
-        o -= s * t9
-        *(ov + 32) = o
-        wi @s1 = *(win + 32)
-        w9 @s2 = *(win + 68)
-        lo @s3 = ovl * wi
-        lo -= sum * w9
-        hi @s4 = ovl * w9
-        hi += sum * wi
-        *(g + 32) = lo
-        *(g + 36) = hi
+        *(g + 28) = lo16
+        *(g + 40) = hi16
+        *(g + 32) = lo18
+        *(g + 36) = hi18
         g += 18 * 4
         ov += 9 * 4
         #(n -= 1)
@@ -2670,22 +2660,31 @@ fn mp3_imdct_short(grbuf: *f32, overlap: *f32, nbands) {
 // Negate the odd lines of the odd bands
 #[link_section = ".ram"]
 fn mp3_change_sign(grbuf: *u32) {
+    push(r4, r5)
     p @r0 = grbuf + 19 * 4
     j @r1 = 16
     loop {
-        k @r2 = 9
+        // 9 lines, 3 at a time
+        k @r2 = 3
         loop {
             x @r3 = *p
-            x ^= 0x80000000
-            *p = x
-            p += 8
+            y @r4 = *(p + 8)
+            z @r5 = *(p + 16)
             #(k -= 1)
+            x ^= 0x80000000
+            y ^= 0x80000000
+            z ^= 0x80000000
+            *p = x
+            *(p + 8) = y
+            *(p + 16) = z
+            p += 24
             if #ne goto loop
         }
         p += 18 * 4
         #(j -= 1)
         if #ne goto loop
     }
+    pop(r4, r5)
     bx lr
 }
 
@@ -2748,12 +2747,8 @@ fn mp3_synth_granule(nch, pcm: *i16) {
         g += 576 * 4
         call mp3_dct_ii(g)
     }
-    d @r0 = &mp3_scratch.syn as *u32
-    s @r1 = &mp3_decoder.qmf_state as *u32
-    c @r2 = 960
-    call mp3_copy_words(d, s, c)
     band @r6 = 0
-    lins @r7 = &mp3_scratch.syn as *f32
+    lins @r7 = &mp3_decoder.syn as *f32
     loop {
         a @r0 = band
         o @r1 = out
@@ -2767,9 +2762,9 @@ fn mp3_synth_granule(nch, pcm: *i16) {
         #(band - 18)
         if #lo goto loop
     }
-    d @r0 = &mp3_decoder.qmf_state as *u32
-    s @r1 = &mp3_scratch.syn as *u32
-    s += 1152 * 4
+    // the history for the next granule to the front
+    d @r0 = &mp3_decoder.syn as *u32
+    s @r1 = d + 1152 * 4
     if {
         #(n - 1)
         if #ne goto else
@@ -2794,15 +2789,20 @@ fn mp3_synth_granule(nch, pcm: *i16) {
 // The 32 point DCT-II across the subbands, for each of the 18 lines
 #[link_section = ".ram"]
 fn mp3_dct_ii(grbuf: *f32) {
-    push(r4, r5, r6, r7)
-    push(s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31)
+    push(r4, r5, r6, r7, r8)
+    push(s16, s17, s18, s19, s20, s21, s22, s23, s24)
     sp -= 128 (t: [f32; 32])
     kp @r1 = &mp3_dct8_k as *f32
-    (k0 @s23, k1 @s24, k2 @s25, k3 @s26, k4 @s27, k5 @s28, k6 @s29, k7 @s30, k8 @s31) = *kp
+    (k0 @s16, k1 @s17, k2 @s18, k3 @s19, k4 @s20, k5 @s21, k6 @s22, k7 @s23, k8 @s24) = *kp
     p @r0 = grbuf
     kc @r1 = 18
+    // Each loop ends with a 16 bit add of a stride in a register, which
+    // doesn't set flags, so that the branch folds with it.
+    row @r2 = 72
+    // The ops below are in mp3dec's order for each value, but interleaved,
+    // so that no result is used by the very next instruction.
     loop {
-        q0 @r2 = p
+        q0 @r8 = p
         q1 @r3 = p + 15 * 72
         q2 @r12 = p + 16 * 72
         q3 @r4 = p + 31 * 72
@@ -2810,6 +2810,7 @@ fn mp3_dct_ii(grbuf: *f32) {
         tp @r6 = &sp.t as *f32
         i @r7 = 8
         loop {
+            #(i -= 1)
             x0 @s0 = *q0
             x1 @s1 = *q1
             x2 @s2 = *q2
@@ -2818,124 +2819,120 @@ fn mp3_dct_ii(grbuf: *f32) {
             t0 @s7 = x0 + x3
             t1 @s8 = x1 + x2
             t2 @s9 = x1 - x2
-            t2 = t2 * c0
             t3 @s10 = x0 - x3
-            t3 = t3 * c1
             u @s11 = t0 + t1
-            *tp = u
             v @s12 = t0 - t1
+            t2 = t2 * c0
+            t3 = t3 * c1
+            *tp++ = u
             v = v * c2
-            *(tp + 32) = v
-            u = t3 + t2
-            *(tp + 64) = u
-            v = t3 - t2
-            v = v * c2
-            *(tp + 96) = v
-            tp += 4
-            q0 += 72
+            u2 @s13 = t3 + t2
+            v2 @s14 = t3 - t2
+            *(tp + 28) = v
+            v2 = v2 * c2
+            *(tp + 60) = u2
+            q0 += row
             q1 -= 72
-            q2 += 72
+            *(tp + 92) = v2
             q3 -= 72
-            #(i -= 1)
+            q2 += row
             if #ne goto loop
         }
-        // an 8 point DCT of each row of t
+        // an 8 point DCT of each row of t, with the results in s8-s15 in
+        // order, for one store
         tp = &sp.t as *f32
         i = 4
+        step @r3 = 32
         loop {
-            (x0 @s0, x1 @s1, x2 @s2, x3 @s3, x4 @s4, x5 @s5, x6 @s6, x7 @s7) = *tp
-            xt @s8 = x0 - x7
-            x0 = x0 + x7
-            x7 = x1 - x6
-            x1 = x1 + x6
-            x6 = x2 - x5
-            x2 = x2 + x5
-            x5 = x3 - x4
-            x3 = x3 + x4
-            x4 = x0 - x3
-            x0 = x0 + x3
-            x3 = x1 - x2
-            x1 = x1 + x2
-            y @s9 = x0 + x1
-            *tp = y
-            y = x0 - x1
-            y = y * k0
-            *(tp + 16) = y
-            x5 = x5 + x6
-            x6 = x6 + x7
-            x6 = x6 * k0
-            x7 = x7 + xt
-            x3 = x3 + x4
-            x3 = x3 * k0
-            x5 -= x7 * k1
-            x7 += x5 * k2
-            x5 -= x7 * k1
-            x0 = xt - x6
-            xt = xt + x6
-            y = xt + x7
-            y = y * k3
-            *(tp + 4) = y
-            y = x4 + x3
-            y = y * k4
-            *(tp + 8) = y
-            y = x0 - x5
-            y = y * k5
-            *(tp + 12) = y
-            y = x0 + x5
-            y = y * k6
-            *(tp + 20) = y
-            y = x4 - x3
-            y = y * k7
-            *(tp + 24) = y
-            y = xt - x7
-            y = y * k8
-            *(tp + 28) = y
-            tp += 32
             #(i -= 1)
+            (x0 @s0, x1 @s1, x2 @s2, x3 @s3, x4 @s4, x5 @s5, x6 @s6, x7 @s7) = *tp
+            x3a @s9 = x3 + x4
+            x5a @s4 = x3 - x4
+            x2a @s3 = x2 + x5
+            x6a @s5 = x2 - x5
+            x0a @s2 = x0 + x7
+            xt @s0 = x0 - x7
+            x1a @s7 = x1 + x6
+            x7a @s1 = x1 - x6
+            x4b @s6 = x0a - x3a
+            x0b @s2 = x0a + x3a
+            x5b @s4 = x5a + x6a
+            x7b @s9 = x7a + xt
+            x3b @s10 = x1a - x2a
+            m @s11 = x7b * k1
+            x1b @s7 = x1a + x2a
+            x5c @s4 = x5b - m
+            x6b @s5 = x6a + x7a
+            x3c @s10 = x3b + x4b
+            m = x5c * k2
+            y0 @s8 = x0b + x1b
+            x6c @s5 = x6b * k0
+            x7c @s1 = x7b + m
+            y4 @s12 = x0b - x1b
+            m = x7c * k1
+            x3d @s10 = x3c * k0
+            y4 = y4 * k0
+            x5d @s4 = x5c - m
+            x0c @s2 = xt - x6c
+            xtb @s0 = xt + x6c
+            w2 @s3 = x4b + x3d
+            y6 @s14 = x4b - x3d
+            w3 @s6 = x0c - x5d
+            w5 @s7 = x0c + x5d
+            y1 @s9 = xtb + x7c
+            y7 @s15 = xtb - x7c
+            y2 @s10 = w2 * k4
+            y6 = y6 * k7
+            y3 @s11 = w3 * k5
+            y5 @s13 = w5 * k6
+            y1 = y1 * k3
+            y7 = y7 * k8
+            *tp = (y0, y1, y2, y3, y4, y5, y6, y7)
+            tp += step
             if #ne goto loop
         }
         // back to the subbands
-        o @r2 = p
+        o @r8 = p
         tp = &sp.t as *f32
         i = 7
+        step = 288
         loop {
-            a @s0 = *tp
-            *o = a
-            t2i @s1 = *(tp + 64)
-            t3i @s2 = *(tp + 96)
-            t3n @s3 = *(tp + 100)
-            v @s4 = t2i + t3i
-            v = v + t3n
-            *(o + 72) = v
-            t1i @s5 = *(tp + 32)
-            t1n @s6 = *(tp + 36)
-            u @s7 = t1i + t1n
-            *(o + 144) = u
-            t2n @s8 = *(tp + 68)
-            v = t2n + t3i
-            v = v + t3n
-            *(o + 216) = v
-            o += 288
-            tp += 4
             #(i -= 1)
+            a @s0 = *tp++
+            t2i @s1 = *(tp + 60)
+            t3i @s2 = *(tp + 92)
+            t3n @s3 = *(tp + 96)
+            t1i @s5 = *(tp + 28)
+            t1n @s6 = *(tp + 32)
+            t2n @s8 = *(tp + 64)
+            v @s4 = t2i + t3i
+            u @s7 = t1i + t1n
+            v2 @s9 = t2n + t3i
+            v = v + t3n
+            *o = a
+            v2 = v2 + t3n
+            *(o + 144) = u
+            *(o + 72) = v
+            *(o + 216) = v2
+            o += step
             if #ne goto loop
         }
         a @s0 = *tp
-        *o = a
         t2i @s1 = *(tp + 64)
         t3i @s2 = *(tp + 96)
-        v @s4 = t2i + t3i
-        *(o + 72) = v
         t1i @s5 = *(tp + 32)
-        *(o + 144) = t1i
-        *(o + 216) = t3i
+        v @s4 = t2i + t3i
         p += 4
         #(kc -= 1)
+        *o = a
+        *(o + 144) = t1i
+        *(o + 216) = t3i
+        *(o + 72) = v
         if #ne goto loop
     }
     sp += 128
-    pop(s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31)
-    pop(r4, r5, r6, r7)
+    pop(s16, s17, s18, s19, s20, s21, s22, s23, s24)
+    pop(r4, r5, r6, r7, r8)
     bx lr
 }
 
@@ -2949,70 +2946,89 @@ fn mp3_synth_pair(pcm: *i16, nch, z: *f32) {
     zb @r3 = z + 4 * 64 * 4
     zc @r12 = z + 8 * 64 * 4
     zd @r4 = z + 12 * 64 * 4
-    x @s0 = *(zd + 512)
-    y @s1 = *z
-    d @s2 = x - y
-    a @s7 = d * k0
-    x = *(z + 256)
-    y = *(zd + 256)
-    d = x + y
-    a += d * k1
-    x = *zd
-    y = *(z + 512)
-    d = x - y
-    a += d * k2
-    x = *(z + 768)
-    y = *(zc + 768)
-    d = x + y
-    a += d * k3
-    x = *(zc + 512)
-    y = *zb
-    d = x - y
-    a += d * k4
-    x = *(zb + 256)
-    y = *(zc + 256)
-    d = x + y
-    a += d * k5
-    x = *zc
-    y = *(zb + 512)
-    d = x - y
-    a += d * k6
-    x = *(zb + 768)
-    a += x * k7
-    (k0, k1, k2, k3, k4, k5, k6, k7) = *k++
+    // a = sum of d_i * k_i in order, each d_i the sum or difference of a
+    // pair. vmla rounds the product, so this is the same as mp3dec's, but
+    // pipelined: the loads of one term, the d of the next and the product
+    // of the one before, three registers apart.
+    x0 @s0 = *(zd + 512)
+    y0 @s1 = *z
+    x1 @s2 = *(z + 256)
+    y1 @s3 = *(zd + 256)
+    d0 @s0 = x0 - y0
+    x2 @s4 = *zd
+    y2 @s5 = *(z + 512)
+    d1 @s2 = x1 + y1
+    a @s7 = d0 * k0
+    m1 @s3 = d1 * k1
+    x3 @s0 = *(z + 768)
+    y3 @s1 = *(zc + 768)
+    d2 @s4 = x2 - y2
+    a = a + m1
+    m2 @s5 = d2 * k2
+    x4 @s2 = *(zc + 512)
+    y4 @s3 = *zb
+    d3 @s0 = x3 + y3
+    a = a + m2
+    m3 @s1 = d3 * k3
+    x5 @s4 = *(zb + 256)
+    y5 @s5 = *(zc + 256)
+    d4 @s2 = x4 - y4
+    a = a + m3
+    m4 @s3 = d4 * k4
+    x6 @s0 = *zc
+    y6 @s1 = *(zb + 512)
+    d5 @s4 = x5 + y5
+    a = a + m4
+    m5 @s5 = d5 * k5
+    x7 @s2 = *(zb + 768)
+    d6 @s0 = x6 - y6
+    a = a + m5
+    m6 @s1 = d6 * k6
+    m7 @s2 = x7 * k7
+    a = a + m6
+    (j0 @s8, j1 @s9, j2 @s10, j3 @s11, j4 @s12, j5 @s13, j6 @s14, j7 @s15) = *k++
     (lo @s4, hi @s5, half @s6) = *k
-    cl @s0 = max(a, lo)
+    a = a + m7
+    // b = sum of z_j * j_j, with a's conversion to i16 in between
+    u0 @s0 = *(zd + 520)
+    u1 @s1 = *(zd + 8)
+    cl @s2 = max(a, lo)
+    b @s7 = u0 * j0
+    n1 @s1 = u1 * j1
+    u2 @s0 = *(zc + 520)
     cl = min(cl, hi)
+    b = b + n1
+    n2 @s0 = u2 * j2
+    u3 @s1 = *(zc + 8)
     cl = cl + half
-    ci @s1 = f32_to_i32(cl)
+    b = b + n2
+    n3 @s1 = u3 * j3
+    u4 @s0 = *(zb + 520)
+    ci @s3 = f32_to_i32(cl)
+    b = b + n3
+    n4 @s0 = u4 * j4
+    u5 @s1 = *(zb + 8)
     v @r5 = ci
+    b = b + n4
+    n5 @s1 = u5 * j5
+    u6 @s0 = *(z + 520)
     sgn @r6 = to_bits(cl)
+    b = b + n5
+    n6 @s0 = u6 * j6
+    u7 @s1 = *(z + 8)
     v = v + ((sgn as i32) >> 31)
+    b = b + n6
+    n7 @s1 = u7 * j7
     *pcm = v
-    x @s0 = *(zd + 520)
-    a = x * k0
-    x = *(zd + 8)
-    a += x * k1
-    x = *(zc + 520)
-    a += x * k2
-    x = *(zc + 8)
-    a += x * k3
-    x = *(zb + 520)
-    a += x * k4
-    x = *(zb + 8)
-    a += x * k5
-    x = *(z + 520)
-    a += x * k6
-    x = *(z + 8)
-    a += x * k7
-    cl @s0 = max(a, lo)
+    off @r1 = nch << 5
+    b = b + n7
+    cl = max(b, lo)
     cl = min(cl, hi)
     cl = cl + half
-    ci @s1 = f32_to_i32(cl)
-    v @r5 = ci
-    sgn @r6 = to_bits(cl)
+    ci = f32_to_i32(cl)
+    sgn = to_bits(cl)
+    v = ci
     v = v + ((sgn as i32) >> 31)
-    off @r1 = nch << 5
     *(pcm + off) = v
     pop(r4, r5, r6, r7)
     bx lr
@@ -3026,23 +3042,23 @@ fn mp3_synth(band, dst: *i16, nch, lins: *f32) {
     push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
     push(s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31)
     sp -= 4
-    gl @r4 = &mp3_scratch.grbuf as *f32
+    gl @r6 = &mp3_scratch.grbuf as *f32
     gl = gl + (band << 2)
-    out @r8 = dst
-    n @r9 = nch
+    out @r7 = dst
+    n @r4 = nch
     zl @r10 = lins
     // the right channel's offset from the left
-    roff @r7 = 0
+    roff @r8 = 0
     #(n - 2)
     if #eq {
         roff = 576 * 4
     }
-    gr @r5 = gl + roff
+    gr @r12 = gl + roff
     a @r0 = *(gl + 16 * 18 * 4)
     b @r1 = *(gr + 16 * 18 * 4)
     c @r2 = *gl
     d @r3 = *gr
-    z @r12 = zl + (960 + 4 * 15) * 4
+    z @r5 = zl + (960 + 4 * 15) * 4
     *z = (a, b, c, d)
     a = *(gl + (16 * 18 + 1) * 4)
     b = *(gr + (16 * 18 + 1) * 4)
@@ -3050,19 +3066,20 @@ fn mp3_synth(band, dst: *i16, nch, lins: *f32) {
     d = *(gr + 4)
     z += 16 * 4 * 4
     *z = (a, b, c, d)
-    // the outputs for the right channel first
-    ro @r6 = n - 1
-    ro <<= 1
-    p @r0 = out + ro
-    nc @r1 = n
-    z @r2 = zl + (4 * 15 + 1) * 4
-    call mp3_synth_pair(p, nc, z)
-    t @r0 = n << 6
-    p @r0 = out + t
-    p += ro
-    nc @r1 = n
-    z @r2 = zl + (4 * 15 + 64 + 1) * 4
-    call mp3_synth_pair(p, nc, z)
+    // the outputs for the right channel first, which in mono the left's
+    // overwrite
+    if {
+        #(n - 2)
+        if #ne goto end
+        p @r0 = out + 2
+        nc @r1 = n
+        z @r2 = zl + (4 * 15 + 1) * 4
+        call mp3_synth_pair(p, nc, z)
+        p @r0 = out + 130
+        nc @r1 = n
+        z @r2 = zl + (4 * 15 + 64 + 1) * 4
+        call mp3_synth_pair(p, nc, z)
+    }
     p @r0 = out
     nc @r1 = n
     z @r2 = zl + 4 * 15 * 4
@@ -3076,22 +3093,22 @@ fn mp3_synth(band, dst: *i16, nch, lins: *f32) {
     k += 16 * 4
     (lo @s28, hi @s29, half @s30) = *k
     // i from 14 down to 0
-    pp @r6 = zl + (960 + 4 * 14) * 4
+    pp @r9 = zl + (960 + 4 * 14) * 4
     end @lr = zl + (960 - 4) * 4
-    gb @r5 = gl + 18 * 15 * 4
-    ga @r4 = gl + 18 * 17 * 4
+    gb @r12 = gl + 18 * 15 * 4
+    ga @r6 = gl + 18 * 17 * 4
     wp @r11 = &mp3_win as *f32
     t @r0 = n << 6
     t -= n << 1
     o2 @r1 = out + t
     t = n << 1
-    o1 @r8 = out + t
+    o1 @r7 = out + t
     n @r10 = n
-    o2 @r9 = o2
+    o2 @r4 = o2
     loop {
         // the new values for this i
         (v0 @r0, v2 @r2) = *ga
-        gt @r12 = ga + roff
+        gt @r5 = ga + roff
         (v1 @r1, v3 @r3) = *gt
         *pp = (v0, v1, v2, v3)
         (v0, v2) = *gb
@@ -3111,186 +3128,212 @@ fn mp3_synth(band, dst: *i16, nch, lins: *f32) {
         zp @r1 = pp
         yp @r2 = pp - 15 * 64 * 4
         kc @r3 = 4
-        loop {
-            (w0 @s24, w1 @s25, w2 @s26, w3 @s27) = *wp++
-            (z0 @s0, z1 @s1, z2 @s2, z3 @s3) = *zp
-            (y0 @s4, y1 @s5, y2 @s6, y3 @s7) = *yp
-            m @s8 = z0 * w1
-            m2 @s9 = y0 * w0
-            nn @s10 = z0 * w0
-            n2 @s11 = y0 * w1
-            m = m + m2
-            nn = nn - n2
-            b0 = b0 + m
-            a0 = a0 + nn
-            m @s12 = z1 * w1
-            m2 @s13 = y1 * w0
-            nn @s14 = z1 * w0
-            n2 @s15 = y1 * w1
-            m = m + m2
-            nn = nn - n2
-            b1 = b1 + m
-            a1 = a1 + nn
-            m @s8 = z2 * w1
-            m2 @s9 = y2 * w0
-            nn @s10 = z2 * w0
-            n2 @s11 = y2 * w1
-            m = m + m2
-            nn = nn - n2
-            b2 = b2 + m
-            a2 = a2 + nn
-            m @s12 = z3 * w1
-            m2 @s13 = y3 * w0
-            nn @s14 = z3 * w0
-            n2 @s15 = y3 * w1
-            m = m + m2
-            nn = nn - n2
-            b3 = b3 + m
-            a3 = a3 + nn
-            zq @r12 = zp - 64 * 4
-            (z0, z1, z2, z3) = *zq
-            yq @r12 = yp + 64 * 4
-            (y0, y1, y2, y3) = *yq
-            m @s8 = z0 * w3
-            m2 @s9 = y0 * w2
-            nn @s10 = y0 * w3
-            n2 @s11 = z0 * w2
-            m = m + m2
-            nn = nn - n2
-            b0 = b0 + m
-            a0 = a0 + nn
-            m @s12 = z1 * w3
-            m2 @s13 = y1 * w2
-            nn @s14 = y1 * w3
-            n2 @s15 = z1 * w2
-            m = m + m2
-            nn = nn - n2
-            b1 = b1 + m
-            a1 = a1 + nn
-            m @s8 = z2 * w3
-            m2 @s9 = y2 * w2
-            nn @s10 = y2 * w3
-            n2 @s11 = z2 * w2
-            m = m + m2
-            nn = nn - n2
-            b2 = b2 + m
-            a2 = a2 + nn
-            m @s12 = z3 * w3
-            m2 @s13 = y3 * w2
-            nn @s14 = y3 * w3
-            n2 @s15 = z3 * w2
-            m = m + m2
-            nn = nn - n2
-            b3 = b3 + m
-            a3 = a3 + nn
-            zp -= 128 * 4
-            yp += 128 * 4
-            #(kc -= 1)
-            if #ne goto loop
-        }
         if {
             #(n - 2)
-            if #ne goto else
-            cl @s8 = max(a1, lo)
-            cl = min(cl, hi)
-            cl = cl + half
-            ci @s9 = f32_to_i32(cl)
-            v @r0 = ci
-            sgn @r1 = to_bits(cl)
-            v = v + ((sgn as i32) >> 31)
-            *(o1 + 2) = v
-            cl @s10 = max(b1, lo)
-            cl = min(cl, hi)
-            cl = cl + half
-            ci @s11 = f32_to_i32(cl)
-            v @r2 = ci
-            sgn @r3 = to_bits(cl)
-            v = v + ((sgn as i32) >> 31)
-            *(o2 + 2) = v
-            cl @s8 = max(a0, lo)
-            cl = min(cl, hi)
-            cl = cl + half
-            ci @s9 = f32_to_i32(cl)
-            v @r0 = ci
-            sgn @r1 = to_bits(cl)
-            v = v + ((sgn as i32) >> 31)
-            *o1 = v
-            cl @s10 = max(b0, lo)
-            cl = min(cl, hi)
-            cl = cl + half
-            ci @s11 = f32_to_i32(cl)
-            v @r2 = ci
-            sgn @r3 = to_bits(cl)
-            v = v + ((sgn as i32) >> 31)
-            *o2 = v
-            cl @s8 = max(a3, lo)
-            cl = min(cl, hi)
-            cl = cl + half
-            ci @s9 = f32_to_i32(cl)
-            v @r0 = ci
-            sgn @r1 = to_bits(cl)
-            v = v + ((sgn as i32) >> 31)
-            *(o1 + 130) = v
-            cl @s10 = max(b3, lo)
-            cl = min(cl, hi)
-            cl = cl + half
-            ci @s11 = f32_to_i32(cl)
-            v @r2 = ci
-            sgn @r3 = to_bits(cl)
-            v = v + ((sgn as i32) >> 31)
-            *(o2 + 130) = v
-            cl @s8 = max(a2, lo)
-            cl = min(cl, hi)
-            cl = cl + half
-            ci @s9 = f32_to_i32(cl)
-            v @r0 = ci
-            sgn @r1 = to_bits(cl)
-            v = v + ((sgn as i32) >> 31)
-            *(o1 + 128) = v
-            cl @s10 = max(b2, lo)
-            cl = min(cl, hi)
-            cl = cl + half
-            ci @s11 = f32_to_i32(cl)
-            v @r2 = ci
-            sgn @r3 = to_bits(cl)
-            v = v + ((sgn as i32) >> 31)
-            *(o2 + 128) = v
+            if #eq goto else
+            // mono: only lanes 0 and 2 reach the output, as mp3dec keeps
+            // only their history
+            loop {
+                #(kc -= 1)
+                zq @r0 = zp - 64 * 4
+                yq @r5 = yp + 64 * 4
+                (w0 @s24, w1 @s25, w2 @s26, w3 @s27) = *wp++
+                z0 @s0 = *zp
+                z2 @s2 = *(zp + 8)
+                y0 @s4 = *yp
+                y2 @s6 = *(yp + 8)
+                m @s8 = z0 * w1
+                m2 @s9 = y0 * w0
+                nn @s10 = z0 * w0
+                n2 @s11 = y0 * w1
+                m = m + m2
+                nn = nn - n2
+                b0 = b0 + m
+                a0 = a0 + nn
+                m @s8 = z2 * w1
+                m2 @s9 = y2 * w0
+                nn @s10 = z2 * w0
+                n2 @s11 = y2 * w1
+                m = m + m2
+                nn = nn - n2
+                b2 = b2 + m
+                a2 = a2 + nn
+                z0 = *zq
+                z2 = *(zq + 8)
+                y0 = *yq
+                y2 = *(yq + 8)
+                m @s8 = z0 * w3
+                m2 @s9 = y0 * w2
+                nn @s10 = y0 * w3
+                n2 @s11 = z0 * w2
+                m = m + m2
+                nn = nn - n2
+                b0 = b0 + m
+                a0 = a0 + nn
+                m @s8 = z2 * w3
+                m2 @s9 = y2 * w2
+                nn @s10 = y2 * w3
+                n2 @s11 = z2 * w2
+                m = m + m2
+                nn = nn - n2
+                b2 = b2 + m
+                a2 = a2 + nn
+                zp -= 128 * 4
+                yp += 128 * 4
+                if #ne goto loop
+            }
             goto end
         } else {
-            // the right channel is the left
-            cl @s8 = max(a0, lo)
-            cl = min(cl, hi)
-            cl = cl + half
-            ci @s9 = f32_to_i32(cl)
-            v @r0 = ci
-            sgn @r1 = to_bits(cl)
-            v = v + ((sgn as i32) >> 31)
-            *o1 = v
-            cl @s10 = max(b0, lo)
-            cl = min(cl, hi)
-            cl = cl + half
-            ci @s11 = f32_to_i32(cl)
-            v @r2 = ci
-            sgn @r3 = to_bits(cl)
-            v = v + ((sgn as i32) >> 31)
-            *o2 = v
-            cl @s8 = max(a2, lo)
-            cl = min(cl, hi)
-            cl = cl + half
-            ci @s9 = f32_to_i32(cl)
-            v @r0 = ci
-            sgn @r1 = to_bits(cl)
-            v = v + ((sgn as i32) >> 31)
-            *(o1 + 64) = v
-            cl @s10 = max(b2, lo)
-            cl = min(cl, hi)
-            cl = cl + half
-            ci @s11 = f32_to_i32(cl)
-            v @r2 = ci
-            sgn @r3 = to_bits(cl)
-            v = v + ((sgn as i32) >> 31)
-            *(o2 + 64) = v
+            loop {
+                #(kc -= 1)
+                zq @r0 = zp - 64 * 4
+                yq @r5 = yp + 64 * 4
+                (w0 @s24, w1 @s25, w2 @s26, w3 @s27) = *wp++
+                (z0 @s0, z1 @s1, z2 @s2, z3 @s3) = *zp
+                (y0 @s4, y1 @s5, y2 @s6, y3 @s7) = *yp
+                m @s8 = z0 * w1
+                m2 @s9 = y0 * w0
+                nn @s10 = z0 * w0
+                n2 @s11 = y0 * w1
+                m = m + m2
+                nn = nn - n2
+                b0 = b0 + m
+                a0 = a0 + nn
+                m @s12 = z1 * w1
+                m2 @s13 = y1 * w0
+                nn @s14 = z1 * w0
+                n2 @s15 = y1 * w1
+                m = m + m2
+                nn = nn - n2
+                b1 = b1 + m
+                a1 = a1 + nn
+                m @s8 = z2 * w1
+                m2 @s9 = y2 * w0
+                nn @s10 = z2 * w0
+                n2 @s11 = y2 * w1
+                m = m + m2
+                nn = nn - n2
+                b2 = b2 + m
+                a2 = a2 + nn
+                m @s12 = z3 * w1
+                m2 @s13 = y3 * w0
+                nn @s14 = z3 * w0
+                n2 @s15 = y3 * w1
+                m = m + m2
+                nn = nn - n2
+                b3 = b3 + m
+                a3 = a3 + nn
+                (z0, z1, z2, z3) = *zq
+                (y0, y1, y2, y3) = *yq
+                m @s8 = z0 * w3
+                m2 @s9 = y0 * w2
+                nn @s10 = y0 * w3
+                n2 @s11 = z0 * w2
+                m = m + m2
+                nn = nn - n2
+                b0 = b0 + m
+                a0 = a0 + nn
+                m @s12 = z1 * w3
+                m2 @s13 = y1 * w2
+                nn @s14 = y1 * w3
+                n2 @s15 = z1 * w2
+                m = m + m2
+                nn = nn - n2
+                b1 = b1 + m
+                a1 = a1 + nn
+                m @s8 = z2 * w3
+                m2 @s9 = y2 * w2
+                nn @s10 = y2 * w3
+                n2 @s11 = z2 * w2
+                m = m + m2
+                nn = nn - n2
+                b2 = b2 + m
+                a2 = a2 + nn
+                m @s12 = z3 * w3
+                m2 @s13 = y3 * w2
+                nn @s14 = y3 * w3
+                n2 @s15 = z3 * w2
+                m = m + m2
+                nn = nn - n2
+                b3 = b3 + m
+                a3 = a3 + nn
+                zp -= 128 * 4
+                yp += 128 * 4
+                if #ne goto loop
+            }
         }
+        // a0, b0, a2, b2 go to the left channel, or both when mono, and
+        // a1, b1, a3, b3 to the right. Four at a time, so that each op's
+        // result is ready by its next use.
+        t @r5 = n << 6
+        cx0 @s0 = max(a0, lo)
+        cx1 @s1 = max(b0, lo)
+        cx2 @s2 = max(a2, lo)
+        cx3 @s3 = max(b2, lo)
+        cx0 = min(cx0, hi)
+        cx1 = min(cx1, hi)
+        cx2 = min(cx2, hi)
+        cx3 = min(cx3, hi)
+        cx0 = cx0 + half
+        cx1 = cx1 + half
+        cx2 = cx2 + half
+        cx3 = cx3 + half
+        ix0 @s4 = f32_to_i32(cx0)
+        ix1 @s5 = f32_to_i32(cx1)
+        ix2 @s6 = f32_to_i32(cx2)
+        ix3 @s7 = f32_to_i32(cx3)
+        u0 @r0 = ix0
+        sg0 @r1 = to_bits(cx0)
+        u1 @r2 = ix1
+        sg1 @r3 = to_bits(cx1)
+        u0 = u0 + ((sg0 as i32) >> 31)
+        u1 = u1 + ((sg1 as i32) >> 31)
+        *o1 = u0
+        *o2 = u1
+        u0 = ix2
+        sg0 = to_bits(cx2)
+        u1 = ix3
+        sg1 = to_bits(cx3)
+        u0 = u0 + ((sg0 as i32) >> 31)
+        u1 = u1 + ((sg1 as i32) >> 31)
+        *(o1 + t) = u0
+        *(o2 + t) = u1
+        #(n - 2)
+        if #ne goto mono
+        t += 2
+        cx0 = max(a1, lo)
+        cx1 = max(b1, lo)
+        cx2 = max(a3, lo)
+        cx3 = max(b3, lo)
+        cx0 = min(cx0, hi)
+        cx1 = min(cx1, hi)
+        cx2 = min(cx2, hi)
+        cx3 = min(cx3, hi)
+        cx0 = cx0 + half
+        cx1 = cx1 + half
+        cx2 = cx2 + half
+        cx3 = cx3 + half
+        ix0 = f32_to_i32(cx0)
+        ix1 = f32_to_i32(cx1)
+        ix2 = f32_to_i32(cx2)
+        ix3 = f32_to_i32(cx3)
+        u0 = ix0
+        sg0 = to_bits(cx0)
+        u1 = ix1
+        sg1 = to_bits(cx1)
+        u0 = u0 + ((sg0 as i32) >> 31)
+        u1 = u1 + ((sg1 as i32) >> 31)
+        *(o1 + 2) = u0
+        *(o2 + 2) = u1
+        u0 = ix2
+        sg0 = to_bits(cx2)
+        u1 = ix3
+        sg1 = to_bits(cx3)
+        u0 = u0 + ((sg0 as i32) >> 31)
+        u1 = u1 + ((sg1 as i32) >> 31)
+        *(o1 + t) = u0
+        *(o2 + t) = u1
+    mono:
         o1 = o1 + (n << 1)
         o2 = o2 - (n << 1)
         ga += 18 * 4

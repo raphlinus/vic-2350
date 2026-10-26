@@ -15,6 +15,10 @@
 //!                 building one: its mp3_init and mp3_decode_frame
 //!   --frames N    stop after N frames of each file
 //!   --profile     print instructions per function
+//!   --cycles      print estimated cycles per function, from instruction
+//!                 counts and symbolasm --analyze's cycles per instruction,
+//!                 and the lines whose flagged instructions run the most
+//!   --lines PATH  with --cycles, also write every line's cycles to PATH
 //!   --no-pcm      pass no output buffer, so only headers are parsed
 //!   --stages PATH write the granule buffer after each stage to PATH, in
 //!                 the format of mp3dec's dump feature, with a line
@@ -76,6 +80,8 @@ struct Args {
     verbose: bool,
     frames: Option<usize>,
     profile: bool,
+    cycles: bool,
+    lines: Option<PathBuf>,
     no_pcm: bool,
     stages: Option<PathBuf>,
     elf: Option<PathBuf>,
@@ -87,6 +93,8 @@ fn parse_args() -> Result<Args, String> {
         verbose: false,
         frames: None,
         profile: false,
+        cycles: false,
+        lines: None,
         no_pcm: false,
         stages: None,
         elf: None,
@@ -96,8 +104,10 @@ fn parse_args() -> Result<Args, String> {
         match a.as_str() {
             "-v" => args.verbose = true,
             "--profile" => args.profile = true,
+            "--cycles" => args.cycles = true,
             "--no-pcm" => args.no_pcm = true,
             "--elf" => args.elf = Some(it.next().ok_or("--elf needs a value")?.into()),
+            "--lines" => args.lines = Some(it.next().ok_or("--lines needs a value")?.into()),
             "--stages" => args.stages = Some(it.next().ok_or("--stages needs a value")?.into()),
             "--frames" => {
                 let n = it.next().ok_or("--frames needs a value")?;
@@ -129,9 +139,7 @@ fn build() -> Result<Vec<u8>, String> {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let dir = std::env::temp_dir().join(format!("mp3sim-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let symbolasm = std::env::var("SYMBOLASM")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| here.join("../../symbolasm"));
+    let symbolasm = symbolasm_dir();
     let asm = run(Command::new("cargo")
         .args(["run", "-q", "--release", "--manifest-path"])
         .arg(symbolasm.join("Cargo.toml"))
@@ -153,11 +161,41 @@ fn build() -> Result<Vec<u8>, String> {
     std::fs::read(file("mp3.elf")).map_err(|e| e.to_string())
 }
 
+/// symbolasm's --analyze output for mp3.sy, with exact sizes
+fn analyze() -> Result<String, String> {
+    let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let out = run(Command::new("cargo")
+        .args(["run", "-q", "--release", "--manifest-path"])
+        .arg(symbolasm_dir().join("Cargo.toml"))
+        .arg("--")
+        .arg(here.join("../mp3.sy"))
+        .args([
+            "--analyze",
+            "--size",
+            "n",
+            "--cols",
+            "line,size,cycwhy,cyc,asm",
+        ]))?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+fn symbolasm_dir() -> PathBuf {
+    let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    std::env::var("SYMBOLASM")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| here.join("../../symbolasm"))
+}
+
 /// Instructions run, by the function they're in
 struct Profile {
     /// Function start addresses and names, sorted
     fns: Vec<(u32, String)>,
     counts: Vec<u64>,
+    /// Times run and times taken (the next pc wasn't the next
+    /// instruction), by pc / 2
+    pcs: Vec<(u64, u64)>,
+    /// The pc of the instruction being run, and the next one
+    last: Option<(u32, u32)>,
 }
 
 impl Profile {
@@ -169,14 +207,125 @@ impl Profile {
             .collect();
         fns.sort();
         let counts = vec![0; fns.len()];
-        Profile { fns, counts }
+        let end = fns.last().map_or(0, |f| f.0) as usize + 0x10000;
+        Profile {
+            fns,
+            counts,
+            pcs: vec![(0, 0); end / 2],
+            last: None,
+        }
     }
 
-    fn count(&mut self, pc: u32) {
+    fn count(&mut self, cpu: &Cpu) {
+        let pc = cpu.regs.r[15];
+        if let Some((last, next)) = self.last.take()
+            && pc != next
+        {
+            self.pcs[last as usize / 2].1 += 1;
+        }
         let i = self.fns.partition_point(|(addr, _)| *addr <= pc);
         if i > 0 {
             self.counts[i - 1] += 1;
         }
+        if let Some(c) = self.pcs.get_mut(pc as usize / 2) {
+            c.0 += 1;
+            let wide = cpu.load_u16(pc) >> 11 >= 0b11101;
+            self.last = Some((pc, pc + if wide { 4 } else { 2 }));
+        }
+    }
+
+    /// Print estimated cycles per function and the hottest lines, given
+    /// the per-instruction analysis, and write every line's to lines_path
+    fn print_cycles(&self, analysis: &str, lines_path: Option<&Path>) -> Result<(), String> {
+        let addrs: HashMap<&str, u32> = self
+            .fns
+            .iter()
+            .map(|(addr, name)| (name.as_str(), addr & !1))
+            .collect();
+        // Cycles and lost cycles (those with a why code) by function, and
+        // by line
+        let mut fns: Vec<(String, u64, u64)> = vec![];
+        let mut lines: HashMap<u32, (u64, u64, String)> = HashMap::new();
+        let mut pc = None;
+        for row in analysis.lines() {
+            if let Some(rest) = row.strip_prefix("== ") {
+                let name = rest.split_whitespace().next().unwrap_or("");
+                pc = addrs.get(name).copied();
+                fns.push((name.to_string(), 0, 0));
+                continue;
+            }
+            let Some(addr) = pc.as_mut() else { continue };
+            // line: size why cyc asm, with --cols line,size,cycwhy,cyc,asm
+            let Some((line, rest)) = row.trim_start().split_once(": ") else {
+                continue;
+            };
+            let Ok(line) = line.parse::<u32>() else {
+                continue;
+            };
+            let size = &rest[..1];
+            let Ok(size) = size.parse::<u32>() else {
+                continue;
+            };
+            let why = rest[2..6].trim();
+            let mut fields = rest[6..].split_whitespace();
+            let cyc = fields.next().unwrap_or("0");
+            let asm: Vec<&str> = fields.collect();
+            let (not_taken, taken) = match cyc.split_once('/') {
+                Some((a, b)) => (a.parse().unwrap_or(0), b.parse().unwrap_or(0)),
+                None => {
+                    let c = cyc.parse().unwrap_or(0);
+                    (c, c)
+                }
+            };
+            let (n, t) = self.pcs.get(*addr as usize / 2).copied().unwrap_or((0, 0));
+            let c = (n - t) * not_taken + t * taken;
+            let lost = if why.is_empty() { 0 } else { n };
+            let f = fns.last_mut().unwrap();
+            f.1 += c;
+            f.2 += lost;
+            let l = lines.entry(line).or_insert((0, 0, String::new()));
+            l.0 += c;
+            l.1 += lost;
+            if !l.2.is_empty() {
+                l.2.push_str("; ");
+            }
+            l.2.push_str(&asm.join(" "));
+            if !why.is_empty() {
+                l.2.push_str(&format!(" [{why}]"));
+            }
+            *addr += size;
+        }
+        let total: u64 = fns.iter().map(|f| f.1).sum();
+        println!("{total} cycles in all");
+        fns.sort_by_key(|f| std::cmp::Reverse(f.1));
+        println!(
+            "{:>12} {:>6} {:>12}  function (cycles, %, runs of flagged insns)",
+            "", "", ""
+        );
+        for (name, c, lost) in &fns {
+            if *c > 0 {
+                println!(
+                    "{c:12} {:5.1}% {lost:12}  {name}",
+                    100.0 * *c as f64 / total as f64
+                );
+            }
+        }
+        let mut lines: Vec<_> = lines.into_iter().collect();
+        lines.sort_by_key(|l| std::cmp::Reverse(l.1.1));
+        println!("lines with the most runs of flagged instructions:");
+        for (line, (c, lost, asm)) in lines.iter().take(40) {
+            println!("{line:6} {c:12} {lost:12}  {asm}");
+        }
+        if let Some(path) = lines_path {
+            // line, cycles, runs of flagged instructions, instructions
+            lines.sort_by_key(|l| l.0);
+            let text: String = lines
+                .iter()
+                .map(|(line, (c, lost, asm))| format!("{line} {c} {lost} {asm}\n"))
+                .collect();
+            std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        Ok(())
     }
 
     fn print(&self) {
@@ -305,7 +454,7 @@ fn call(cpu: &mut Cpu, addr: u32, args: &[u32], watch: &mut Watch) -> Result<(u3
             ));
         }
         if let Some(p) = &mut watch.profile {
-            p.count(cpu.regs.r[15]);
+            p.count(cpu);
         }
         if let Some(s) = &mut watch.stages {
             s.step(cpu);
@@ -377,7 +526,7 @@ fn check_file(
     let mut watch = Watch {
         layout,
         entries,
-        profile: args.profile.then(|| Profile::new(&symbols)),
+        profile: (args.profile || args.cycles).then(|| Profile::new(&symbols)),
         stages: args.stages.as_ref().map(|_| Stages::new(&symbols)),
     };
     // Flash, which is read only on the RP2350
@@ -393,7 +542,12 @@ fn check_file(
         result = result.and(Err(format!("wrote to flash at {:#x}", 0x1000_0000 + i)));
     }
     if let Some(p) = &watch.profile {
-        p.print();
+        if args.profile {
+            p.print();
+        }
+        if args.cycles {
+            p.print_cycles(&analyze()?, args.lines.as_deref())?;
+        }
     }
     if let (Some(s), Some(path)) = (&watch.stages, &args.stages) {
         std::fs::write(path, &s.out).map_err(|e| format!("{}: {e}", path.display()))?;
