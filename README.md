@@ -49,6 +49,12 @@ cd mp3sim && cargo run -r -- song.mp3
 
 With `--cycles`, it also estimates cycles per function and per line, from the emulator's instruction counts and the cycles per instruction of `symbolasm --analyze`. Some of mp3.sy's FP code was scheduled with `tools/sched.py`, which reorders a straight-line block so that no result is used by the very next instruction.
 
+`mp3bench` times mp3.sy and mp3dec on the board, a frame at a time, and checks their samples against mp3dec's on the host:
+
+```
+cd mp3bench && MP3=song.mp3 cargo build -r && ../tools/run.sh target/thumbv8m.main-none-eabihf/release/mp3bench 60
+```
+
 ## License
 
 Licensed under either of
