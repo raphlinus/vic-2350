@@ -126,11 +126,11 @@ unsafe fn fast_alarm_schedule(timestamp: u32) {
 const TX_IDLE_ADDRESS: u32 = 4;
 
 // Clock dividers for clk_sys at 144 MHz. TX runs at 4 cycles per bit and RX
-// at 10; RX's are (integer, 1/256ths).
+// at 12.
 const TX_DIV_FULL_SPEED: u16 = 3;
 const TX_DIV_LOW_SPEED: u16 = 24;
-const RX_DIV_FULL_SPEED: (u16, u8) = (1, 51);
-const RX_DIV_LOW_SPEED: (u16, u8) = (9, 154);
+const RX_DIV_FULL_SPEED: u16 = 1;
+const RX_DIV_LOW_SPEED: u16 = 8;
 
 const MAX_BUF: usize = 1028;
 
@@ -181,7 +181,7 @@ impl<PIO: PIOExt> UsbPio<PIO> {
         let (rx_sm, rx, _) = rp235x_hal::pio::PIOBuilder::from_installed_program(rx_installed)
             .in_pin_base(DP_PIN)
             .jmp_pin(DM_PIN)
-            .clock_divisor_fixed_point(RX_DIV_FULL_SPEED.0, RX_DIV_FULL_SPEED.1)
+            .clock_divisor_fixed_point(RX_DIV_FULL_SPEED, 0)
             .push_threshold(8)
             .autopush(true)
             .buffers(Buffers::OnlyRx)
@@ -236,12 +236,10 @@ impl<PIO: PIOExt> UsbPio<PIO> {
                 pio_write_instr(&self.pio, 4, 0xe080); // set pindirs, 0
             }
             self.tx_sm.clock_divisor_fixed_point(TX_DIV_LOW_SPEED, 0);
-            self.rx_sm
-                .clock_divisor_fixed_point(RX_DIV_LOW_SPEED.0, RX_DIV_LOW_SPEED.1);
+            self.rx_sm.clock_divisor_fixed_point(RX_DIV_LOW_SPEED, 0);
         } else {
             self.tx_sm.clock_divisor_fixed_point(TX_DIV_FULL_SPEED, 0);
-            self.rx_sm
-                .clock_divisor_fixed_point(RX_DIV_FULL_SPEED.0, RX_DIV_FULL_SPEED.1);
+            self.rx_sm.clock_divisor_fixed_point(RX_DIV_FULL_SPEED, 0);
         }
         self.setup_tx_raw(n_bytes);
     }
@@ -482,7 +480,7 @@ impl<PIO: PIOExt> UsbPio<PIO> {
     #[link_section = ".data"]
     fn prepare_rx(&mut self) {
         unsafe {
-            pio_write_instr(&self.pio, 9, 0x25a0); // wait 1 pin 0 [5]
+            pio_write_instr(&self.pio, 9, 0x27a0); // wait 1 pin 0 [7]
             pio_sm_exec(&self.rx_sm, 0x0009); // jmp start
             pio_sm_exec(&self.rx_sm, 0xa0eb); // mov osr, !null
             pio_sm_start(&self.rx_sm);

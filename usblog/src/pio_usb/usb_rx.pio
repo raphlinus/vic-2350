@@ -8,17 +8,17 @@
 .define public IRQ_RX_EOP 1
 
 start:
-    //wait 1 pin 0 [5]
+    //wait 1 pin 0 [7]
 pin_went_low:
     in null, 1
 pin_went_low_1:
-    set y, 6
+    set y, 6 [1]
 pin_low:
     jmp pin pin_went_high
     jmp pin pin_went_high
+    jmp pin pin_went_high [1]
     jmp pin pin_went_high
-    jmp pin pin_went_high
-    in osr, 1 [4]
+    in osr, 1 [5]
     jmp y-- pin_low
     // bit stuffing error, but can ignore
 
@@ -29,9 +29,9 @@ pin_went_high:
 not_stuffed:
     in null, 1
 went_high_1:
-    set y, 6
+    set y, 6 [1]
     mov x, pins
-    jmp x-- eop [8]
+    jmp x-- eop [10]
 went_high_2:
     mov x, pins
     jmp pin pin_still_high
@@ -40,7 +40,7 @@ went_high_2:
 
 pin_still_high:
     jmp x-- eop
-    in osr, 1 [5]
+    in osr, 1 [7]
     jmp y-- went_high_2
 
 eop:
