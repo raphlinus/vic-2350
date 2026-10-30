@@ -287,6 +287,7 @@ unsafe fn core1_main() {
         if pio_usb::now_us().wrapping_sub(next_report) < 0x8000_0000 {
             next_report = next_report.wrapping_add(REPORT_US);
             pio_usb::timing_report();
+            usb_task.report();
         }
         critical_section::with(|_| {
             if let Some(usb) = (*addr_of_mut!(USB)).as_mut() {

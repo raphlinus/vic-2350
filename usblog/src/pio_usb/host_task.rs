@@ -1,7 +1,19 @@
 //! A task that is continuously polled to run the USB host role.
+//!
+//! The root port has a hub on it, which is enumerated on pipe 0, and then
+//! polled there for status changes. Pipe 1 does everything else that's
+//! control transfers, for one port at a time: changes on the ports, and
+//! enumerating what's attached to them. An enumerated device gets a pipe
+//! of its own to poll.
+//!
+//! A failed transfer is recovered from at the smallest scale that works.
+//! A device is reset by its port, a few times, and a failure of the hub
+//! restarts the bus. The hub's status change reports are level triggered,
+//! so a port can always be gone back to.
 
 use crate::pio_usb::{
     iface::{PipeGuard, Request, Status, UserIface},
+    restart,
     wire::{
         CLASS_REQUEST, CLEAR_FEATURE, DEVICE_DESCRIPTOR, DEVICE_TO_HOST, GET_DESCRIPTOR,
         GET_STATUS, HOST_TO_DEVICE, HUB_DESCRIPTOR, PORT_POWER, PORT_RESET, RECIPIENT_OTHER,
@@ -12,7 +24,51 @@ use crate::pio_usb::{
 /// Maximum number of pipes that will be allocated
 const N_PIPES: usize = 16;
 
-/// A "task" encapsulating the host side of a USB bus.
+const HUB_PIPE: usize = 0;
+const CTRL_PIPE: usize = 1;
+
+const HUB_ADDR: u8 = 1;
+/// As many as fit in the first byte of the hub's status change report.
+const MAX_PORTS: usize = 7;
+
+/// How many frames of NAKs a control transfer sits through.
+const NAK_FRAMES: u16 = 1000;
+/// Resets of a port before giving up on what's attached to it.
+const ENUM_ATTEMPTS: u8 = 3;
+/// Checks of a port that's slow to finish its reset.
+const RESET_POLLS: u8 = 10;
+
+// In frames. TRSTRCY is 10 ms, and SET_ADDRESS gets 2 ms.
+const RESET_RECOVERY: u16 = 20;
+const ADDRESS_RECOVERY: u16 = 10;
+const CONNECT_DEBOUNCE: u16 = 100;
+const RESET_WAIT: u16 = 20;
+
+// wPortStatus
+const PORT_CONNECTED: u16 = 1 << 0;
+const PORT_ENABLED: u16 = 1 << 1;
+const PORT_RESETTING: u16 = 1 << 4;
+const PORT_LOW_SPEED: u16 = 1 << 9;
+// wPortChange, without bits that aren't defined
+const PORT_CHANGES: u16 = 0x1f;
+
+/// Print progress, which the soak test has too much of.
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        if !SOAK {
+            console!($($arg)*);
+        }
+    };
+}
+
+/// Run the soak test: reset and enumerate, for as long as the power is on.
+/// Set `USB_SOAK` when building.
+const SOAK: bool = option_env!("USB_SOAK").is_some();
+const SOAK_DEADLINE_US: u32 = 5_000_000;
+const SOAK_SETTLE_US: u32 = 100_000;
+const N_MODES: usize = 3;
+
+/// A task encapsulating the host side of a USB bus.
 ///
 /// It's conceptually similar to an async task, but there is no async
 /// involved here. Rather, tasks are implemented as explicit state
@@ -20,9 +76,21 @@ const N_PIPES: usize = 16;
 pub struct UsbTask {
     iface: UserIface,
     transfers: [Transfer; N_PIPES],
-    transfers_free: u32,
-    hub: HubTask,
-    pipe_tasks: [PipeTask; N_PIPES],
+    hub: HubState,
+    n_ports: u8,
+    /// Ports to look at, by bit.
+    dirty: u16,
+    ctrl: CtrlState,
+    /// The port pipe 1 is working on, and its latest wPortStatus.
+    port: u16,
+    port_status: u16,
+    reset_polls: u8,
+    ports: [Port; MAX_PORTS + 1],
+    restart: Option<Restart>,
+    /// Bus restarts and enumeration failures, since power on.
+    bus_restarts: u32,
+    enum_failures: u32,
+    soak: Soak,
 }
 
 #[derive(Copy, Clone)]
@@ -43,11 +111,10 @@ struct Transfer {
 enum TransferType {
     ControlNone,
     ControlIn,
-    #[expect(unused)]
-    ControlOut,
     PollInterrupt,
 }
 
+#[derive(Clone, Copy, Debug)]
 enum TransferPhase {
     Idle,
     Setup,
@@ -63,54 +130,73 @@ enum TickResult {
     Error,
 }
 
-#[derive(Default)]
-struct HubTask {
-    state: DeviceState,
-    hub_state: HubState,
-    port: u16,
-    changes: u16,
-    pending_resets: u16,
-    resetting: u16,
-    ignore_hub_events: bool,
-    low_speed: bool,
-}
-
-// states from Figure 9-1 of USB 2.0 spec
-#[derive(Clone, Copy, Default)]
-enum DeviceState {
-    #[default]
-    Default,
-    Address,
-    Configured,
-}
-
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug)]
 enum HubState {
-    #[default]
-    Configuring,
+    Recovery,
+    Desc,
+    Address,
+    AddressDelay,
+    Configured,
+    HubDesc,
     PowerPort(u8),
+    PowerGood,
     Polling,
-    GotPoll,
-}
-
-struct PipeTask {
-    state: PipeState,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum PipeState {
+enum CtrlState {
     Idle,
-    GotPortStatus,
-    DidClearFeature,
+    PortStatus,
+    ClearedChange,
+    Debounce,
     DidReset,
-    GotReset,
-    AfterResetDelay,
+    ResetWait,
+    ResetRecovery,
     GotDesc,
     Address,
-    AfterAddressDelay,
+    AddressDelay,
     Configured,
-    GotPoll,
 }
+
+#[derive(Clone, Copy)]
+struct Port {
+    phase: PortPhase,
+    attempts: u8,
+    low_speed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PortPhase {
+    /// Nothing is known to be attached.
+    Empty,
+    /// Reset, and enumerating.
+    Enumerating,
+    /// The device is being polled.
+    Running,
+    /// Given up on, until the next connection.
+    Failed,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Restart {
+    Bus,
+    Power,
+}
+
+/// Outcomes of the soak test, by what was reset, with counts of what it
+/// takes for the device to deliver a report.
+struct Soak {
+    mode: usize,
+    start: u32,
+    /// When the report came, while settling.
+    settling: Option<u32>,
+    reported: bool,
+    ok: [u32; N_MODES],
+    failed: [u32; N_MODES],
+    max_ms: [u32; N_MODES],
+}
+
+const MODE_NAMES: [&str; N_MODES] = ["port", "bus", "power"];
 
 impl SetupPacket {
     #[link_section = ".data"]
@@ -144,54 +230,49 @@ impl Transfer {
 
     fn tick(&mut self) -> TickResult {
         let pipe = self.pipe.as_mut().unwrap();
-        if pipe.status == Status::Success {
-            match self.phase {
-                TransferPhase::Setup => match self.ty {
+        if pipe.status != Status::Success {
+            return TickResult::Error;
+        }
+        match self.phase {
+            TransferPhase::Setup => {
+                match self.ty {
                     TransferType::ControlIn => {
                         self.phase = TransferPhase::Data;
                         pipe.req = Request::In;
-                        TickResult::Send
                     }
-                    TransferType::ControlNone => {
+                    _ => {
                         self.phase = TransferPhase::Status;
                         pipe.len = 0;
                         pipe.req = Request::In;
-                        TickResult::Send
                     }
-                    _ => todo!(),
-                },
-                TransferPhase::Data => match self.ty {
-                    TransferType::ControlIn => {
-                        let len = pipe.len.min(self.target_len - self.actual_len) as usize;
-                        self.buf[self.actual_len as usize..][..len]
-                            .copy_from_slice(&pipe.buf[0..len]);
-                        self.actual_len += len as u16;
-                        if self.actual_len == self.target_len || (len as u16) < self.packet_size {
-                            console!("IN {:02x?}", &self.buf[0..self.actual_len as usize]);
-                            self.phase = TransferPhase::Status;
-                            pipe.len = 0;
-                            pipe.toggle = 1;
-                            pipe.req = Request::Out;
-                        }
-                        TickResult::Send
-                    }
-                    TransferType::PollInterrupt => {
-                        let len = pipe.len as usize;
-                        self.buf[..len].copy_from_slice(&pipe.buf[..len]);
-                        self.actual_len = len as u16;
-                        TickResult::Done
-                    }
-                    _ => todo!(),
-                },
-                TransferPhase::Status | TransferPhase::Delay => {
-                    self.phase = TransferPhase::Idle;
-                    //console!("status done");
+                }
+                TickResult::Send
+            }
+            TransferPhase::Data => match self.ty {
+                TransferType::PollInterrupt => {
+                    let len = pipe.len as usize;
+                    self.buf[..len].copy_from_slice(&pipe.buf[..len]);
+                    self.actual_len = len as u16;
                     TickResult::Done
                 }
-                _ => todo!(),
+                _ => {
+                    let len = pipe.len.min(self.target_len - self.actual_len) as usize;
+                    self.buf[self.actual_len as usize..][..len].copy_from_slice(&pipe.buf[0..len]);
+                    self.actual_len += len as u16;
+                    if self.actual_len == self.target_len || (len as u16) < self.packet_size {
+                        trace!("IN {:02x?}", &self.buf[0..self.actual_len as usize]);
+                        self.phase = TransferPhase::Status;
+                        pipe.len = 0;
+                        pipe.toggle = 1;
+                        pipe.req = Request::Out;
+                    }
+                    TickResult::Send
+                }
+            },
+            TransferPhase::Status | TransferPhase::Delay | TransferPhase::Idle => {
+                self.phase = TransferPhase::Idle;
+                TickResult::Done
             }
-        } else {
-            TickResult::Error
         }
     }
 
@@ -199,6 +280,7 @@ impl Transfer {
         if let Some(pipe) = &mut self.pipe {
             let len = setup.length();
             pipe.setup(setup);
+            pipe.timer = NAK_FRAMES;
             self.phase = TransferPhase::Setup;
             self.ty = if len == 0 {
                 TransferType::ControlNone
@@ -217,39 +299,100 @@ impl Transfer {
             self.phase = TransferPhase::Delay;
         }
     }
+
+    /// Point the pipe at a device's control endpoint.
+    fn target(&mut self, addr: u8, low_speed: bool) {
+        if let Some(pipe) = &mut self.pipe {
+            pipe.addr = addr;
+            pipe.low_speed = low_speed;
+        }
+    }
+
+    /// Poll an interrupt endpoint from here on, which can NAK forever.
+    fn poll_interrupt(&mut self, ep: u8, target_len: u16) {
+        if let Some(pipe) = &mut self.pipe {
+            pipe.ep = ep;
+            pipe.toggle = 0;
+            pipe.timer = 0;
+            pipe.req = Request::In;
+        }
+        self.ty = TransferType::PollInterrupt;
+        self.phase = TransferPhase::Data;
+        self.target_len = target_len;
+    }
+}
+
+fn get_port_status(port: u16) -> SetupPacket {
+    SetupPacket::new(
+        DEVICE_TO_HOST | CLASS_REQUEST | RECIPIENT_OTHER,
+        GET_STATUS,
+        0,
+        port,
+        4,
+    )
+}
+
+fn set_port_feature(feature: u16, port: u16) -> SetupPacket {
+    SetupPacket::new(
+        HOST_TO_DEVICE | CLASS_REQUEST | RECIPIENT_OTHER,
+        SET_FEATURE,
+        feature,
+        port,
+        0,
+    )
+}
+
+fn clear_port_feature(feature: u16, port: u16) -> SetupPacket {
+    SetupPacket::new(
+        HOST_TO_DEVICE | CLASS_REQUEST | RECIPIENT_OTHER,
+        CLEAR_FEATURE,
+        feature,
+        port,
+        0,
+    )
 }
 
 impl UsbTask {
     // Safety: only call this once.
     pub unsafe fn new() -> Self {
-        let mut iface = UserIface::new();
-        let mut pipe = iface.pipe(0);
-        let setup = SetupPacket::new(
-            DEVICE_TO_HOST,
-            GET_DESCRIPTOR,
-            (DEVICE_DESCRIPTOR as u16) << 8,
-            0,
-            0x12,
-        );
-        let mut transfers = [const { Transfer::new() }; N_PIPES];
-        transfers[0].ty = TransferType::ControlIn;
-        transfers[0].phase = TransferPhase::Setup;
-        // TODO: packet size should be derived from device descriptor
-        transfers[0].packet_size = 64;
-        transfers[0].target_len = 18;
-        transfers[0].actual_len = 0;
-        pipe.addr = 0;
-        pipe.setup(setup);
-        iface.send_req(pipe);
-        let hub = HubTask::default();
-        let pipe_tasks = [const { PipeTask::new() }; N_PIPES];
-        Self {
-            iface,
-            transfers,
-            transfers_free: 1u32.unbounded_shl(N_PIPES as u32).wrapping_sub(2),
-            hub,
-            pipe_tasks,
+        let mut task = Self {
+            iface: UserIface::new(),
+            transfers: [const { Transfer::new() }; N_PIPES],
+            hub: HubState::Recovery,
+            n_ports: 0,
+            dirty: 0,
+            ctrl: CtrlState::Idle,
+            port: 0,
+            port_status: 0,
+            reset_polls: 0,
+            ports: [Port::new(); MAX_PORTS + 1],
+            restart: None,
+            bus_restarts: 0,
+            enum_failures: 0,
+            soak: Soak::new(),
+        };
+        task.begin();
+        task
+    }
+
+    /// Start from a bus that has just been reset.
+    fn begin(&mut self) {
+        for transfer in &mut self.transfers {
+            transfer.pipe = None;
+            transfer.phase = TransferPhase::Idle;
         }
+        self.hub = HubState::Recovery;
+        self.dirty = 0;
+        self.ctrl = CtrlState::Idle;
+        self.ports = [Port::new(); MAX_PORTS + 1];
+        self.restart = None;
+        self.transfers[CTRL_PIPE].pipe = Some(self.iface.pipe(CTRL_PIPE));
+        let transfer = &mut self.transfers[HUB_PIPE];
+        transfer.pipe = Some(self.iface.pipe(HUB_PIPE));
+        transfer.target(0, false);
+        transfer.packet_size = 64;
+        transfer.delay(RESET_RECOVERY);
+        self.send(HUB_PIPE);
     }
 
     /// Poll the USB bus, advancing the state machine.
@@ -261,200 +404,203 @@ impl UsbTask {
     /// It will probably evolve to return a result, basically a stream of events.
     pub fn poll(&mut self) {
         let mut bits = self.iface.poll();
-        while bits != 0 {
+        while bits != 0 && self.restart.is_none() {
             let ix = bits.trailing_zeros() as usize;
             let pipe = self.iface.pipe(ix);
             if pipe.status != Status::Success {
                 console!("pipe {ix} status {:?}", pipe.status);
             }
             self.transfers[ix].pipe = Some(pipe);
-            //console!("polled {ix}, status = {:?}", pipe.status);
-            let mut res = self.transfers[ix].tick();
-            if res == TickResult::Done {
-                if ix == 0 {
-                    self.hub_tick();
-                    res = TickResult::Send;
-                } else {
-                    res = self.pipe_tick(ix);
-                }
-            }
-            match res {
-                TickResult::Send => {
-                    if let Some(pipe) = self.transfers[ix].pipe.take() {
-                        self.iface.send_req(pipe);
-                    }
-                }
-                TickResult::Done => {
-                    self.free_transfer(ix);
-                    console!("pipe {ix} done");
-                }
-                _ => (),
+            let res = self.transfers[ix].tick();
+            match ix {
+                HUB_PIPE => self.hub_tick(res),
+                CTRL_PIPE => self.ctrl_tick(res),
+                _ => self.device_tick(ix, res),
             }
             bits &= bits - 1;
         }
-    }
-
-    fn alloc_transfer(&mut self) -> usize {
-        let ix = self.transfers_free.trailing_zeros() as usize;
-        // TODO: handle failure
-        self.transfers[ix].pipe = Some(self.iface.pipe(ix));
-        ix
-    }
-
-    fn free_transfer(&mut self, ix: usize) {
-        if let Some(pipe) = self.transfers[ix].pipe.take() {
-            self.iface.release_pipe(pipe);
+        self.ctrl_next();
+        if SOAK {
+            self.soak_tick();
         }
-        self.transfers_free |= 1 << ix;
+        if let Some(kind) = self.restart {
+            unsafe { restart(&mut self.iface, kind == Restart::Power) };
+            self.begin();
+        }
     }
 
-    fn hub_tick(&mut self) {
-        let transfer = &mut self.transfers[0];
-        match self.hub.hub_state {
-            HubState::Configuring => match self.hub.state {
-                // maybe reduce duplication between this and device setup
-                DeviceState::Default => {
-                    let setup = SetupPacket::new(HOST_TO_DEVICE, SET_ADDRESS, 1, 0, 0);
-                    transfer.setup(setup);
-                    self.hub.state = DeviceState::Address;
-                }
-                DeviceState::Address => {
-                    // TODO: should implement 2ms delay here, per 9.2.6.3
-                    let setup = SetupPacket::new(HOST_TO_DEVICE, SET_CONFIGURATION, 1, 0, 0);
-                    transfer.pipe.as_mut().unwrap().addr = 1;
-                    transfer.setup(setup);
-                    self.hub.state = DeviceState::Configured;
-                }
-                DeviceState::Configured => {
-                    let setup = SetupPacket::new(
-                        DEVICE_TO_HOST | CLASS_REQUEST,
-                        GET_DESCRIPTOR,
-                        (HUB_DESCRIPTOR as u16) << 8,
-                        0,
-                        9,
-                    );
-                    transfer.setup(setup);
-                    self.hub.hub_state = HubState::PowerPort(1);
-                }
-            },
-            HubState::PowerPort(port) => {
-                if port == 1 {
-                    console!("hub desc {:02x?}", &transfer.buf[0..9]);
-                }
+    fn send(&mut self, ix: usize) {
+        if let Some(pipe) = self.transfers[ix].pipe.take() {
+            self.iface.send_req(pipe);
+        }
+    }
+
+    fn hub_tick(&mut self, res: TickResult) {
+        match res {
+            TickResult::Send => return self.send(HUB_PIPE),
+            TickResult::Error => {
+                console!("hub failed in {:?}", self.hub);
+                self.bus_restarts += 1;
+                self.restart = Some(Restart::Bus);
+                return;
+            }
+            TickResult::Done => (),
+        }
+        let transfer = &mut self.transfers[HUB_PIPE];
+        match self.hub {
+            HubState::Recovery => {
                 let setup = SetupPacket::new(
-                    HOST_TO_DEVICE | CLASS_REQUEST | RECIPIENT_OTHER,
-                    SET_FEATURE,
-                    PORT_POWER,
-                    port.into(),
+                    DEVICE_TO_HOST,
+                    GET_DESCRIPTOR,
+                    (DEVICE_DESCRIPTOR as u16) << 8,
                     0,
+                    0x12,
                 );
                 transfer.setup(setup);
-                // TODO: iterate through ports, though probably not necessary for CH334F
-                self.hub.hub_state = HubState::Polling;
+                self.hub = HubState::Desc;
+            }
+            HubState::Desc => {
+                let setup = SetupPacket::new(HOST_TO_DEVICE, SET_ADDRESS, HUB_ADDR as u16, 0, 0);
+                transfer.setup(setup);
+                self.hub = HubState::Address;
+            }
+            HubState::Address => {
+                transfer.delay(ADDRESS_RECOVERY);
+                self.hub = HubState::AddressDelay;
+            }
+            HubState::AddressDelay => {
+                transfer.target(HUB_ADDR, false);
+                let setup = SetupPacket::new(HOST_TO_DEVICE, SET_CONFIGURATION, 1, 0, 0);
+                transfer.setup(setup);
+                self.hub = HubState::Configured;
+            }
+            HubState::Configured => {
+                let setup = SetupPacket::new(
+                    DEVICE_TO_HOST | CLASS_REQUEST,
+                    GET_DESCRIPTOR,
+                    (HUB_DESCRIPTOR as u16) << 8,
+                    0,
+                    9,
+                );
+                transfer.setup(setup);
+                self.hub = HubState::HubDesc;
+            }
+            HubState::HubDesc => {
+                trace!("hub desc {:02x?}", &transfer.buf[0..9]);
+                self.n_ports = transfer.buf[2].min(MAX_PORTS as u8);
+                transfer.setup(set_port_feature(PORT_POWER, 1));
+                self.hub = HubState::PowerPort(1);
+            }
+            HubState::PowerPort(port) if port < self.n_ports => {
+                transfer.setup(set_port_feature(PORT_POWER, port as u16 + 1));
+                self.hub = HubState::PowerPort(port + 1);
+            }
+            HubState::PowerPort(_) => {
+                // bPwrOn2PwrGood, in units of 2 ms
+                transfer.delay(transfer.buf[5] as u16 * 2 + 1);
+                self.hub = HubState::PowerGood;
+            }
+            HubState::PowerGood => {
+                transfer.poll_interrupt(1, 1);
+                self.hub = HubState::Polling;
             }
             HubState::Polling => {
-                if let Some(pipe) = &mut transfer.pipe {
-                    pipe.ep = 1;
-                    pipe.req = Request::In;
-                }
-                transfer.ty = TransferType::PollInterrupt;
-                transfer.phase = TransferPhase::Data;
-                transfer.target_len = 1;
-                self.hub.hub_state = HubState::GotPoll;
+                // Bit 0 is the hub itself, and it has nothing we'd act on.
+                self.dirty |= transfer.buf[0] as u16 & !1;
             }
-            HubState::GotPoll => {
-                // spawn a task to query port status
-                if !self.hub.ignore_hub_events {
-                    let port = transfer.buf[0].trailing_zeros();
-                    self.hub.port = port as u16;
-                    let new_transfer_ix = self.alloc_transfer();
-                    console!("investigating port {port}, new_transfer_ix = {new_transfer_ix}");
-                    let setup = SetupPacket::new(
-                        DEVICE_TO_HOST | CLASS_REQUEST | RECIPIENT_OTHER,
-                        GET_STATUS,
-                        0,
-                        self.hub.port,
-                        4,
-                    );
-                    self.transfers[new_transfer_ix].setup(setup);
-                    if let Some(mut pipe) = self.transfers[new_transfer_ix].pipe.take() {
-                        pipe.addr = 1;
-                        self.iface.send_req(pipe);
-                    }
-                    self.pipe_tasks[new_transfer_ix].state = PipeState::GotPortStatus;
-                    self.hub.ignore_hub_events = true;
-                }
-            }
+        }
+        self.send(HUB_PIPE);
+    }
+
+    /// Start on a port that needs looking at, if pipe 1 is free.
+    fn ctrl_next(&mut self) {
+        if self.ctrl == CtrlState::Idle && self.dirty != 0 && self.restart.is_none() {
+            self.port = self.dirty.trailing_zeros() as u16;
+            self.dirty &= self.dirty - 1;
+            self.ctrl_hub(get_port_status(self.port), CtrlState::PortStatus);
         }
     }
 
-    fn pipe_tick(&mut self, ix: usize) -> TickResult {
-        let transfer = &mut self.transfers[ix];
-        let task = &mut self.pipe_tasks[ix];
-        match task.state {
-            PipeState::GotPortStatus => {
-                let status = u16::from_le_bytes(transfer.buf[0..2].try_into().unwrap());
-                self.hub.changes = u16::from_le_bytes(transfer.buf[2..4].try_into().unwrap());
-                if status & self.hub.changes & 1 != 0 {
-                    self.hub.pending_resets |= 1 << self.hub.port;
+    /// Run a control transfer to the hub on pipe 1.
+    fn ctrl_hub(&mut self, setup: SetupPacket, state: CtrlState) {
+        let transfer = &mut self.transfers[CTRL_PIPE];
+        transfer.target(HUB_ADDR, false);
+        transfer.packet_size = 64;
+        transfer.setup(setup);
+        self.ctrl = state;
+        self.send(CTRL_PIPE);
+    }
+
+    /// Run a control transfer to the device being enumerated on pipe 1.
+    fn ctrl_device(&mut self, addr: u8, setup: SetupPacket, state: CtrlState) {
+        let low_speed = self.ports[self.port as usize].low_speed;
+        let transfer = &mut self.transfers[CTRL_PIPE];
+        transfer.target(addr, low_speed);
+        transfer.setup(setup);
+        self.ctrl = state;
+        self.send(CTRL_PIPE);
+    }
+
+    fn ctrl_delay(&mut self, delay_ms: u16, state: CtrlState) {
+        self.transfers[CTRL_PIPE].delay(delay_ms);
+        self.ctrl = state;
+        self.send(CTRL_PIPE);
+    }
+
+    fn reset_port(&mut self) {
+        self.reset_polls = 0;
+        self.ports[self.port as usize].phase = PortPhase::Enumerating;
+        self.ctrl_hub(set_port_feature(PORT_RESET, self.port), CtrlState::DidReset);
+    }
+
+    fn enum_failed(&mut self) {
+        self.enum_failures += 1;
+        let port = &mut self.ports[self.port as usize];
+        port.attempts += 1;
+        console!(
+            "enumeration failed in {:?} {:?}, attempt {}",
+            self.ctrl,
+            self.transfers[CTRL_PIPE].phase,
+            port.attempts
+        );
+        if port.attempts < ENUM_ATTEMPTS {
+            self.reset_port();
+        } else {
+            port.phase = PortPhase::Failed;
+            self.ctrl = CtrlState::Idle;
+        }
+    }
+
+    fn ctrl_tick(&mut self, res: TickResult) {
+        match res {
+            TickResult::Send => return self.send(CTRL_PIPE),
+            TickResult::Error => {
+                match self.ctrl {
+                    CtrlState::GotDesc | CtrlState::Address | CtrlState::Configured => {
+                        self.enum_failed();
+                    }
+                    _ => {
+                        console!("hub failed in {:?}", self.ctrl);
+                        self.bus_restarts += 1;
+                        self.restart = Some(Restart::Bus);
+                    }
                 }
-                let change = self.hub.changes.trailing_zeros();
-                console!(
-                    "status {status:04x} changes {:04x}, change = {change}",
-                    self.hub.changes
-                );
-                let setup = SetupPacket::new(
-                    HOST_TO_DEVICE | CLASS_REQUEST | RECIPIENT_OTHER,
-                    CLEAR_FEATURE,
-                    change as u16 + 16,
-                    self.hub.port,
-                    0,
-                );
-                transfer.setup(setup);
-                self.hub.changes &= self.hub.changes - 1;
-                self.hub.low_speed = status & 2 != 0;
-                task.state = if change == 4 {
-                    PipeState::GotReset
-                } else {
-                    PipeState::DidClearFeature
-                };
+                return;
             }
-            PipeState::DidClearFeature => {
-                console!("did clear feature");
-                // TODO: handle more changes
-                if self.hub.changes == 0 {
-                    self.hub.ignore_hub_events = false;
-                }
-                if self.hub.pending_resets != 0 {
-                    self.hub.resetting = self.hub.pending_resets.trailing_zeros() as u16;
-                    let setup = SetupPacket::new(
-                        HOST_TO_DEVICE | CLASS_REQUEST | RECIPIENT_OTHER,
-                        SET_FEATURE,
-                        PORT_RESET,
-                        self.hub.resetting,
-                        0,
-                    );
-                    transfer.setup(setup);
-                    task.state = PipeState::DidReset;
-                    self.hub.pending_resets &= self.hub.pending_resets - 1;
-                } else {
-                    return TickResult::Done;
-                }
+            TickResult::Done => (),
+        }
+        match self.ctrl {
+            CtrlState::Idle => (),
+            CtrlState::PortStatus => self.got_port_status(),
+            CtrlState::ClearedChange => {
+                self.ctrl_hub(get_port_status(self.port), CtrlState::PortStatus);
             }
-            PipeState::DidReset => {
-                console!("did reset");
-                return TickResult::Done;
+            CtrlState::Debounce => self.reset_port(),
+            CtrlState::DidReset => self.ctrl_delay(RESET_WAIT, CtrlState::ResetWait),
+            CtrlState::ResetWait => {
+                self.ctrl_hub(get_port_status(self.port), CtrlState::PortStatus);
             }
-            PipeState::GotReset => {
-                console!("got reset");
-                // It's possible we can tighten this; 7.1.7.5 dictates 50ms total, but we've
-                // had some delay from the hub. No harm done though.
-                transfer.delay(50);
-                task.state = PipeState::AfterResetDelay;
-            }
-            PipeState::AfterResetDelay => {
-                console!("got reset delay");
-                // should probably check that port status enabled flag is set
+            CtrlState::ResetRecovery => {
                 // Device has been reset, is now in default state, with address 0 (see Figure 9-1)
                 let setup = SetupPacket::new(
                     DEVICE_TO_HOST,
@@ -463,58 +609,209 @@ impl UsbTask {
                     0,
                     0x8,
                 );
-                transfer.packet_size = 8;
-                transfer.setup(setup);
-                if let Some(pipe) = &mut transfer.pipe {
-                    pipe.addr = 0;
-                    pipe.low_speed = self.hub.low_speed;
-                }
-                task.state = PipeState::GotDesc;
+                self.transfers[CTRL_PIPE].packet_size = 8;
+                self.ctrl_device(0, setup, CtrlState::GotDesc);
             }
-            PipeState::GotDesc => {
-                console!("device desc {:02x?}", &transfer.buf[0..8]);
+            CtrlState::GotDesc => {
+                let transfer = &mut self.transfers[CTRL_PIPE];
+                trace!("device desc {:02x?}", &transfer.buf[0..8]);
+                if transfer.actual_len != 8 || transfer.buf[1] != DEVICE_DESCRIPTOR {
+                    return self.enum_failed();
+                }
                 transfer.packet_size = transfer.buf[7] as u16;
                 // probably should get full descriptor here, but we cut corners
-                // TODO: allocate address, for now hardcode as 2
-                let setup = SetupPacket::new(HOST_TO_DEVICE, SET_ADDRESS, 2, 0, 0);
-                transfer.setup(setup);
-                task.state = PipeState::Address;
-                // the user task is crashing intermittently here for unknown reasons
+                let setup = SetupPacket::new(HOST_TO_DEVICE, SET_ADDRESS, self.port + 1, 0, 0);
+                self.ctrl_device(0, setup, CtrlState::Address);
             }
-            PipeState::Address => {
-                console!("address");
-                transfer.delay(100);
-                task.state = PipeState::AfterAddressDelay;
-            }
-            PipeState::AfterAddressDelay => {
-                transfer.pipe.as_mut().unwrap().addr = 2;
+            CtrlState::Address => self.ctrl_delay(ADDRESS_RECOVERY, CtrlState::AddressDelay),
+            CtrlState::AddressDelay => {
                 let setup = SetupPacket::new(HOST_TO_DEVICE, SET_CONFIGURATION, 1, 0, 0);
-                transfer.setup(setup);
-                task.state = PipeState::Configured;
+                self.ctrl_device(self.port as u8 + 1, setup, CtrlState::Configured);
             }
-            PipeState::Configured => {
-                if let Some(pipe) = &mut transfer.pipe {
-                    pipe.ep = 1;
-                    pipe.req = Request::In;
-                }
-                transfer.ty = TransferType::PollInterrupt;
-                transfer.phase = TransferPhase::Data;
-                transfer.target_len = 8;
-                task.state = PipeState::GotPoll;
+            CtrlState::Configured => {
+                self.ctrl = CtrlState::Idle;
+                self.start_device();
             }
-            PipeState::GotPoll => {
-                console!("report {:02x?}", &transfer.buf[0..8]);
-            }
-            _ => return TickResult::Error, // shouldn't happen
         }
-        TickResult::Send
+    }
+
+    fn got_port_status(&mut self) {
+        let transfer = &self.transfers[CTRL_PIPE];
+        let status = u16::from_le_bytes(transfer.buf[0..2].try_into().unwrap());
+        let changes = u16::from_le_bytes(transfer.buf[2..4].try_into().unwrap());
+        trace!("port {} status {status:04x} changes {changes:04x}", self.port);
+        self.port_status = status;
+        let port = &mut self.ports[self.port as usize];
+        let changes = changes & PORT_CHANGES;
+        if changes != 0 {
+            let change = changes.trailing_zeros() as u16;
+            if change == 0 {
+                port.phase = PortPhase::Empty;
+            }
+            let setup = clear_port_feature(change + 16, self.port);
+            return self.ctrl_hub(setup, CtrlState::ClearedChange);
+        }
+        if status & PORT_CONNECTED == 0 {
+            port.phase = PortPhase::Empty;
+            self.ctrl = CtrlState::Idle;
+            return;
+        }
+        match port.phase {
+            PortPhase::Empty => {
+                port.attempts = 0;
+                self.ctrl_delay(CONNECT_DEBOUNCE, CtrlState::Debounce);
+            }
+            PortPhase::Enumerating if status & PORT_RESETTING != 0 => {
+                self.reset_polls += 1;
+                if self.reset_polls < RESET_POLLS {
+                    self.ctrl_delay(RESET_WAIT, CtrlState::ResetWait);
+                } else {
+                    self.enum_failed();
+                }
+            }
+            PortPhase::Enumerating if status & PORT_ENABLED != 0 => {
+                port.low_speed = status & PORT_LOW_SPEED != 0;
+                self.ctrl_delay(RESET_RECOVERY, CtrlState::ResetRecovery);
+            }
+            PortPhase::Enumerating => self.enum_failed(),
+            PortPhase::Running if status & PORT_ENABLED == 0 => {
+                // Its polling will fail, if it hasn't already.
+                port.phase = PortPhase::Empty;
+                self.ctrl_delay(CONNECT_DEBOUNCE, CtrlState::Debounce);
+            }
+            PortPhase::Running | PortPhase::Failed => self.ctrl = CtrlState::Idle,
+        }
+    }
+
+    /// Start polling the device just enumerated, each port having its own
+    /// pipe and address.
+    fn start_device(&mut self) {
+        let port = self.port as usize;
+        self.ports[port].phase = PortPhase::Running;
+        let ix = port + 1;
+        let mut pipe = self.iface.pipe(ix);
+        pipe.addr = ix as u8;
+        pipe.low_speed = self.ports[port].low_speed;
+        let transfer = &mut self.transfers[ix];
+        transfer.pipe = Some(pipe);
+        transfer.poll_interrupt(1, 8);
+        self.send(ix);
+    }
+
+    fn device_tick(&mut self, ix: usize, res: TickResult) {
+        let port = ix - 1;
+        match res {
+            TickResult::Done => {
+                let transfer = &self.transfers[ix];
+                trace!("report {:02x?}", &transfer.buf[0..transfer.actual_len as usize]);
+                if self.ports[port].phase == PortPhase::Running {
+                    self.soak.reported = true;
+                }
+                self.send(ix);
+            }
+            TickResult::Send => self.send(ix),
+            TickResult::Error => {
+                // Look at the port again; the hub knows if it was unplugged.
+                if let Some(pipe) = self.transfers[ix].pipe.take() {
+                    self.iface.release_pipe(pipe);
+                }
+                if self.ports[port].phase == PortPhase::Running {
+                    self.ports[port].phase = PortPhase::Empty;
+                    self.dirty |= 1 << port;
+                }
+            }
+        }
+    }
+
+    fn soak_tick(&mut self) {
+        let now = super::now_us();
+        let mode = self.soak.mode;
+        if let Some(reported) = self.soak.settling {
+            if now.wrapping_sub(reported) >= SOAK_SETTLE_US {
+                self.soak_next(now);
+            }
+        } else if self.soak.reported {
+            let ms = now.wrapping_sub(self.soak.start) / 1000;
+            self.soak.ok[mode] += 1;
+            self.soak.max_ms[mode] = self.soak.max_ms[mode].max(ms);
+            self.soak.settling = Some(now);
+        } else if now.wrapping_sub(self.soak.start) >= SOAK_DEADLINE_US {
+            self.soak.failed[mode] += 1;
+            console!(
+                "soak: {} failed, hub {:?} ctrl {:?} port {} status {:04x} phase {:?}",
+                MODE_NAMES[mode],
+                self.hub,
+                self.ctrl,
+                self.port,
+                self.port_status,
+                self.ports[self.port as usize].phase,
+            );
+            self.soak_next(now);
+        }
+    }
+
+    fn soak_next(&mut self, now: u32) {
+        self.soak.mode = (self.soak.mode + 1) % N_MODES;
+        self.soak.start = now;
+        self.soak.settling = None;
+        self.soak.reported = false;
+        match self.soak.mode {
+            0 => {
+                for port in 1..=self.n_ports as usize {
+                    if self.ports[port].phase == PortPhase::Running {
+                        self.ports[port].phase = PortPhase::Empty;
+                        self.dirty |= 1 << port;
+                    }
+                }
+            }
+            1 => self.restart = Some(Restart::Bus),
+            _ => self.restart = Some(Restart::Power),
+        }
+    }
+
+    /// Print counts of what's gone wrong, and the soak test's outcomes.
+    pub fn report(&self) {
+        let [wrong, crc, no_reply] = self.iface.errors();
+        console!(
+            "usb errors: wrong {wrong} crc {crc} no reply {no_reply}, enum failures {}, bus restarts {}",
+            self.enum_failures,
+            self.bus_restarts,
+        );
+        if SOAK {
+            for mode in 0..N_MODES {
+                console!(
+                    "soak {}: ok {} failed {} max {} ms",
+                    MODE_NAMES[mode],
+                    self.soak.ok[mode],
+                    self.soak.failed[mode],
+                    self.soak.max_ms[mode],
+                );
+            }
+        }
     }
 }
 
-impl PipeTask {
+impl Port {
     const fn new() -> Self {
         Self {
-            state: PipeState::Idle,
+            phase: PortPhase::Empty,
+            attempts: 0,
+            low_speed: false,
+        }
+    }
+}
+
+impl Soak {
+    const fn new() -> Self {
+        Self {
+            // The first enumeration is after a bus reset.
+            mode: 1,
+            start: 0,
+            settling: None,
+            reported: false,
+            ok: [0; N_MODES],
+            failed: [0; N_MODES],
+            max_ms: [0; N_MODES],
         }
     }
 }

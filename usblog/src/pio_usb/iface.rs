@@ -23,6 +23,10 @@ pub struct Iface {
     request: AtomicU32,
     // Bitmask of responses
     response: AtomicU32,
+    // Bitmask of pipes the interrupt retries in the next frame
+    held: AtomicU32,
+    // Failed transactions: a wrong reply, a bad CRC, and no reply
+    errors: [AtomicU32; 3],
     pipes: [UnsafeCell<Pipe>; N_PIPES],
 }
 
@@ -56,13 +60,17 @@ pub struct Pipe {
     pub timer: u16,
     pub req: Request,
     pub status: Status,
+    /// Consecutive failed transactions, kept by the interrupt side.
+    retries: u8,
 }
 
 // The interrupt side's view of the interface; these must match its layout.
 const _: () = {
     assert!(offset_of!(Iface, request) == 0);
     assert!(offset_of!(Iface, response) == 4);
-    assert!(offset_of!(Iface, pipes) == 8);
+    assert!(offset_of!(Iface, held) == 8);
+    assert!(offset_of!(Iface, errors) == 12);
+    assert!(offset_of!(Iface, pipes) == 24);
     assert!(offset_of!(Pipe, buf) == 0);
     assert!(offset_of!(Pipe, addr) == 64);
     assert!(offset_of!(Pipe, ep) == 65);
@@ -72,6 +80,7 @@ const _: () = {
     assert!(offset_of!(Pipe, timer) == 70);
     assert!(offset_of!(Pipe, req) == 72);
     assert!(offset_of!(Pipe, status) == 73);
+    assert!(offset_of!(Pipe, retries) == 74);
     assert!(size_of::<Pipe>() == 76);
 };
 
@@ -94,15 +103,12 @@ pub enum Request {
 pub enum Status {
     Empty = 0,
     Success = 1,
-    #[expect(unused, reason = "TODO: haven't implemented timeouts yet")]
+    #[expect(unused, reason = "only set by the interrupt side")]
     Timeout = 2,
-    #[expect(
-        unused,
-        reason = "TODO: signal this when hub signals port disconnected"
-    )]
-    Disconnected = 3,
     #[expect(unused, reason = "only set by the interrupt side")]
     Error = 4,
+    #[expect(unused, reason = "only set by the interrupt side")]
+    Stall = 5,
 }
 
 impl Pipe {
@@ -117,6 +123,7 @@ impl Pipe {
             timer: 0,
             req: Request::Empty,
             status: Status::Empty,
+            retries: 0,
         }
     }
 
@@ -148,6 +155,8 @@ impl Iface {
         Iface {
             request: AtomicU32::new(0),
             response: AtomicU32::new(0),
+            held: AtomicU32::new(0),
+            errors: [const { AtomicU32::new(0) }; 3],
             pipes: [const { UnsafeCell::new(Pipe::new()) }; N_PIPES],
         }
     }
@@ -159,6 +168,23 @@ impl UserIface {
     /// Safety: there needs to be only one instance; it's bound to `IFACE`
     pub unsafe fn new() -> UserIface {
         UserIface { int_owned: 0 }
+    }
+
+    /// Forget all requests and take back all pipes. The interrupt must be
+    /// masked.
+    pub fn clear(&mut self) {
+        IFACE.request.store(0, Relaxed);
+        IFACE.response.store(0, Relaxed);
+        IFACE.held.store(0, Relaxed);
+        for pipe in &IFACE.pipes {
+            unsafe { (*pipe.get()).retries = 0 };
+        }
+        self.int_owned = 0;
+    }
+
+    /// Failed transactions: wrong replies, bad CRCs, and no replies.
+    pub fn errors(&self) -> [u32; 3] {
+        [0, 1, 2].map(|i| IFACE.errors[i].load(Relaxed))
     }
 
     pub fn pipe(&mut self, pipe_ix: usize) -> PipeGuard {

@@ -5,7 +5,10 @@ mod wire;
 
 use core::{cell::UnsafeCell, mem::MaybeUninit};
 
-use cortex_m::peripheral::NVIC;
+use cortex_m::{
+    asm::{dsb, isb},
+    peripheral::NVIC,
+};
 use hal::{
     pac::{Interrupt, PIO0, RESETS},
     pio::{Buffers, PIOExt, Rx, StateMachine, Stopped, Tx, ValidStateMachine, SM0, SM1},
@@ -13,6 +16,7 @@ use hal::{
 use pio::Instruction;
 use rp235x_hal as hal;
 
+use self::iface::UserIface;
 use self::wire::PID_SOF;
 
 pub use self::host_task::UsbTask;
@@ -31,6 +35,7 @@ const USB_5V_PIN: usize = 11;
 const IO_BANK0: usize = 0x40028000;
 const PADS_BANK0: usize = 0x40038000;
 const SIO_GPIO_OUT_SET: usize = 0xd0000018;
+const SIO_GPIO_OUT_CLR: usize = 0xd0000020;
 const SIO_GPIO_OE_SET: usize = 0xd0000038;
 const TIMER0_INTR: usize = 0x400b003c;
 const TIMER0_INTE: usize = 0x400b0040;
@@ -41,6 +46,17 @@ const FUNCSEL_SIO: u32 = 5;
 const FUNCSEL_PIO0: u32 = 6;
 /// GPIO_CTRL's INOVER field set to invert.
 const INOVER_INVERT: u32 = 1 << 16;
+
+// The bus reset from the host's states, in microseconds. 7.1.7.5 asks for 50 ms.
+const RESET_US: u32 = 50_000;
+const POWER_OFF_US: u32 = 300_000;
+const POWER_ON_US: u32 = 300_000;
+
+const STATE_RESET: u32 = 0;
+const STATE_RELEASE: u32 = 1;
+const STATE_RUNNING: u32 = 2;
+const STATE_POWER_OFF: u32 = 3;
+const STATE_POWER_ON: u32 = 4;
 
 // Very low level PIO functions
 
@@ -202,7 +218,7 @@ impl<PIO: PIOExt> UsbPio<PIO> {
             rx_sm,
             rx,
             pio,
-            state: 0,
+            state: STATE_RESET,
             frame_number: 0,
             sof_timestamp: 0,
         }
@@ -240,9 +256,8 @@ impl<PIO: PIOExt> UsbPio<PIO> {
         unsafe {
             fast_alarm_schedule(self.sof_timestamp);
         }
-        self.state = 2;
+        self.state = STATE_RUNNING;
     }
-
 }
 
 unsafe fn configure_pin(pin: usize, ctrl: u32) {
@@ -271,23 +286,51 @@ pub unsafe fn start() {
     NVIC::unmask(Interrupt::TIMER0_IRQ_0);
 }
 
+/// Abandon all transactions and go back through a bus reset, with the host
+/// ports' power off first if `power_cycle`. Called on the interrupt's core.
+pub unsafe fn restart(iface: &mut UserIface, power_cycle: bool) {
+    NVIC::mask(Interrupt::TIMER0_IRQ_0);
+    dsb();
+    isb();
+    iface.clear();
+    let usb_pio = (*USB_PIO.0.get()).assume_init_mut();
+    usb_pio.frame_number = 0;
+    usb_pio.state = if power_cycle {
+        STATE_POWER_OFF
+    } else {
+        STATE_RESET
+    };
+    fast_alarm_schedule(fast_get_timer().wrapping_add(1_000));
+    NVIC::unmask(Interrupt::TIMER0_IRQ_0);
+}
+
 #[link_section = ".data"]
 #[no_mangle]
 pub unsafe extern "C" fn TIMER0_IRQ_0() {
     let usb_pio = (*USB_PIO.0.get()).assume_init_mut();
     (TIMER0_INTR as *mut u32).write_volatile(1);
     match usb_pio.state {
-        0 => {
+        STATE_RESET => {
             usb_pio.bus_reset(true);
-            fast_alarm_schedule(fast_get_timer().wrapping_add(12_000));
-            usb_pio.state = 1;
+            fast_alarm_schedule(fast_get_timer().wrapping_add(RESET_US));
+            usb_pio.state = STATE_RELEASE;
         }
-        1 => {
+        STATE_RELEASE => {
             usb_pio.bus_reset(false);
             fast_alarm_schedule(fast_get_timer().wrapping_add(1_000));
-            usb_pio.state = 2;
+            usb_pio.state = STATE_RUNNING;
         }
-        2 => {
+        STATE_POWER_OFF => {
+            (SIO_GPIO_OUT_CLR as *mut u32).write_volatile(1 << USB_5V_PIN);
+            fast_alarm_schedule(fast_get_timer().wrapping_add(POWER_OFF_US));
+            usb_pio.state = STATE_POWER_ON;
+        }
+        STATE_POWER_ON => {
+            (SIO_GPIO_OUT_SET as *mut u32).write_volatile(1 << USB_5V_PIN);
+            fast_alarm_schedule(fast_get_timer().wrapping_add(POWER_ON_US));
+            usb_pio.state = STATE_RESET;
+        }
+        STATE_RUNNING => {
             let entry = timing::cycles();
             if usb_pio.frame_number == 0 {
                 usb_pio.sof_timestamp = fast_get_timer();

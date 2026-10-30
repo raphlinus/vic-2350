@@ -17,7 +17,12 @@ const REQ_OUT = 3
 const REQ_DELAY = 4
 
 const STATUS_SUCCESS = 1
+const STATUS_TIMEOUT = 2
 const STATUS_ERROR = 4
+const STATUS_STALL = 5
+
+// Consecutive failed transactions before giving up on a request
+const MAX_RETRIES = 3
 
 const PID_OUT = 0xe1
 const PID_IN = 0x69
@@ -26,6 +31,7 @@ const PID_DATA0 = 0xc3
 const PID_DATA1 = 0x4b
 const PID_ACK = 0xd2
 const PID_NAK = 0x5a
+const PID_STALL = 0x1e
 
 // Must match usblog's Pipe
 struct Pipe {
@@ -38,13 +44,18 @@ struct Pipe {
     timer: u16
     req: u8
     status: u8
-    pad: u16
+    retries: u8
+    pad: u8
 }
 
 // Must match usblog's Iface
 struct Iface {
     request: u32
     response: u32
+    // Pipes retried in the next frame
+    held: u32
+    // Failed transactions, by the RX status; RX_OK is a wrong reply
+    errors: [u32; 3]
     pipes: [Pipe; N_PIPES]
 }
 
@@ -61,9 +72,6 @@ symbol usb_record_data: fn(u32, u32)
 
 static mut usb_rx_buf: [u8; RX_MAX_BYTES]
 
-// Pipes retried in the next frame
-static mut usb_held_pipes: u32
-
 #[link_section = ".ram"]
 fn usb_pipe_token(pid: u32, pipe: *Pipe) {
     push(r4, lr)
@@ -78,9 +86,10 @@ fn usb_pipe_token(pid: u32, pipe: *Pipe) {
     pop(r4, pc)
 }
 
-// Send a token and a data packet, and return whether the device acked.
+// Send a token and a data packet. Returns the handshake's PID, or the RX
+// status if there wasn't a good one.
 #[link_section = ".ram"]
-fn usb_pipe_send(token_pid: u32, data_pid: u32, pipe: *Pipe, len: u32) -> acked: u32 {
+fn usb_pipe_send(token_pid: u32, data_pid: u32, pipe: *Pipe, len: u32) -> reply: u32 {
     push(r4, r5, r6, r7, r8, r9, r10, lr)
     token_pid @r4 = token_pid
     data_pid @r5 = data_pid
@@ -108,29 +117,27 @@ fn usb_pipe_send(token_pid: u32, data_pid: u32, pipe: *Pipe, len: u32) -> acked:
     t @r0 = token_end
     speed @r1 = low_speed
     call usb_record_data(t, speed)
-    acked @r0 = 0
+    reply @r0 = result >> 16
     #(result - 2)
     if #ne goto end
     rx @r1 = &usb_rx_buf as *u8
     b @r2 = *rx
     #(b - SYNC)
     if #ne goto end
-    b @r2 = *(rx + 1)
-    #(b - PID_ACK)
-    if #ne goto end
-    acked = 1
+    reply = *(rx + 1)
 end:
     pop(r4, r5, r6, r7, r8, r9, r10, pc)
 }
 
 // Run the requests made since the last frame, along with the retries from
-// it, one transaction for each.
+// it, one transaction for each. Waiting 16 bit times after a bad packet
+// comes for free, as the transactions after a failure wait for the next frame.
 #[link_section = ".ram"]
 fn usb_handle_requests() {
     push(r4, r5, r6, r7, r8, r9, r10, lr)
     reqs @r0 = call usb_iface_poll()
-    held @r1 = &usb_held_pipes as *u32
-    old @r2 = *held
+    iface @r1 = USB_IFACE
+    old @r2 = iface.held
     reqs @r4 = reqs | old
     held @r9 = 0
     rx @r8 = &usb_rx_buf as *u8
@@ -170,12 +177,12 @@ setup:
         data @r1 = PID_DATA0
         p @r2 = pipe
         n @r3 = 8
-        acked @r0 = call usb_pipe_send(token, data, p, n)
-        acked @r10 = acked
+        reply @r0 = call usb_pipe_send(token, data, p, n)
+        reply @r10 = reply
         speed @r0 = low_speed
         call usb_record_rx(speed)
-        #(acked - 0)
-        if #eq goto hold
+        #(reply - PID_ACK)
+        if #ne goto bad_reply
         toggle @r0 = 1
         pipe.toggle = toggle
         goto success
@@ -189,12 +196,16 @@ out:
 out_pid:
         p @r2 = pipe
         n @r3 = pipe.len
-        acked @r0 = call usb_pipe_send(token, data, p, n)
-        acked @r10 = acked
+        reply @r0 = call usb_pipe_send(token, data, p, n)
+        reply @r10 = reply
         speed @r0 = low_speed
         call usb_record_rx(speed)
-        #(acked - 0)
-        if #eq goto error
+        #(reply - PID_NAK)
+        if #eq goto nak
+        #(reply - PID_STALL)
+        if #eq goto stalled
+        #(reply - PID_ACK)
+        if #ne goto bad_reply
         toggle @r0 = pipe.toggle
         toggle ^= 1
         pipe.toggle = toggle
@@ -245,6 +256,8 @@ copied:
         speed @r0 = low_speed
         call usb_record_rx(speed)
 success:
+        retries @r0 = 0
+        pipe.retries = retries
         status @r0 = STATUS_SUCCESS
         pipe.status = status
         goto respond
@@ -253,12 +266,20 @@ not_data:
         // Whether the receive itself failed
         failed @r2 = result >> 16
         #(failed - 0)
-        if #ne goto in_error
+        if #ne goto in_failed
+        #(result - 2)
+        if #ne goto not_handshake
         #(pid - PID_NAK)
         if #eq goto in_held
-        wrong @r2 = expected ^ (PID_DATA0 ^ PID_DATA1)
+        #(pid - PID_STALL)
+        if #eq goto in_stalled
+        goto in_failed
+not_handshake:
+        #(result - 4)
+        if #lo goto in_failed
+        wrong @r3 = expected ^ (PID_DATA0 ^ PID_DATA1)
         #(pid - wrong)
-        if #ne goto in_error
+        if #ne goto in_failed
         // Our last ACK got lost: ack again, and retry the transaction
         ack @r0 = PID_ACK
         speed @r1 = low_speed
@@ -266,17 +287,66 @@ not_data:
 in_held:
         speed @r0 = low_speed
         call usb_record_rx(speed)
+nak:
+        // Timer counts down the frames left, with 0 for no limit.
+        retries @r0 = 0
+        pipe.retries = retries
+        timer @r0 = pipe.timer
+        #(timer - 0)
+        if #eq goto hold
+        timer -= 1
+        pipe.timer = timer
+        #(timer - 0)
+        if #ne goto hold
+        status @r0 = STATUS_TIMEOUT
+        pipe.status = status
+        goto respond
 hold:
         bit @r0 = 1
         bit <<= pipe_ix
         held |= bit
         goto next
 
-in_error:
+in_stalled:
         speed @r0 = low_speed
         call usb_record_rx(speed)
-error:
+stalled:
+        retries @r0 = 0
+        pipe.retries = retries
+        status @r0 = STATUS_STALL
+        pipe.status = status
+        goto respond
+
+in_failed:
+        reply @r10 = failed
+        speed @r0 = low_speed
+        call usb_record_rx(speed)
+        goto failed
+bad_reply:
+        // A PID where a status would be: the wrong handshake
+        #(reply - RX_TIMED_OUT)
+        if #ls goto failed
+        reply = RX_OK
+failed:
+        iface @r0 = USB_IFACE
+        errors @r0 = &iface.errors as *u32
+        count @r1 = *(errors + reply * 4)
+        count += 1
+        *(errors + reply * 4) = count
+        held |= reqs
+        reqs = 0
+        retries @r0 = pipe.retries
+        retries += 1
+        pipe.retries = retries
+        #(retries - MAX_RETRIES)
+        if #lo goto hold
+        retries = 0
+        pipe.retries = retries
         status @r0 = STATUS_ERROR
+        #(reply - RX_TIMED_OUT)
+        if #ne goto give_up
+        status = STATUS_TIMEOUT
+give_up:
         pipe.status = status
 respond:
         ix @r0 = pipe_ix
@@ -285,7 +355,7 @@ next:
         goto loop
     }
 done:
-    p @r0 = &usb_held_pipes as *u32
-    *p = held
+    iface @r0 = USB_IFACE
+    iface.held = held
     pop(r4, r5, r6, r7, r8, r9, r10, pc)
 }
