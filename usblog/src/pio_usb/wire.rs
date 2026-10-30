@@ -41,6 +41,8 @@ pub const GET_DESCRIPTOR: u8 = 6;
 
 pub const SET_CONFIGURATION: u8 = 9;
 
+pub const SET_PROTOCOL: u8 = 0x0b;
+
 // features
 
 pub const PORT_RESET: u16 = 4;
@@ -51,7 +53,23 @@ pub const PORT_POWER: u16 = 8;
 
 pub const DEVICE_DESCRIPTOR: u8 = 1;
 
+pub const CONFIG_DESCRIPTOR: u8 = 2;
+
+pub const INTERFACE_DESCRIPTOR: u8 = 4;
+
+pub const ENDPOINT_DESCRIPTOR: u8 = 5;
+
 pub const HUB_DESCRIPTOR: u8 = 0x29;
+
+// interfaces
+
+pub const HID_CLASS: u8 = 3;
+
+pub const BOOT_SUBCLASS: u8 = 1;
+
+pub const KEYBOARD_PROTOCOL: u8 = 1;
+
+pub const MOUSE_PROTOCOL: u8 = 2;
 
 pub const fn pid_data(toggle: u8) -> u8 {
     if toggle == 0 {

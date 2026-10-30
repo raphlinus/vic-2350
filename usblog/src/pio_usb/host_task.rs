@@ -11,13 +11,18 @@
 //! restarts the bus. The hub's status change reports are level triggered,
 //! so a port can always be gone back to.
 
-use crate::pio_usb::{
-    iface::{PipeGuard, Request, Status, UserIface},
-    restart,
-    wire::{
-        CLASS_REQUEST, CLEAR_FEATURE, DEVICE_DESCRIPTOR, DEVICE_TO_HOST, GET_DESCRIPTOR,
-        GET_STATUS, HOST_TO_DEVICE, HUB_DESCRIPTOR, PORT_POWER, PORT_RESET, RECIPIENT_OTHER,
-        SET_ADDRESS, SET_CONFIGURATION, SET_FEATURE,
+use crate::{
+    mouse,
+    pio_usb::{
+        iface::{PipeGuard, Request, Status, UserIface},
+        restart,
+        wire::{
+            BOOT_SUBCLASS, CLASS_REQUEST, CLEAR_FEATURE, CONFIG_DESCRIPTOR, DEVICE_DESCRIPTOR,
+            DEVICE_TO_HOST, ENDPOINT_DESCRIPTOR, GET_DESCRIPTOR, GET_STATUS, HID_CLASS,
+            HOST_TO_DEVICE, HUB_DESCRIPTOR, INTERFACE_DESCRIPTOR, KEYBOARD_PROTOCOL,
+            MOUSE_PROTOCOL, PORT_POWER, PORT_RESET, RECIPIENT_INTERFACE, RECIPIENT_OTHER,
+            SET_ADDRESS, SET_CONFIGURATION, SET_FEATURE, SET_PROTOCOL,
+        },
     },
 };
 
@@ -155,7 +160,9 @@ enum CtrlState {
     GotDesc,
     Address,
     AddressDelay,
+    GotConfig,
     Configured,
+    ProtocolSet,
 }
 
 #[derive(Clone, Copy)]
@@ -163,6 +170,23 @@ struct Port {
     phase: PortPhase,
     attempts: u8,
     low_speed: bool,
+    interface: Interface,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Kind {
+    Mouse,
+    Keyboard,
+    Other,
+}
+
+/// The interface of a device to use.
+#[derive(Clone, Copy, Debug)]
+struct Interface {
+    kind: Kind,
+    number: u8,
+    /// Its interrupt IN endpoint.
+    ep: u8,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -212,6 +236,62 @@ impl SetupPacket {
 
     pub fn length(&self) -> u16 {
         u16::from_le_bytes(self.raw[6..8].try_into().unwrap())
+    }
+}
+
+impl Interface {
+    /// What's assumed of a device with no HID boot interface.
+    const fn new() -> Self {
+        Self {
+            kind: Kind::Other,
+            number: 0,
+            ep: 1,
+        }
+    }
+
+    /// Pick the interface to use from a configuration descriptor, which may
+    /// be cut short. A mouse is preferred, so a receiver with both on one
+    /// address works as a mouse, and it's a boot one so its reports don't
+    /// need parsing against a report descriptor.
+    fn parse(config: &[u8]) -> Self {
+        let mut best = Self::new();
+        let mut current = Self::new();
+        let mut rest = config;
+        while let &[len, ty, ..] = rest {
+            let Some((desc, tail)) = rest.split_at_checked(len as usize) else {
+                break;
+            };
+            if len < 2 {
+                break;
+            }
+            rest = tail;
+            match (ty, desc) {
+                (INTERFACE_DESCRIPTOR, &[_, _, number, _, _, class, subclass, protocol, ..]) => {
+                    let kind = match (class, subclass, protocol) {
+                        (HID_CLASS, BOOT_SUBCLASS, MOUSE_PROTOCOL) => Kind::Mouse,
+                        (HID_CLASS, BOOT_SUBCLASS, KEYBOARD_PROTOCOL) => Kind::Keyboard,
+                        _ => Kind::Other,
+                    };
+                    current = Self { kind, number, ep: 0 };
+                }
+                (ENDPOINT_DESCRIPTOR, &[_, _, addr, attributes, ..]) => {
+                    // The first interrupt IN endpoint of a boot interface
+                    if addr & 0x80 != 0 && attributes & 3 == 3 && current.ep == 0 {
+                        current.ep = addr & 0xf;
+                        let better = match (current.kind, best.kind) {
+                            (Kind::Other, _) | (_, Kind::Mouse) => false,
+                            (Kind::Keyboard, Kind::Keyboard) => false,
+                            _ => true,
+                        };
+                        if better {
+                            best = current;
+                        }
+                    }
+                }
+                _ => (),
+            }
+        }
+        best
     }
 }
 
@@ -576,9 +656,11 @@ impl UsbTask {
             TickResult::Send => return self.send(CTRL_PIPE),
             TickResult::Error => {
                 match self.ctrl {
-                    CtrlState::GotDesc | CtrlState::Address | CtrlState::Configured => {
-                        self.enum_failed();
-                    }
+                    CtrlState::GotDesc
+                    | CtrlState::Address
+                    | CtrlState::GotConfig
+                    | CtrlState::Configured
+                    | CtrlState::ProtocolSet => self.enum_failed(),
                     _ => {
                         console!("hub failed in {:?}", self.ctrl);
                         self.bus_restarts += 1;
@@ -625,10 +707,48 @@ impl UsbTask {
             }
             CtrlState::Address => self.ctrl_delay(ADDRESS_RECOVERY, CtrlState::AddressDelay),
             CtrlState::AddressDelay => {
-                let setup = SetupPacket::new(HOST_TO_DEVICE, SET_CONFIGURATION, 1, 0, 0);
+                // As much of it as fits, the start being what matters.
+                let setup = SetupPacket::new(
+                    DEVICE_TO_HOST,
+                    GET_DESCRIPTOR,
+                    (CONFIG_DESCRIPTOR as u16) << 8,
+                    0,
+                    64,
+                );
+                self.ctrl_device(self.port as u8 + 1, setup, CtrlState::GotConfig);
+            }
+            CtrlState::GotConfig => {
+                let transfer = &self.transfers[CTRL_PIPE];
+                let config = &transfer.buf[..transfer.actual_len as usize];
+                trace!("config desc {config:02x?}");
+                if config.len() < 9 || config[1] != CONFIG_DESCRIPTOR {
+                    return self.enum_failed();
+                }
+                let interface = Interface::parse(config);
+                let value = config[5] as u16;
+                trace!("port {} using {interface:?}", self.port);
+                self.ports[self.port as usize].interface = interface;
+                let setup = SetupPacket::new(HOST_TO_DEVICE, SET_CONFIGURATION, value, 0, 0);
                 self.ctrl_device(self.port as u8 + 1, setup, CtrlState::Configured);
             }
             CtrlState::Configured => {
+                let interface = self.ports[self.port as usize].interface;
+                if interface.kind == Kind::Mouse {
+                    // Devices start out in report protocol.
+                    let setup = SetupPacket::new(
+                        HOST_TO_DEVICE | CLASS_REQUEST | RECIPIENT_INTERFACE,
+                        SET_PROTOCOL,
+                        0,
+                        interface.number as u16,
+                        0,
+                    );
+                    self.ctrl_device(self.port as u8 + 1, setup, CtrlState::ProtocolSet);
+                } else {
+                    self.ctrl = CtrlState::Idle;
+                    self.start_device();
+                }
+            }
+            CtrlState::ProtocolSet => {
                 self.ctrl = CtrlState::Idle;
                 self.start_device();
             }
@@ -694,7 +814,7 @@ impl UsbTask {
         pipe.low_speed = self.ports[port].low_speed;
         let transfer = &mut self.transfers[ix];
         transfer.pipe = Some(pipe);
-        transfer.poll_interrupt(1, 8);
+        transfer.poll_interrupt(self.ports[port].interface.ep, 8);
         self.send(ix);
     }
 
@@ -703,7 +823,12 @@ impl UsbTask {
         match res {
             TickResult::Done => {
                 let transfer = &self.transfers[ix];
-                trace!("report {:02x?}", &transfer.buf[0..transfer.actual_len as usize]);
+                let report = &transfer.buf[0..transfer.actual_len as usize];
+                if self.ports[port].interface.kind == Kind::Mouse {
+                    mouse::report(report);
+                } else {
+                    trace!("report {report:02x?}");
+                }
                 if self.ports[port].phase == PortPhase::Running {
                     self.soak.reported = true;
                 }
@@ -797,6 +922,7 @@ impl Port {
             phase: PortPhase::Empty,
             attempts: 0,
             low_speed: false,
+            interface: Interface::new(),
         }
     }
 }

@@ -50,6 +50,41 @@ fail:
     pop(r4, r5, r6, pc)
 }
 
+// Append a solid rectangle. x0y0 and x1y1 have x in the low half and y in
+// the high half, and the rectangle mustn't be empty. Returns 0 if there's no
+// room.
+fn dl_solid(list: *DisplayList, x0y0: u32, x1y1: u32, color: u32) -> obj: *u32 {
+    push(r4, r5, r6, lr)
+    a @r4 = x0y0
+    b @r5 = x1y1
+    c @r6 = color
+    sz @r1 = size(Solid)
+    obj @r0 = call dl_alloc(list, sz)
+    if obj == 0 goto done
+    vt @r3 = &solid_vtable
+    *obj = (vt, a, b, c)
+done:
+    pop(r4, r5, r6, pc)
+}
+
+// Append a sprite (see render.sy), with stride on the stack. Otherwise as
+// dl_solid.
+fn dl_sprite(list: *DisplayList, x0y0: u32, x1y1: u32, pixels: *u16) -> obj: *u32 {
+    stride @r12 = *(sp as *u32)
+    push(r4, r5, r6, r7, r8, lr)
+    a @r4 = x0y0
+    b @r5 = x1y1
+    c @r6 = pixels
+    d @r7 = stride
+    sz @r1 = size(Sprite)
+    obj @r0 = call dl_alloc(list, sz)
+    if obj == 0 goto done
+    vt @r3 = &sprite_vtable
+    *obj = (vt, a, b, c, d)
+done:
+    pop(r4, r5, r6, r7, r8, pc)
+}
+
 // Sort list's heads by y0, keeping draw order among equal y0, as the
 // renderer requires. Insertion sort, good when lists are short.
 fn dl_finish(list: *DisplayList) {

@@ -49,6 +49,7 @@ macro_rules! console {
     }};
 }
 
+pub mod mouse;
 mod pio_usb;
 
 pub const LOG_SIZE: usize = 4096;

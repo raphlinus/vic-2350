@@ -300,3 +300,55 @@ static solid_vtable = DisplayVtable {
     start: 0,
     end: 0,
 }
+
+// sprite rendering
+
+// A rectangle of RGB565 pixels, drawn over what's below it, with 0 being
+// transparent; use 0x0001 for black. The pixels are read from the render
+// interrupt, so they belong in RAM. The object's rectangle has to be on the
+// screen, and pixels is the one for its top left corner: to clip, make the
+// rectangle smaller and move pixels along. stride is the bytes from a row
+// to the next.
+struct Sprite {
+    vtable: *DisplayVtable
+    x0: u16
+    y0: u16
+    x1: u16
+    y1: u16
+    pixels: *u16
+    stride: u32
+}
+
+// 6 cycles per pixel, but for the stall of a store after a store.
+#[link_section = ".ram"]
+fn sprite_render(self: *Sprite, y: u32, x1x0: u32, buf: *u16) {
+    y0 @r12 = self.y0
+    row @r1 = y - y0
+    stride @r12 = self.stride
+    src @r0 = self.pixels
+    row *= stride
+    x0 @r12 = x1x0[0..16]
+    x1 @r2 = x1x0[16..32]
+    src += row
+    count @r2 = x1 - x0
+    dst @r3 = buf + x0 * 2
+    loop {
+        px @r1 = *src++
+        // fills the load's delay slot
+        dst += 2
+        #(px - 0)
+        if #ne {
+            *(dst - 2) = px
+        }
+        #(count -= 1)
+        if #ne goto loop
+    }
+    bx lr
+}
+
+#[link_section = ".ram"]
+static sprite_vtable = DisplayVtable {
+    render: sprite_render,
+    start: 0,
+    end: 0,
+}
