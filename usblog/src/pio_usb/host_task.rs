@@ -42,6 +42,11 @@ const NAK_FRAMES: u16 = 1000;
 /// As much of a descriptor as is kept. A mouse's report descriptor can run
 /// to a couple of hundred bytes.
 const TRANSFER_BUF: usize = 256;
+/// The most to ask of a descriptor. There are devices that only look at the
+/// low byte of the length, and answer 256 with nothing.
+const MAX_REQUEST: u16 = 255;
+/// Interfaces of a device to consider.
+const MAX_INTERFACES: usize = 4;
 /// Resets of a port before giving up on what's attached to it.
 const ENUM_ATTEMPTS: u8 = 3;
 /// Checks of a port that's slow to finish its reset.
@@ -178,11 +183,19 @@ struct Port {
     interface: Interface,
     /// How its reports are laid out, if it's a mouse.
     layout: mouse::Layout,
+    /// Interfaces to try, best first, and how far through them we are.
+    candidates: [Interface; MAX_INTERFACES],
+    n_candidates: u8,
+    next_candidate: u8,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Kind {
+    /// A boot mouse.
     Mouse,
+    /// HID without boot protocol, which may turn out to be a mouse.
+    Hid,
+    /// A boot keyboard.
     Keyboard,
     Other,
 }
@@ -259,12 +272,12 @@ impl Interface {
         }
     }
 
-    /// Pick the interface to use from a configuration descriptor, which may
-    /// be cut short. A mouse is preferred, so a receiver with both on one
-    /// address works as a mouse, and it's a boot one so its reports don't
-    /// need parsing against a report descriptor.
-    fn parse(config: &[u8]) -> Self {
-        let mut best = Self::new();
+    /// Find the HID interfaces in a configuration descriptor, which may be
+    /// cut short, each with its interrupt IN endpoint. Mice go first, so a
+    /// receiver with both on one address works as a mouse.
+    fn parse(config: &[u8]) -> ([Self; MAX_INTERFACES], u8) {
+        let mut found = [Self::new(); MAX_INTERFACES];
+        let mut n = 0;
         let mut current = Self::new();
         let mut rest = config;
         while let &[len, ty, ..] = rest {
@@ -280,6 +293,7 @@ impl Interface {
                     let kind = match (class, subclass, protocol) {
                         (HID_CLASS, BOOT_SUBCLASS, MOUSE_PROTOCOL) => Kind::Mouse,
                         (HID_CLASS, BOOT_SUBCLASS, KEYBOARD_PROTOCOL) => Kind::Keyboard,
+                        (HID_CLASS, ..) => Kind::Hid,
                         _ => Kind::Other,
                     };
                     current = Self {
@@ -293,23 +307,31 @@ impl Interface {
                     current.report_len = u16::from_le_bytes([lo, hi]);
                 }
                 (ENDPOINT_DESCRIPTOR, &[_, _, addr, attributes, ..]) => {
-                    // The first interrupt IN endpoint of a boot interface
                     if addr & 0x80 != 0 && attributes & 3 == 3 && current.ep == 0 {
                         current.ep = addr & 0xf;
-                        let better = match (current.kind, best.kind) {
-                            (Kind::Other, _) | (_, Kind::Mouse) => false,
-                            (Kind::Keyboard, Kind::Keyboard) => false,
-                            _ => true,
-                        };
-                        if better {
-                            best = current;
+                        if current.kind != Kind::Other && (n as usize) < MAX_INTERFACES {
+                            found[n as usize] = current;
+                            n += 1;
                         }
                     }
                 }
                 _ => (),
             }
         }
-        best
+        let rank = |i: &Self| match i.kind {
+            Kind::Mouse => 0,
+            Kind::Hid => 1,
+            _ => 2,
+        };
+        // Insertion sort, keeping the order within a kind
+        for i in 1..n as usize {
+            let mut j = i;
+            while j > 0 && rank(&found[j - 1]) > rank(&found[j]) {
+                found.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+        (found, n)
     }
 }
 
@@ -678,8 +700,9 @@ impl UsbTask {
                     | CtrlState::Address
                     | CtrlState::GotConfig
                     | CtrlState::Configured
-                    | CtrlState::GotReportDesc
                     | CtrlState::ProtocolSet => self.enum_failed(),
+                    // Not every interface has to answer this.
+                    CtrlState::GotReportDesc => self.no_layout(),
                     _ => {
                         console!("hub failed in {:?}", self.ctrl);
                         self.bus_restarts += 1;
@@ -726,13 +749,13 @@ impl UsbTask {
             }
             CtrlState::Address => self.ctrl_delay(ADDRESS_RECOVERY, CtrlState::AddressDelay),
             CtrlState::AddressDelay => {
-                // As much of it as fits, the start being what matters.
+                // As much of it as fits
                 let setup = SetupPacket::new(
                     DEVICE_TO_HOST,
                     GET_DESCRIPTOR,
                     (CONFIG_DESCRIPTOR as u16) << 8,
                     0,
-                    64,
+                    MAX_REQUEST,
                 );
                 self.ctrl_device(self.port as u8 + 1, setup, CtrlState::GotConfig);
             }
@@ -743,53 +766,31 @@ impl UsbTask {
                 if config.len() < 9 || config[1] != CONFIG_DESCRIPTOR {
                     return self.enum_failed();
                 }
-                let interface = Interface::parse(config);
+                let (candidates, n_candidates) = Interface::parse(config);
                 let value = config[5] as u16;
-                trace!("port {} using {interface:?}", self.port);
-                self.ports[self.port as usize].interface = interface;
+                trace!("port {} has {:?}", self.port, &candidates[..n_candidates as usize]);
+                let port = &mut self.ports[self.port as usize];
+                port.candidates = candidates;
+                port.n_candidates = n_candidates;
+                port.next_candidate = 0;
                 let setup = SetupPacket::new(HOST_TO_DEVICE, SET_CONFIGURATION, value, 0, 0);
                 self.ctrl_device(self.port as u8 + 1, setup, CtrlState::Configured);
             }
-            CtrlState::Configured => {
-                let interface = self.ports[self.port as usize].interface;
-                if interface.kind == Kind::Mouse {
-                    // Devices start out in report protocol, which is what
-                    // this describes. Boot protocol isn't relied on, as
-                    // there are mice that accept it and carry on as before.
-                    let setup = SetupPacket::new(
-                        DEVICE_TO_HOST | RECIPIENT_INTERFACE,
-                        GET_DESCRIPTOR,
-                        (REPORT_DESCRIPTOR as u16) << 8,
-                        interface.number as u16,
-                        interface.report_len.min(TRANSFER_BUF as u16),
-                    );
-                    self.ctrl_device(self.port as u8 + 1, setup, CtrlState::GotReportDesc);
-                } else {
-                    self.ctrl = CtrlState::Idle;
-                    self.start_device();
-                }
-            }
+            CtrlState::Configured => self.next_interface(),
             CtrlState::GotReportDesc => {
                 let transfer = &self.transfers[CTRL_PIPE];
                 let desc = &transfer.buf[..transfer.actual_len as usize];
                 trace!("report desc {desc:02x?}");
                 let layout = mouse::Layout::parse(desc);
                 trace!("mouse layout {layout:?}");
-                let port = &mut self.ports[self.port as usize];
                 if let Some(layout) = layout {
+                    let port = &mut self.ports[self.port as usize];
                     port.layout = layout;
+                    port.interface.kind = Kind::Mouse;
                     self.ctrl = CtrlState::Idle;
                     self.start_device();
                 } else {
-                    port.layout = mouse::Layout::BOOT;
-                    let setup = SetupPacket::new(
-                        HOST_TO_DEVICE | CLASS_REQUEST | RECIPIENT_INTERFACE,
-                        SET_PROTOCOL,
-                        0,
-                        port.interface.number as u16,
-                        0,
-                    );
-                    self.ctrl_device(self.port as u8 + 1, setup, CtrlState::ProtocolSet);
+                    self.no_layout();
                 }
             }
             CtrlState::ProtocolSet => {
@@ -797,6 +798,53 @@ impl UsbTask {
                 self.start_device();
             }
         }
+    }
+
+    /// Try the next interface of the device just configured. A mouse is
+    /// found by its report descriptor: devices start out in report protocol,
+    /// which is what that describes. Boot protocol isn't relied on, as there
+    /// are mice that accept it and carry on as before.
+    fn next_interface(&mut self) {
+        let port = &mut self.ports[self.port as usize];
+        let ix = port.next_candidate;
+        let interface = if ix < port.n_candidates {
+            port.next_candidate += 1;
+            port.candidates[ix as usize]
+        } else {
+            Interface::new()
+        };
+        port.interface = interface;
+        if matches!(interface.kind, Kind::Mouse | Kind::Hid) {
+            let setup = SetupPacket::new(
+                DEVICE_TO_HOST | RECIPIENT_INTERFACE,
+                GET_DESCRIPTOR,
+                (REPORT_DESCRIPTOR as u16) << 8,
+                interface.number as u16,
+                interface.report_len.min(MAX_REQUEST),
+            );
+            self.ctrl_device(self.port as u8 + 1, setup, CtrlState::GotReportDesc);
+        } else {
+            self.ctrl = CtrlState::Idle;
+            self.start_device();
+        }
+    }
+
+    /// There's no using the report descriptor of the current interface. A
+    /// boot mouse can go by the book, and others aren't mice.
+    fn no_layout(&mut self) {
+        let port = &mut self.ports[self.port as usize];
+        if port.interface.kind != Kind::Mouse {
+            return self.next_interface();
+        }
+        port.layout = mouse::Layout::BOOT;
+        let setup = SetupPacket::new(
+            HOST_TO_DEVICE | CLASS_REQUEST | RECIPIENT_INTERFACE,
+            SET_PROTOCOL,
+            0,
+            port.interface.number as u16,
+            0,
+        );
+        self.ctrl_device(self.port as u8 + 1, setup, CtrlState::ProtocolSet);
     }
 
     fn got_port_status(&mut self) {
@@ -968,6 +1016,9 @@ impl Port {
             low_speed: false,
             interface: Interface::new(),
             layout: mouse::Layout::BOOT,
+            candidates: [Interface::new(); MAX_INTERFACES],
+            n_candidates: 0,
+            next_candidate: 0,
         }
     }
 }

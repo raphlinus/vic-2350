@@ -14,9 +14,11 @@
 //! starting core 1; the interrupt is at the lowest priority, and setting
 //! its pending bit plays the role of `sev`. log.sy's log_flush does both.
 //!
-//! The critical-section implementation only masks the USB interrupt on
-//! the current core, which is enough because all Rust code after
-//! `usb_init` runs on the one core that handles USB.
+//! An app in Rust links this crate and runs on core 0, while the USB code
+//! here runs on core 1. The critical-section implementation only masks the
+//! USB interrupt on the current core, so critical sections, and anything
+//! built on them, are only for core 1. What an app calls here, like
+//! `mouse::read`, has to be safe from either core.
 //!
 //! Opening the port at 1200 baud and closing it (dropping DTR) reboots
 //! into BOOTSEL, so picotool can load a new image without a button press.
@@ -179,9 +181,9 @@ struct Usb {
     serial: SerialPort<'static, UsbBus>,
 }
 
-/// Rust code runs in `usb_init` (before interrupts are enabled) and then
-/// only on the core handling USB, so a critical section only needs to mask
-/// the USB interrupt there. Masking with BASEPRI rather than PRIMASK keeps
+/// The Rust code using critical sections runs in `usb_init` (before
+/// interrupts are enabled) and then only on the core handling USB, so a
+/// critical section only needs to mask the USB interrupt there. Masking with BASEPRI rather than PRIMASK keeps
 /// higher priority interrupts, like the DVI DMA one if USB is on core 0,
 /// on time.
 struct BasepriCs;
@@ -369,8 +371,41 @@ unsafe fn drain_ring(serial: &mut SerialPort<'static, UsbBus>, log: *mut UsbLog)
     }
 }
 
+/// `USBLOG`, for a panic on core 0, which owns it. The interrupts that
+/// write to it have to be off.
+struct Core0Log;
+
+impl core::fmt::Write for Core0Log {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        unsafe {
+            let log = addr_of_mut!(USBLOG);
+            let tail = addr_of!((*log).tail).read_volatile();
+            let mut head = (*log).head;
+            for b in s.bytes() {
+                if head.wrapping_sub(tail) as usize == LOG_SIZE {
+                    break;
+                }
+                (*log).buf[head as usize & (LOG_SIZE - 1)] = b;
+                head = head.wrapping_add(1);
+            }
+            dmb();
+            addr_of_mut!((*log).head).write_volatile(head);
+        }
+        Ok(())
+    }
+}
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    console!("{info}");
+    use core::fmt::Write;
+    // The console has one producer, core 1, which is left to drain the logs.
+    const SIO_CPUID: *const u32 = 0xd000_0000 as *const u32;
+    if unsafe { SIO_CPUID.read_volatile() } == 0 {
+        cortex_m::interrupt::disable();
+        let _ = writeln!(Core0Log, "{info}");
+        cortex_m::asm::sev();
+    } else {
+        console!("{info}");
+    }
     loop {}
 }
