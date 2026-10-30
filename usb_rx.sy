@@ -1,0 +1,127 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+use "usb_crc.sy"
+use "usb_tx.sy"
+
+// Receiving USB packets, with PIO state machine 1. Timing-critical, and
+// called from the USB host's interrupt, so everything here is in RAM.
+
+const TIMERAWL = 0x400b0028
+const SM_ENABLE1 = 1 << 1
+const SM_RESTART1 = 1 << 5
+const FSTAT_RXEMPTY1 = 1 << 9
+const IRQ_RX_EOP = 1 << 1
+
+// Waiting for a byte, in microseconds
+const RX_TIMEOUT_FULL = 3
+const RX_TIMEOUT_LOW = 16
+
+// No more than MAX_BUF in usblog; bytes past this are dropped
+const RX_MAX_BYTES = 1024
+
+// The running CRC16 after a data packet's payload and CRC field, when the
+// packet is intact
+const CRC16_RESIDUAL = 0xb001
+
+const RX_OK = 0
+const RX_CRC_MISMATCH = 1
+const RX_TIMED_OUT = 2
+
+// Receive a packet into buf, including its SYNC and PID. Returns the
+// number of bytes in the low half and the status in the high half.
+#[link_section = ".ram"]
+fn usb_rx_packet(buf: *u8, low_speed: u32) -> result: u32 {
+    // Start RX first: the device can reply very soon after TX ends.
+    pio @r2 = peripherals.PIO0
+    // wait 1 pin 0 [7]
+    instr @r3 = 0x27a0
+    pio.INSTR_MEM9 = instr
+    // jmp start
+    instr @r3 = 0x0009
+    pio.SM1_INSTR = instr
+    // mov osr, !null
+    instr @r3 = 0xa0eb
+    pio.SM1_INSTR = instr
+    set @r3 = PIO_CTRL_SET as *u32
+    enable @r12 = SM_ENABLE1
+    *set = enable
+    push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
+    cyccnt @r5 = DWT_CYCCNT as *u32
+    last @r6 = *cyccnt
+    stamps @r3 = USB_STAMPS
+    stamps.rx_start = last
+    timeout @r10 = RX_TIMEOUT_FULL
+    if low_speed == 0 goto full_speed
+    timeout = RX_TIMEOUT_LOW
+full_speed:
+    ix @r1 = 0
+    crc @r3 = 0xffff
+    tbl @r4 = &crc16_tbl
+    max @r7 = 0
+    timer @r8 = TIMERAWL as *u32
+    byte_time @r9 = *timer
+    loop {
+        now @r12 = *cyccnt
+        d @r11 = now - last
+        last = now
+        #(d - max)
+        if #hi {
+            max = d
+        }
+        // Before draining, so that the last bytes are seen after EOP
+        irq @lr = pio.IRQ
+        loop {
+            st @r12 = pio.FSTAT
+            #(st & FSTAT_RXEMPTY1)
+            if #ne goto break
+            data @r12 = pio.RXF1
+            byte_time = *timer
+            b @r12 = data >> 24
+            #(ix - RX_MAX_BYTES)
+            if #hs goto loop
+            *(buf + ix) = b
+            ix += 1
+            // SYNC and the PID aren't in the CRC
+            #(ix - 3)
+            if #lo goto loop
+            idx @r11 = crc ^ b
+            idx = idx[0..8]
+            entry @r11 = *(tbl + idx * 2)
+            crc = entry ^ (crc >> 8)
+            goto loop
+        }
+        status @r12 = RX_OK
+        #(irq - 0)
+        if #ne goto done
+        ts @r11 = *timer
+        ts -= byte_time
+        status = RX_TIMED_OUT
+        #(ts - timeout)
+        if #lo goto loop
+        goto timed_out
+    }
+done:
+    stamps @r11 = USB_STAMPS
+    stamps.rx_eop = last
+timed_out:
+    clr @r11 = PIO_CTRL_CLR as *u32
+    enable @lr = SM_ENABLE1
+    *clr = enable
+    set @r11 = PIO_CTRL_SET as *u32
+    restart @lr = SM_RESTART1
+    *set = restart
+    eop @lr = IRQ_RX_EOP
+    pio.IRQ = eop
+    stamps @r11 = USB_STAMPS
+    stamps.rx_max_poll = max
+    #(ix - 4)
+    if #lo goto end
+    expected @r2 = CRC16_RESIDUAL
+    #(crc - expected)
+    if #eq goto end
+    status = RX_CRC_MISMATCH
+end:
+    result @r0 = ix | (status << 16)
+    pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
+}

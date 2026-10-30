@@ -125,20 +125,30 @@ unsafe fn fast_alarm_schedule(timestamp: u32) {
     }
 }
 
-/// Must match usb_tx.sy's TxStamps.
+/// Must match usb_tx.sy's Stamps.
 #[repr(C)]
-struct TxStamps {
-    start: u32,
-    idle: u32,
+struct Stamps {
+    tx_start: u32,
+    tx_idle: u32,
+    rx_start: u32,
+    rx_eop: u32,
+    rx_max_poll: u32,
 }
 
 #[no_mangle]
-static mut USB_TX_STAMPS: TxStamps = TxStamps { start: 0, idle: 0 };
+static mut USB_STAMPS: Stamps = Stamps {
+    tx_start: 0,
+    tx_idle: 0,
+    rx_start: 0,
+    rx_eop: 0,
+    rx_max_poll: 0,
+};
 
 extern "C" {
     fn usb_tx_handshake(pid: u32, low_speed: u32);
     fn usb_tx_token(pid: u32, data: u32, low_speed: u32);
     fn usb_tx_data(pid: u32, data: *const u8, len: u32, crc_speed: u32);
+    fn usb_rx_packet(buf: *mut u8, low_speed: u32) -> u32;
 }
 
 #[inline(always)]
@@ -150,12 +160,12 @@ unsafe fn tx_token(pid: u8, addr: u8, ep_num: u8, low_speed: bool) {
 /// Send a data packet, recording the time since the token.
 #[inline(always)]
 unsafe fn tx_data(pid: u8, data: &[u8], crc: u16, low_speed: bool) {
-    let token_end = USB_TX_STAMPS.idle;
+    let token_end = USB_STAMPS.tx_idle;
     let crc_speed = crc as u32 | (low_speed as u32) << 16;
     usb_tx_data(pid as u32, data.as_ptr(), data.len() as u32, crc_speed);
     timing::record(
         timing::TOKEN_TO_DATA + low_speed as usize,
-        USB_TX_STAMPS.start.wrapping_sub(token_end),
+        USB_STAMPS.tx_start.wrapping_sub(token_end),
     );
 }
 
@@ -176,10 +186,6 @@ pub fn now_us() -> u32 {
 }
 
 const TX_IDLE_ADDRESS: u32 = 4;
-
-/// The running CRC16 after a data packet's payload and CRC field, when
-/// the packet is intact.
-const CRC16_RESIDUAL: u16 = 0xb001;
 
 // Clock dividers for clk_sys at 144 MHz. TX runs at 4 cycles per bit and RX
 // at 12.
@@ -204,10 +210,6 @@ struct UsbPio<PIO: PIOExt> {
     sof_timestamp: u32,
     int_iface: IntIface,
     held_pipes: u32,
-    // Cycle stamps, for timing
-    rx_start: u32,
-    rx_eop: u32,
-    rx_max_poll: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -265,9 +267,6 @@ impl<PIO: PIOExt> UsbPio<PIO> {
             sof_timestamp: 0,
             int_iface: IntIface::default(),
             held_pipes: 0,
-            rx_start: 0,
-            rx_eop: 0,
-            rx_max_poll: 0,
         }
     }
 
@@ -276,56 +275,13 @@ impl<PIO: PIOExt> UsbPio<PIO> {
     /// On `Ok` result, the received packet is in the buffer, with `buf_ix` equal to the length.
     #[link_section = ".data"]
     fn rx_packet(&mut self, low_speed: bool) -> RxResult {
-        self.prepare_rx();
-        let timeout = if low_speed {
-            TIMEOUT_DELAY_US_LOW_SPEED
-        } else {
-            TIMEOUT_DELAY_US
-        };
-        let mut last_timestamp = fast_get_timer();
-        let mut ix = 0;
-        let mut result = RxResult::Ok;
-        let mut crc = 0xffff;
-        let mut last_poll = timing::cycles();
-        let mut max_poll = 0;
-        loop {
-            let now = timing::cycles();
-            max_poll = max_poll.max(now.wrapping_sub(last_poll));
-            last_poll = now;
-            let irq = self.pio.get_irq_raw();
-            let ix_start = ix;
-            while let Some(data) = self.rx.read() {
-                let byte = (data >> 24) as u8;
-                self.buf[ix] = byte;
-                if ix >= 2 {
-                    crc = update_crc_16(crc, byte);
-                }
-                ix += 1;
-            }
-            if irq != 0 {
-                self.rx_eop = now;
-                break;
-            }
-            let timestamp = fast_get_timer();
-            if ix > ix_start {
-                last_timestamp = timestamp;
-            } else if timestamp.wrapping_sub(last_timestamp) >= timeout {
-                result = RxResult::Timeout;
-                break;
-            }
+        let r = unsafe { usb_rx_packet(self.buf.as_mut_ptr(), low_speed as u32) };
+        self.buf_ix = (r & 0xffff) as usize;
+        match r >> 16 {
+            0 => RxResult::Ok,
+            1 => RxResult::CrcMismatch,
+            _ => RxResult::Timeout,
         }
-        if ix >= 4 && crc != CRC16_RESIDUAL {
-            result = RxResult::CrcMismatch;
-            //console!("crc fail");
-        }
-        unsafe {
-            pio_sm_stop(&self.rx_sm);
-            pio_sm_restart(&self.rx_sm);
-        }
-        self.pio.clear_irq(2);
-        self.buf_ix = ix;
-        self.rx_max_poll = max_poll;
-        result
     }
 
     /// Expect a single byte handshake.
@@ -333,43 +289,9 @@ impl<PIO: PIOExt> UsbPio<PIO> {
     /// Returns `None` on timeout, malformed packed, or wrong packet size.
     #[link_section = ".data"]
     fn rx_handshake(&mut self, low_speed: bool) -> Option<u8> {
-        self.prepare_rx();
-        let last_timestamp = fast_get_timer();
-        let mut ix = 0;
-        let mut ok = true;
-        let mut pid = 0;
-        loop {
-            let irq = self.pio.get_irq_raw();
-            if let Some(data) = self.rx.read() {
-                let byte = (data >> 24) as u8;
-                match ix {
-                    0 => ok = byte == SYNC,
-                    1 => pid = byte,
-                    _ => ok = false,
-                }
-                ix += 1;
-            }
-            let timestamp = fast_get_timer();
-            let timeout = if low_speed {
-                TIMEOUT_DELAY_US_LOW_SPEED
-            } else {
-                TIMEOUT_DELAY_US
-            };
-            if timestamp.wrapping_sub(last_timestamp) >= timeout {
-                ok = false;
-                break;
-            }
-            if irq != 0 {
-                break;
-            }
-        }
-        unsafe {
-            pio_sm_stop(&self.rx_sm);
-            pio_sm_restart(&self.rx_sm);
-        }
-        self.pio.clear_irq(2);
-        if ok {
-            Some(pid)
+        let result = self.rx_packet(low_speed);
+        if result == RxResult::Ok && self.buf_ix == 2 && self.buf[0] == SYNC {
+            Some(self.buf[1])
         } else {
             None
         }
@@ -401,17 +323,6 @@ impl<PIO: PIOExt> UsbPio<PIO> {
     }
 
     #[link_section = ".data"]
-    fn prepare_rx(&mut self) {
-        unsafe {
-            pio_write_instr(&self.pio, 9, 0x27a0); // wait 1 pin 0 [7]
-            pio_sm_exec(&self.rx_sm, 0x0009); // jmp start
-            pio_sm_exec(&self.rx_sm, 0xa0eb); // mov osr, !null
-            pio_sm_start(&self.rx_sm);
-        }
-        self.rx_start = timing::cycles();
-    }
-
-    #[link_section = ".data"]
     fn wait_next_sof(&mut self) {
         self.sof_timestamp = self.sof_timestamp.wrapping_add(1000);
         self.frame_number = self.frame_number.wrapping_add(1);
@@ -425,13 +336,12 @@ impl<PIO: PIOExt> UsbPio<PIO> {
     /// time from receiving data to sending its ACK has a hard deadline.
     #[link_section = ".data"]
     fn record_rx(&mut self, low_speed: bool) {
-        timing::record(
-            timing::TX_TO_RX + low_speed as usize,
-            self.rx_start.wrapping_sub(unsafe { USB_TX_STAMPS.idle }),
-        );
-        if self.rx_max_poll != 0 {
-            timing::record(timing::RX_POLL + low_speed as usize, self.rx_max_poll);
-            self.rx_max_poll = 0;
+        unsafe {
+            timing::record(
+                timing::TX_TO_RX + low_speed as usize,
+                USB_STAMPS.rx_start.wrapping_sub(USB_STAMPS.tx_idle),
+            );
+            timing::record(timing::RX_POLL + low_speed as usize, USB_STAMPS.rx_max_poll);
         }
     }
 
@@ -478,7 +388,7 @@ impl<PIO: PIOExt> UsbPio<PIO> {
                                     usb_tx_handshake(PID_ACK as u32, pipe.low_speed as u32);
                                     timing::record(
                                         timing::EOP_TO_ACK + pipe.low_speed as usize,
-                                        USB_TX_STAMPS.start.wrapping_sub(self.rx_eop),
+                                        USB_STAMPS.tx_start.wrapping_sub(USB_STAMPS.rx_eop),
                                     );
                                     let len = self.buf_ix - 4;
                                     // This copy could be avoided by having rx_packet decode into the

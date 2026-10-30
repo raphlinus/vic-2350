@@ -32,15 +32,21 @@ const FSTAT_TXFULL0 = 1 << 16
 const SM_ENABLE0 = 1
 const SM_RESTART0 = 1 << 4
 
-// Must match usblog's TxStamps
-struct TxStamps {
+// Must match usblog's Stamps
+struct Stamps {
     // when the latest handshake or data packet was started
-    start: u32
+    tx_start: u32
     // when the latest packet other than a handshake ended
-    idle: u32
+    tx_idle: u32
+    // when RX was last started
+    rx_start: u32
+    // when the latest packet's EOP was seen
+    rx_eop: u32
+    // the longest time between polls in the latest packet
+    rx_max_poll: u32
 }
 
-symbol USB_TX_STAMPS: *TxStamps
+symbol USB_STAMPS: *Stamps
 
 // Prime the state machine for a packet of bits bits, sending PRE first
 // for low speed.
@@ -130,8 +136,8 @@ fn usb_tx_handshake(pid: u32, low_speed: u32) {
     *set = enable
     cyccnt @r1 = DWT_CYCCNT as *u32
     t @r1 = *cyccnt
-    stamps @r2 = USB_TX_STAMPS
-    stamps.start = t
+    stamps @r2 = USB_STAMPS
+    stamps.tx_start = t
     pio.TXF0 = pid
     end @r1 = TX_END
     pio.TXF0 = end
@@ -184,8 +190,8 @@ fn usb_tx_finish() {
     }
     cyccnt @r1 = DWT_CYCCNT as *u32
     t @r1 = *cyccnt
-    stamps @r2 = USB_TX_STAMPS
-    stamps.idle = t
+    stamps @r2 = USB_STAMPS
+    stamps.tx_idle = t
     bx lr
 }
 
@@ -224,8 +230,8 @@ fn usb_tx_data(pid: u32, data: *u8, len: u32, crc_speed: u32) {
     *set = enable
     cyccnt @r1 = DWT_CYCCNT as *u32
     t @r1 = *cyccnt
-    stamps @r2 = USB_TX_STAMPS
-    stamps.start = t
+    stamps @r2 = USB_STAMPS
+    stamps.tx_start = t
     pio.TXF0 = pid
     while {
         #(p - end)
