@@ -235,10 +235,6 @@ fn start() {
     led_mask @r1 = 1 << LED_PIN
     sio.GPIO_OE_SET = led_mask
 
-    // DMA gets priority on the bus, so the CPU can't starve HSTX
-    busctrl @r0 = peripherals.BUSCTRL
-    priority @r1 = (1 << 8) | (1 << 12)
-    busctrl.BUS_PRIORITY = priority
 
     call dvi_init()
 
