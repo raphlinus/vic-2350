@@ -160,11 +160,24 @@ unsafe fn enable_fpu() {
     isb();
 }
 
+/// Make exclusive loads and stores on this core use the global monitor, as
+/// the default memory map isn't shareable, and without this atomics don't
+/// synchronize between cores. Needs doing on each core. The global monitor
+/// doesn't cover PSRAM, so atomics there won't work.
+unsafe fn enable_global_exclusives() {
+    const ACTLR: *mut u32 = 0xe000e008 as *mut u32;
+    const EXTEXCLALL: u32 = 1 << 29;
+    ACTLR.write_volatile(ACTLR.read_volatile() | EXTEXCLALL);
+    dsb();
+    isb();
+}
+
 /// Set up USB CDC serial and start core 1 to run it. Call once, on core 0,
 /// with interrupts still disabled.
 #[no_mangle]
 pub unsafe extern "C" fn usb_init() {
     enable_fpu();
+    enable_global_exclusives();
 
     let mut p = pac::Peripherals::steal();
     // The watchdog ticks at 1 MHz, then arm the fail-safe.
@@ -215,6 +228,7 @@ pub unsafe extern "C" fn usb_enable_irq() {
 
 unsafe fn core1_main() {
     enable_fpu();
+    enable_global_exclusives();
     usb_enable_irq();
     let mut usb_task = pio_usb::UsbTask::new();
     pio_usb::start();
