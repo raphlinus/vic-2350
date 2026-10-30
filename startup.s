@@ -39,7 +39,7 @@
 .word default_handler // systick_handler
 
 // interrupts
-.word default_handler // interrupt 0, TIMER0_IRQ_0
+.word TIMER0_IRQ_0 // interrupt 0, in the usblog crate
 .word default_handler // interrupt 1, TIMER0_IRQ_1
 .word default_handler // interrupt 2, TIMER0_IRQ_2
 .word default_handler // interrupt 3, TIMER0_IRQ_3

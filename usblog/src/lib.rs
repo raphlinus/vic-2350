@@ -40,6 +40,17 @@ use usb_device::class_prelude::UsbBusAllocator;
 use usb_device::prelude::*;
 use usbd_serial::SerialPort;
 
+/// Print a line to the console ring. Core 1 thread mode only: the ring has
+/// one producer, and formatting doesn't belong in the timed interrupt.
+macro_rules! console {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = writeln!($crate::Console, $($arg)*);
+    }};
+}
+
+mod pio_usb;
+
 pub const LOG_SIZE: usize = 4096;
 
 /// The log ring buffer. The program (producer) writes `buf[head % LOG_SIZE]`
@@ -66,6 +77,35 @@ pub static mut USBLOG: UsbLog = UsbLog {
     buf: [0; LOG_SIZE],
 };
 
+/// Output of the USB host, drained alongside `USBLOG`, which core 0 owns.
+static mut CONSOLE: UsbLog = UsbLog {
+    head: 0,
+    tail: 0,
+    buf: [0; LOG_SIZE],
+};
+
+struct Console;
+
+impl core::fmt::Write for Console {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        unsafe {
+            let log = addr_of_mut!(CONSOLE);
+            let tail = addr_of!((*log).tail).read_volatile();
+            let mut head = (*log).head;
+            for b in s.bytes() {
+                if head.wrapping_sub(tail) as usize == LOG_SIZE {
+                    break;
+                }
+                (*log).buf[head as usize & (LOG_SIZE - 1)] = b;
+                head = head.wrapping_add(1);
+            }
+            dmb();
+            addr_of_mut!((*log).head).write_volatile(head);
+        }
+        Ok(())
+    }
+}
+
 const FAILSAFE_MS: u32 = 8000;
 /// The bootrom's `reboot` flag for a reboot into BOOTSEL. Unlike
 /// `hal::reboot::reboot`, which always waits 500 ms and doesn't return,
@@ -83,7 +123,7 @@ const USB_PRIORITY: u8 = 0xff;
 
 static mut USB_BUS: Option<UsbBusAllocator<UsbBus>> = None;
 static mut USB: Option<Usb> = None;
-static mut CORE1_STACK: hal::multicore::Stack<1024> = hal::multicore::Stack::new();
+static mut CORE1_STACK: hal::multicore::Stack<4096> = hal::multicore::Stack::new();
 static mut FAILSAFE_ARMED: bool = false;
 
 struct Usb {
@@ -149,6 +189,14 @@ pub unsafe extern "C" fn usb_init() {
         .build();
     *addr_of_mut!(USB) = Some(Usb { dev, serial });
 
+    // Timer 0 ticks at 1 MHz, for the USB host.
+    let tick = p.TICKS.ticktimer0();
+    tick.cycles().write(|w| w.proc0_cycles().bits(CLK_REF_MHZ));
+    tick.ctrl().write(|w| w.enable().set_bit());
+    p.RESETS.reset().modify(|_, w| w.timer0().clear_bit());
+    while p.RESETS.reset_done().read().timer0().bit_is_clear() {}
+    pio_usb::init(p.PIO0, &mut p.RESETS);
+
     // All the setup that touches shared registers, like RESETS, is done,
     // so core 1 doesn't race core 0's startup.
     let mut sio = hal::Sio::new(p.SIO);
@@ -168,9 +216,12 @@ pub unsafe extern "C" fn usb_enable_irq() {
 unsafe fn core1_main() {
     enable_fpu();
     usb_enable_irq();
+    let mut usb_task = pio_usb::UsbTask::new();
+    pio_usb::start();
     loop {
-        // Woken by the USB interrupt, or by sev from a logging core 0.
+        // Woken by an interrupt, or by sev from a logging core 0.
         wfe();
+        usb_task.poll();
         critical_section::with(|_| {
             if let Some(usb) = (*addr_of_mut!(USB)).as_mut() {
                 if usb.dev.state() == UsbDeviceState::Configured && usb.serial.dtr() {
@@ -221,7 +272,11 @@ pub unsafe extern "C" fn USBCTRL_IRQ() {
 }
 
 unsafe fn drain(serial: &mut SerialPort<'static, UsbBus>) {
-    let log = addr_of_mut!(USBLOG);
+    drain_ring(serial, addr_of_mut!(USBLOG));
+    drain_ring(serial, addr_of_mut!(CONSOLE));
+}
+
+unsafe fn drain_ring(serial: &mut SerialPort<'static, UsbBus>, log: *mut UsbLog) {
     let buf = addr_of!((*log).buf) as *const u8;
     let mut tail = addr_of!((*log).tail).read_volatile();
     loop {
@@ -247,6 +302,7 @@ unsafe fn drain(serial: &mut SerialPort<'static, UsbBus>) {
 }
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    console!("{info}");
     loop {}
 }
