@@ -1,4 +1,3 @@
-mod crc;
 mod host_task;
 mod iface;
 mod timing;
@@ -14,13 +13,7 @@ use hal::{
 use pio::Instruction;
 use rp235x_hal as hal;
 
-use crate::pio_usb::wire::{pid_data_toggle, PID_PRE};
-
-use self::{
-    crc::update_crc_16,
-    iface::{IntIface, Request, Status},
-    wire::{pid_data, PID_ACK, PID_DATA0, PID_IN, PID_NAK, PID_OUT, PID_SETUP, PID_SOF, SYNC},
-};
+use self::wire::PID_SOF;
 
 pub use self::host_task::UsbTask;
 pub use self::timing::report as timing_report;
@@ -49,22 +42,12 @@ const FUNCSEL_PIO0: u32 = 6;
 /// GPIO_CTRL's INOVER field set to invert.
 const INOVER_INVERT: u32 = 1 << 16;
 
-const TIMEOUT_DELAY_US: u32 = 3;
-const TIMEOUT_DELAY_US_LOW_SPEED: u32 = 16;
-
 // Very low level PIO functions
 
 #[inline]
 #[link_section = ".data"]
 fn pio_addr<S: ValidStateMachine, State>(_sm: &StateMachine<S, State>) -> *mut u32 {
     (0x50200000 + S::PIO::id() * 0x100000) as *mut u32
-}
-
-#[inline]
-#[link_section = ".data"]
-unsafe fn write_bitmask_set(register: *mut u32, bits: u32) {
-    let alias = (register as usize + 0x2000) as *mut u32;
-    core::ptr::write_volatile(alias, bits);
 }
 
 #[inline]
@@ -76,34 +59,8 @@ unsafe fn write_bitmask_clear(register: *mut u32, bits: u32) {
 
 #[inline]
 #[link_section = ".data"]
-unsafe fn pio_sm_start<S: ValidStateMachine, State>(sm: &StateMachine<S, State>) {
-    write_bitmask_set(pio_addr(sm), 1 << S::id());
-}
-
-#[inline]
-#[link_section = ".data"]
-unsafe fn pio_sm_restart<S: ValidStateMachine, State>(sm: &StateMachine<S, State>) {
-    write_bitmask_set(pio_addr(sm), (1 << 4) << S::id());
-}
-
-#[inline]
-#[link_section = ".data"]
 unsafe fn pio_sm_stop<S: ValidStateMachine, State>(sm: &StateMachine<S, State>) {
     write_bitmask_clear(pio_addr(sm), 1 << S::id());
-}
-
-#[inline]
-#[link_section = ".data"]
-unsafe fn pio_write_instr<PIO: PIOExt>(_pio: &rp235x_hal::pio::PIO<PIO>, n: usize, instr: u16) {
-    let pio_addr = 0x50200000 + PIO::id() * 0x100000 + 0x48 + 4 * n;
-    core::ptr::write_volatile(pio_addr as *mut u16, instr);
-}
-
-#[inline]
-#[link_section = ".data"]
-unsafe fn pio_sm_exec<S: ValidStateMachine, State>(_sm: &StateMachine<S, State>, instr: u16) {
-    let pio_addr = 0x50200000 + S::PIO::id() * 0x100000 + 0xd8 + S::id() * 0x18;
-    core::ptr::write_volatile(pio_addr as *mut u16, instr);
 }
 
 #[inline]
@@ -145,78 +102,63 @@ static mut USB_STAMPS: Stamps = Stamps {
 };
 
 extern "C" {
-    fn usb_tx_handshake(pid: u32, low_speed: u32);
     fn usb_tx_token(pid: u32, data: u32, low_speed: u32);
-    fn usb_tx_data(pid: u32, data: *const u8, len: u32, crc_speed: u32);
-    fn usb_rx_packet(buf: *mut u8, low_speed: u32) -> u32;
+    fn usb_handle_requests();
 }
 
-#[inline(always)]
-unsafe fn tx_token(pid: u8, addr: u8, ep_num: u8, low_speed: bool) {
-    let data = ((ep_num as u32 & 0xf) << 7) | (addr as u32 & 0x7f);
-    usb_tx_token(pid as u32, data, low_speed as u32);
+#[no_mangle]
+#[link_section = ".data"]
+unsafe extern "C" fn usb_record_rx(low_speed: u32) {
+    timing::record(
+        timing::TX_TO_RX + low_speed as usize,
+        USB_STAMPS.rx_start.wrapping_sub(USB_STAMPS.tx_idle),
+    );
+    timing::record(timing::RX_POLL + low_speed as usize, USB_STAMPS.rx_max_poll);
 }
 
-/// Send a data packet, recording the time since the token.
-#[inline(always)]
-unsafe fn tx_data(pid: u8, data: &[u8], crc: u16, low_speed: bool) {
-    let token_end = USB_STAMPS.tx_idle;
-    let crc_speed = crc as u32 | (low_speed as u32) << 16;
-    usb_tx_data(pid as u32, data.as_ptr(), data.len() as u32, crc_speed);
+#[no_mangle]
+#[link_section = ".data"]
+unsafe extern "C" fn usb_record_ack(low_speed: u32) {
+    timing::record(
+        timing::EOP_TO_ACK + low_speed as usize,
+        USB_STAMPS.tx_start.wrapping_sub(USB_STAMPS.rx_eop),
+    );
+}
+
+#[no_mangle]
+#[link_section = ".data"]
+unsafe extern "C" fn usb_record_data(token_end: u32, low_speed: u32) {
     timing::record(
         timing::TOKEN_TO_DATA + low_speed as usize,
         USB_STAMPS.tx_start.wrapping_sub(token_end),
     );
 }
 
-/// The CRC16 field of a data packet.
-#[link_section = ".data"]
-fn data_crc(data: &[u8]) -> u16 {
-    let mut crc = 0xffff;
-    let mut i = 0;
-    while i < data.len() {
-        crc = update_crc_16(crc, data[i]);
-        i += 1;
-    }
-    !crc
-}
-
 pub fn now_us() -> u32 {
     fast_get_timer()
 }
 
-const TX_IDLE_ADDRESS: u32 = 4;
-
 // Clock dividers for clk_sys at 144 MHz. TX runs at 4 cycles per bit and RX
 // at 12.
 const TX_DIV_FULL_SPEED: u16 = 3;
-const TX_DIV_LOW_SPEED: u16 = 24;
 const RX_DIV_FULL_SPEED: u16 = 1;
-const RX_DIV_LOW_SPEED: u16 = 8;
-
-const MAX_BUF: usize = 1028;
 
 struct UsbPio<PIO: PIOExt> {
     tx_sm: StateMachine<(PIO, SM0), Stopped>,
+    // The interrupt side drives these through their registers; they're here
+    // to stay owned.
+    #[expect(dead_code)]
     tx: Tx<(PIO, SM0)>,
+    #[expect(dead_code)]
     rx_sm: StateMachine<(PIO, SM1), Stopped>,
+    #[expect(dead_code)]
     rx: Rx<(PIO, SM1)>,
+    #[expect(dead_code)]
     pio: rp235x_hal::pio::PIO<PIO>,
     state: u32,
-    buf: [u8; MAX_BUF],
-    buf_ix: usize,
     frame_number: u32,
     /// Timestamp (in us) of last SOF packet
     sof_timestamp: u32,
-    int_iface: IntIface,
-    held_pipes: u32,
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum RxResult {
-    Ok,
-    CrcMismatch,
-    Timeout,
 }
 
 impl<PIO: PIOExt> UsbPio<PIO> {
@@ -261,39 +203,8 @@ impl<PIO: PIOExt> UsbPio<PIO> {
             rx,
             pio,
             state: 0,
-            buf: [0u8; MAX_BUF],
-            buf_ix: 0,
             frame_number: 0,
             sof_timestamp: 0,
-            int_iface: IntIface::default(),
-            held_pipes: 0,
-        }
-    }
-
-    /// Receive a packet.
-    ///
-    /// On `Ok` result, the received packet is in the buffer, with `buf_ix` equal to the length.
-    #[link_section = ".data"]
-    fn rx_packet(&mut self, low_speed: bool) -> RxResult {
-        let r = unsafe { usb_rx_packet(self.buf.as_mut_ptr(), low_speed as u32) };
-        self.buf_ix = (r & 0xffff) as usize;
-        match r >> 16 {
-            0 => RxResult::Ok,
-            1 => RxResult::CrcMismatch,
-            _ => RxResult::Timeout,
-        }
-    }
-
-    /// Expect a single byte handshake.
-    ///
-    /// Returns `None` on timeout, malformed packed, or wrong packet size.
-    #[link_section = ".data"]
-    fn rx_handshake(&mut self, low_speed: bool) -> Option<u8> {
-        let result = self.rx_packet(low_speed);
-        if result == RxResult::Ok && self.buf_ix == 2 && self.buf[0] == SYNC {
-            Some(self.buf[1])
-        } else {
-            None
         }
     }
 
@@ -332,128 +243,6 @@ impl<PIO: PIOExt> UsbPio<PIO> {
         self.state = 2;
     }
 
-    /// Account for a transaction's stamps. This can't run within one: the
-    /// time from receiving data to sending its ACK has a hard deadline.
-    #[link_section = ".data"]
-    fn record_rx(&mut self, low_speed: bool) {
-        unsafe {
-            timing::record(
-                timing::TX_TO_RX + low_speed as usize,
-                USB_STAMPS.rx_start.wrapping_sub(USB_STAMPS.tx_idle),
-            );
-            timing::record(timing::RX_POLL + low_speed as usize, USB_STAMPS.rx_max_poll);
-        }
-    }
-
-    #[link_section = ".data"]
-    fn handle_requests(&mut self) {
-        let mut reqs = self.int_iface.poll() | self.held_pipes;
-        self.held_pipes = 0;
-        let mut recording: Option<bool> = None;
-        while reqs != 0 {
-            if let Some(low_speed) = recording.take() {
-                self.record_rx(low_speed);
-            }
-            let pipe_ix = reqs.trailing_zeros() as usize;
-            reqs &= reqs - 1;
-            unsafe {
-                let mut pipe = self.int_iface.pipe(pipe_ix);
-                if matches!(pipe.req, Request::Setup | Request::In | Request::Out) {
-                    recording = Some(pipe.low_speed);
-                }
-                match pipe.req {
-                    Request::Setup => {
-                        let crc = data_crc(&pipe.buf[0..8]);
-                        tx_token(PID_SETUP, pipe.addr, pipe.ep, pipe.low_speed);
-                        tx_data(PID_DATA0, &pipe.buf[0..8], crc, pipe.low_speed);
-                        let handshake = self.rx_handshake(pipe.low_speed);
-                        if handshake == Some(PID_ACK) {
-                            pipe.toggle = 1;
-                            pipe.status = Status::Success;
-                        } else {
-                            // TODO: this always retries, we should have a retry count.
-                            //console!("timeout");
-                            //self.debug.toggle();
-                            self.held_pipes |= 1 << pipe_ix;
-                            continue;
-                        }
-                    }
-                    Request::In => {
-                        tx_token(PID_IN, pipe.addr, pipe.ep, pipe.low_speed);
-                        let rx_result = self.rx_packet(pipe.low_speed);
-                        match rx_result {
-                            RxResult::Ok => {
-                                let expected_pid = pid_data(pipe.toggle);
-                                if self.buf[1] == expected_pid && self.buf_ix >= 4 {
-                                    usb_tx_handshake(PID_ACK as u32, pipe.low_speed as u32);
-                                    timing::record(
-                                        timing::EOP_TO_ACK + pipe.low_speed as usize,
-                                        USB_STAMPS.tx_start.wrapping_sub(USB_STAMPS.rx_eop),
-                                    );
-                                    let len = self.buf_ix - 4;
-                                    // This copy could be avoided by having rx_packet decode into the
-                                    // provided buf. But that's a bit tricky.
-                                    pipe.buf[0..len].copy_from_slice(&self.buf[2..][..len]);
-                                    pipe.len = len as u16;
-                                    pipe.toggle ^= 1;
-                                    pipe.status = Status::Success;
-                                } else if self.buf[1] == PID_NAK {
-                                    // This retries indefinitely, which is reasonable for interrupt
-                                    // endpoints, but other requests should eventually fail.
-                                    //
-                                    // A bunch of other refinements make sense:
-                                    //   * retry interval other than 1ms
-                                    //   * a cancel mechanism
-                                    self.held_pipes |= 1 << pipe_ix;
-                                    continue;
-                                } else if self.buf[1] == pid_data_toggle(expected_pid) {
-                                    // if wrong data pid, then our last ack got lost, send ack
-                                    // again but retry transaction.
-                                    usb_tx_handshake(PID_ACK as u32, pipe.low_speed as u32);
-                                    self.held_pipes |= 1 << pipe_ix;
-                                    continue;
-                                } else {
-                                    //console!("pid = {:02x}", self.buf[1]);
-                                    pipe.status = Status::Error;
-                                }
-                            }
-                            _ => {
-                                pipe.status = Status::Error;
-                            }
-                        }
-                    }
-                    Request::Out => {
-                        let crc = data_crc(&pipe.buf[..pipe.len as usize]);
-                        let pid = pid_data(pipe.toggle);
-                        tx_token(PID_OUT, pipe.addr, pipe.ep, pipe.low_speed);
-                        tx_data(pid, &pipe.buf[..pipe.len as usize], crc, pipe.low_speed);
-                        let handshake = self.rx_handshake(pipe.low_speed);
-                        if handshake == Some(PID_ACK) {
-                            pipe.toggle = 1;
-                            pipe.status = Status::Success;
-                        } else {
-                            // TODO: retry, handle other errors
-                            pipe.status = Status::Error;
-                        }
-                    }
-                    Request::Delay => {
-                        pipe.timer -= 1;
-                        if pipe.timer == 0 {
-                            pipe.status = Status::Success;
-                        } else {
-                            self.held_pipes |= 1 << pipe_ix;
-                            continue;
-                        }
-                    }
-                    _ => (),
-                }
-                self.int_iface.send_response(pipe);
-            }
-        }
-        if let Some(low_speed) = recording {
-            self.record_rx(low_speed);
-        }
-    }
 }
 
 unsafe fn configure_pin(pin: usize, ctrl: u32) {
@@ -508,7 +297,7 @@ pub unsafe extern "C" fn TIMER0_IRQ_0() {
                 fast_get_timer().wrapping_sub(usb_pio.sof_timestamp),
             );
             usb_tx_token(PID_SOF as u32, usb_pio.frame_number & 0x7ff, 0);
-            usb_pio.handle_requests();
+            usb_handle_requests();
             usb_pio.wait_next_sof();
             timing::record(timing::HANDLER, timing::cycles().wrapping_sub(entry));
         }

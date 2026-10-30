@@ -26,6 +26,7 @@ pub struct Iface {
     pipes: [UnsafeCell<Pipe>; N_PIPES],
 }
 
+#[export_name = "USB_IFACE"]
 static IFACE: Iface = Iface::new();
 
 unsafe impl Sync for Iface {}
@@ -34,9 +35,6 @@ unsafe impl Sync for Iface {}
 pub struct UserIface {
     int_owned: u32,
 }
-
-#[derive(Default)]
-pub struct IntIface {}
 
 /// Size of the buffers in the ports.
 ///
@@ -103,6 +101,7 @@ pub enum Status {
         reason = "TODO: signal this when hub signals port disconnected"
     )]
     Disconnected = 3,
+    #[expect(unused, reason = "only set by the interrupt side")]
     Error = 4,
 }
 
@@ -194,30 +193,17 @@ impl UserIface {
     }
 }
 
-impl IntIface {
-    #[link_section = ".data"]
-    pub fn poll(&mut self) -> u32 {
-        let mut old = IFACE.request.load(Relaxed);
-        loop {
-            match IFACE
-                .request
-                .compare_exchange_weak(old, 0, Acquire, Relaxed)
-            {
-                Ok(_) => break,
-                Err(x) => old = x,
-            }
-        }
-        old
-    }
+/// Take the set of requests. For the interrupt side, whose language has
+/// no exclusives yet.
+#[no_mangle]
+#[link_section = ".data"]
+extern "C" fn usb_iface_poll() -> u32 {
+    IFACE.request.swap(0, Acquire)
+}
 
-    /// Safety: pipe_ix must be valid & owned.
-    #[link_section = ".data"]
-    pub unsafe fn pipe(&mut self, pipe_ix: usize) -> PipeGuard {
-        PipeGuard { pipe_ix }
-    }
-
-    #[link_section = ".data"]
-    pub fn send_response(&mut self, pipe: PipeGuard) {
-        IFACE.response.fetch_or(1 << pipe.pipe_ix, Release);
-    }
+/// Respond on a pipe, returning it to user-space.
+#[no_mangle]
+#[link_section = ".data"]
+extern "C" fn usb_iface_respond(pipe_ix: u32) {
+    IFACE.response.fetch_or(1 << pipe_ix, Release);
 }

@@ -1,0 +1,291 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+use "usb_crc.sy"
+use "usb_tx.sy"
+use "usb_rx.sy"
+
+// The USB host's transactions, run from its interrupt, on the requests
+// that user-space has made through the pipes.
+
+const N_PIPES = 16
+const PIPE_BUF_SIZE = 64
+
+const REQ_SETUP = 1
+const REQ_IN = 2
+const REQ_OUT = 3
+const REQ_DELAY = 4
+
+const STATUS_SUCCESS = 1
+const STATUS_ERROR = 4
+
+const PID_OUT = 0xe1
+const PID_IN = 0x69
+const PID_SETUP = 0x2d
+const PID_DATA0 = 0xc3
+const PID_DATA1 = 0x4b
+const PID_ACK = 0xd2
+const PID_NAK = 0x5a
+
+// Must match usblog's Pipe
+struct Pipe {
+    buf: [u8; PIPE_BUF_SIZE]
+    addr: u8
+    ep: u8
+    toggle: u8
+    low_speed: u8
+    len: u16
+    timer: u16
+    req: u8
+    status: u8
+    pad: u16
+}
+
+// Must match usblog's Iface
+struct Iface {
+    request: u32
+    response: u32
+    pipes: [Pipe; N_PIPES]
+}
+
+symbol USB_IFACE: *Iface
+
+// The atomic parts of the interface, in usblog
+symbol usb_iface_poll: fn() -> u32
+symbol usb_iface_respond: fn(u32)
+
+// Timing, also in usblog
+symbol usb_record_rx: fn(u32)
+symbol usb_record_ack: fn(u32)
+symbol usb_record_data: fn(u32, u32)
+
+static mut usb_rx_buf: [u8; RX_MAX_BYTES]
+
+// Pipes retried in the next frame
+static mut usb_held_pipes: u32
+
+#[link_section = ".ram"]
+fn usb_pipe_token(pid: u32, pipe: *Pipe) {
+    push(r4, lr)
+    addr @r2 = pipe.addr
+    ep @r3 = pipe.ep
+    low_speed @r12 = pipe.low_speed
+    data @r1 = addr & 0x7f
+    ep &= 0xf
+    data |= ep << 7
+    speed @r2 = low_speed
+    call usb_tx_token(pid, data, speed)
+    pop(r4, pc)
+}
+
+// Send a token and a data packet, and return whether the device acked.
+#[link_section = ".ram"]
+fn usb_pipe_send(token_pid: u32, data_pid: u32, pipe: *Pipe, len: u32) -> acked: u32 {
+    push(r4, r5, r6, r7, r8, r9, r10, lr)
+    token_pid @r4 = token_pid
+    data_pid @r5 = data_pid
+    pipe @r6 = pipe
+    len @r7 = len
+    p @r0 = pipe as *u8
+    n @r1 = len
+    crc @r0 = call usb_data_crc(p, n)
+    low_speed @r8 = pipe.low_speed
+    crc_speed @r9 = crc | (low_speed << 16)
+    pid @r0 = token_pid
+    q @r1 = pipe
+    call usb_pipe_token(pid, q)
+    stamps @r0 = USB_STAMPS
+    token_end @r10 = stamps.tx_idle
+    pid @r0 = data_pid
+    d @r1 = pipe as *u8
+    m @r2 = len
+    crc_speed2 @r3 = crc_speed
+    call usb_tx_data(pid, d, m, crc_speed2)
+    rx @r0 = &usb_rx_buf as *u8
+    speed @r1 = low_speed
+    result @r0 = call usb_rx_packet(rx, speed)
+    result @r4 = result
+    t @r0 = token_end
+    speed @r1 = low_speed
+    call usb_record_data(t, speed)
+    acked @r0 = 0
+    #(result - 2)
+    if #ne goto end
+    rx @r1 = &usb_rx_buf as *u8
+    b @r2 = *rx
+    #(b - SYNC)
+    if #ne goto end
+    b @r2 = *(rx + 1)
+    #(b - PID_ACK)
+    if #ne goto end
+    acked = 1
+end:
+    pop(r4, r5, r6, r7, r8, r9, r10, pc)
+}
+
+// Run the requests made since the last frame, along with the retries from
+// it, one transaction for each.
+#[link_section = ".ram"]
+fn usb_handle_requests() {
+    push(r4, r5, r6, r7, r8, r9, r10, lr)
+    reqs @r0 = call usb_iface_poll()
+    held @r1 = &usb_held_pipes as *u32
+    old @r2 = *held
+    reqs @r4 = reqs | old
+    held @r9 = 0
+    rx @r8 = &usb_rx_buf as *u8
+    loop {
+        #(reqs - 0)
+        if #eq goto done
+        pipe_ix @r6 = rbit(reqs)
+        pipe_ix = clz(pipe_ix)
+        rest @r0 = reqs - 1
+        reqs &= rest
+        iface @r0 = USB_IFACE
+        pipes @r0 = &iface.pipes as *Pipe
+        sz @r1 = size(Pipe)
+        off @r1 = pipe_ix * sz
+        pipe @r5 = pipes + off
+        low_speed @r7 = pipe.low_speed
+        req @r0 = pipe.req
+        #(req - REQ_IN)
+        if #eq goto in
+        #(req - REQ_SETUP)
+        if #eq goto setup
+        #(req - REQ_OUT)
+        if #eq goto out
+        #(req - REQ_DELAY)
+        if #ne goto respond
+        timer @r0 = pipe.timer
+        timer -= 1
+        pipe.timer = timer
+        #(timer - 0)
+        if #ne goto hold
+        status @r0 = STATUS_SUCCESS
+        pipe.status = status
+        goto respond
+
+setup:
+        token @r0 = PID_SETUP
+        data @r1 = PID_DATA0
+        p @r2 = pipe
+        n @r3 = 8
+        acked @r0 = call usb_pipe_send(token, data, p, n)
+        acked @r10 = acked
+        speed @r0 = low_speed
+        call usb_record_rx(speed)
+        #(acked - 0)
+        if #eq goto hold
+        toggle @r0 = 1
+        pipe.toggle = toggle
+        goto success
+
+out:
+        token @r0 = PID_OUT
+        toggle @r2 = pipe.toggle
+        data @r1 = PID_DATA0
+        if toggle == 0 goto out_pid
+        data = PID_DATA1
+out_pid:
+        p @r2 = pipe
+        n @r3 = pipe.len
+        acked @r0 = call usb_pipe_send(token, data, p, n)
+        acked @r10 = acked
+        speed @r0 = low_speed
+        call usb_record_rx(speed)
+        #(acked - 0)
+        if #eq goto error
+        toggle @r0 = pipe.toggle
+        toggle ^= 1
+        pipe.toggle = toggle
+        goto success
+
+in:
+        toggle @r0 = pipe.toggle
+        expected @r10 = PID_DATA0
+        if toggle == 0 goto in_token
+        expected = PID_DATA1
+in_token:
+        token @r0 = PID_IN
+        p @r1 = pipe
+        call usb_pipe_token(token, p)
+        b @r0 = rx
+        speed @r1 = low_speed
+        result @r0 = call usb_rx_packet(b, speed)
+        // Nothing but the ACK until the packet has been acked. A failed
+        // receive or a short packet wraps, so this also covers those.
+        pid @r1 = *(rx + 1)
+        len @r2 = result - 4
+        #(len - PIPE_BUF_SIZE)
+        if #hi goto not_data
+        #(pid - expected)
+        if #ne goto not_data
+        len @r10 = len
+        ack @r0 = PID_ACK
+        speed @r1 = low_speed
+        call usb_tx_handshake(ack, speed)
+        speed @r0 = low_speed
+        call usb_record_ack(speed)
+        src @r1 = rx + 2
+        i @r2 = 0
+        #(len - 0)
+        if #eq goto copied
+        loop {
+            b @r0 = *(src + i)
+            *(pipe as *u8 + i) = b
+            i += 1
+            #(i - len)
+            if #ne goto loop
+        }
+copied:
+        pipe.len = len
+        toggle @r0 = pipe.toggle
+        toggle ^= 1
+        pipe.toggle = toggle
+        speed @r0 = low_speed
+        call usb_record_rx(speed)
+success:
+        status @r0 = STATUS_SUCCESS
+        pipe.status = status
+        goto respond
+
+not_data:
+        // Whether the receive itself failed
+        failed @r2 = result >> 16
+        #(failed - 0)
+        if #ne goto in_error
+        #(pid - PID_NAK)
+        if #eq goto in_held
+        wrong @r2 = expected ^ (PID_DATA0 ^ PID_DATA1)
+        #(pid - wrong)
+        if #ne goto in_error
+        // Our last ACK got lost: ack again, and retry the transaction
+        ack @r0 = PID_ACK
+        speed @r1 = low_speed
+        call usb_tx_handshake(ack, speed)
+in_held:
+        speed @r0 = low_speed
+        call usb_record_rx(speed)
+hold:
+        bit @r0 = 1
+        bit <<= pipe_ix
+        held |= bit
+        goto next
+
+in_error:
+        speed @r0 = low_speed
+        call usb_record_rx(speed)
+error:
+        status @r0 = STATUS_ERROR
+        pipe.status = status
+respond:
+        ix @r0 = pipe_ix
+        call usb_iface_respond(ix)
+next:
+        goto loop
+    }
+done:
+    p @r0 = &usb_held_pipes as *u32
+    *p = held
+    pop(r4, r5, r6, r7, r8, r9, r10, pc)
+}

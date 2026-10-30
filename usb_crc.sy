@@ -54,12 +54,25 @@ static crc16_tbl: [u16; 256] = [
     0x4100, 0x81c1, 0x8081, 0x4040,
 ]
 
+// The CRC16 field of a data packet.
 #[link_section = ".ram"]
-fn update_crc_16(crc: u32, data: u32) -> result: u32 {
-    tbl @r2 = &crc16_tbl
-    ix @r3 = crc[0..8]
-    ix ^= data
-    entry @r1 = *(tbl + ix * 2)
-    result @r0 = entry ^ (crc >> 8)
-    bx lr
+fn usb_data_crc(data: *u8, len: u32) -> result: u32 {
+    push(r4, lr)
+    tbl @r12 = &crc16_tbl
+    mask @r3 = 0xffff
+    crc @r2 = mask
+    if len == 0 goto end
+    end @lr = data + len
+    loop {
+        b @r1 = *data++
+        ix @r4 = crc ^ b
+        ix = ix[0..8]
+        entry @r4 = *(tbl + ix * 2)
+        crc = entry ^ (crc >> 8)
+        #(data - end)
+        if #ne goto loop
+    }
+end:
+    result @r0 = crc ^ mask
+    pop(r4, pc)
 }

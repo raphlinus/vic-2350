@@ -17,7 +17,7 @@ const IRQ_RX_EOP = 1 << 1
 const RX_TIMEOUT_FULL = 3
 const RX_TIMEOUT_LOW = 16
 
-// No more than MAX_BUF in usblog; bytes past this are dropped
+// The size of usb_rx_buf; bytes past this are dropped
 const RX_MAX_BYTES = 1024
 
 // The running CRC16 after a data packet's payload and CRC field, when the
