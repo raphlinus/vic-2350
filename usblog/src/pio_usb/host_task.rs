@@ -19,9 +19,10 @@ use crate::{
         wire::{
             BOOT_SUBCLASS, CLASS_REQUEST, CLEAR_FEATURE, CONFIG_DESCRIPTOR, DEVICE_DESCRIPTOR,
             DEVICE_TO_HOST, ENDPOINT_DESCRIPTOR, GET_DESCRIPTOR, GET_STATUS, HID_CLASS,
-            HOST_TO_DEVICE, HUB_DESCRIPTOR, INTERFACE_DESCRIPTOR, KEYBOARD_PROTOCOL,
-            MOUSE_PROTOCOL, PORT_POWER, PORT_RESET, RECIPIENT_INTERFACE, RECIPIENT_OTHER,
-            SET_ADDRESS, SET_CONFIGURATION, SET_FEATURE, SET_PROTOCOL,
+            HID_DESCRIPTOR, HOST_TO_DEVICE, HUB_DESCRIPTOR, INTERFACE_DESCRIPTOR,
+            KEYBOARD_PROTOCOL, MOUSE_PROTOCOL, PORT_POWER, PORT_RESET, RECIPIENT_INTERFACE,
+            RECIPIENT_OTHER, REPORT_DESCRIPTOR, SET_ADDRESS, SET_CONFIGURATION, SET_FEATURE,
+            SET_PROTOCOL,
         },
     },
 };
@@ -38,6 +39,9 @@ const MAX_PORTS: usize = 7;
 
 /// How many frames of NAKs a control transfer sits through.
 const NAK_FRAMES: u16 = 1000;
+/// As much of a descriptor as is kept. A mouse's report descriptor can run
+/// to a couple of hundred bytes.
+const TRANSFER_BUF: usize = 256;
 /// Resets of a port before giving up on what's attached to it.
 const ENUM_ATTEMPTS: u8 = 3;
 /// Checks of a port that's slow to finish its reset.
@@ -106,7 +110,7 @@ pub struct SetupPacket {
 struct Transfer {
     ty: TransferType,
     phase: TransferPhase,
-    buf: [u8; 64],
+    buf: [u8; TRANSFER_BUF],
     packet_size: u16,
     target_len: u16,
     actual_len: u16,
@@ -162,6 +166,7 @@ enum CtrlState {
     AddressDelay,
     GotConfig,
     Configured,
+    GotReportDesc,
     ProtocolSet,
 }
 
@@ -171,6 +176,8 @@ struct Port {
     attempts: u8,
     low_speed: bool,
     interface: Interface,
+    /// How its reports are laid out, if it's a mouse.
+    layout: mouse::Layout,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -187,6 +194,8 @@ struct Interface {
     number: u8,
     /// Its interrupt IN endpoint.
     ep: u8,
+    /// The length of its report descriptor.
+    report_len: u16,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -246,6 +255,7 @@ impl Interface {
             kind: Kind::Other,
             number: 0,
             ep: 1,
+            report_len: 0,
         }
     }
 
@@ -272,7 +282,15 @@ impl Interface {
                         (HID_CLASS, BOOT_SUBCLASS, KEYBOARD_PROTOCOL) => Kind::Keyboard,
                         _ => Kind::Other,
                     };
-                    current = Self { kind, number, ep: 0 };
+                    current = Self {
+                        kind,
+                        number,
+                        ep: 0,
+                        report_len: 0,
+                    };
+                }
+                (HID_DESCRIPTOR, &[_, _, _, _, _, _, REPORT_DESCRIPTOR, lo, hi, ..]) => {
+                    current.report_len = u16::from_le_bytes([lo, hi]);
                 }
                 (ENDPOINT_DESCRIPTOR, &[_, _, addr, attributes, ..]) => {
                     // The first interrupt IN endpoint of a boot interface
@@ -300,7 +318,7 @@ impl Transfer {
         Self {
             ty: TransferType::ControlNone,
             phase: TransferPhase::Idle,
-            buf: [0; 64],
+            buf: [0; TRANSFER_BUF],
             packet_size: 0,
             target_len: 0,
             actual_len: 0,
@@ -660,6 +678,7 @@ impl UsbTask {
                     | CtrlState::Address
                     | CtrlState::GotConfig
                     | CtrlState::Configured
+                    | CtrlState::GotReportDesc
                     | CtrlState::ProtocolSet => self.enum_failed(),
                     _ => {
                         console!("hub failed in {:?}", self.ctrl);
@@ -734,18 +753,43 @@ impl UsbTask {
             CtrlState::Configured => {
                 let interface = self.ports[self.port as usize].interface;
                 if interface.kind == Kind::Mouse {
-                    // Devices start out in report protocol.
+                    // Devices start out in report protocol, which is what
+                    // this describes. Boot protocol isn't relied on, as
+                    // there are mice that accept it and carry on as before.
+                    let setup = SetupPacket::new(
+                        DEVICE_TO_HOST | RECIPIENT_INTERFACE,
+                        GET_DESCRIPTOR,
+                        (REPORT_DESCRIPTOR as u16) << 8,
+                        interface.number as u16,
+                        interface.report_len.min(TRANSFER_BUF as u16),
+                    );
+                    self.ctrl_device(self.port as u8 + 1, setup, CtrlState::GotReportDesc);
+                } else {
+                    self.ctrl = CtrlState::Idle;
+                    self.start_device();
+                }
+            }
+            CtrlState::GotReportDesc => {
+                let transfer = &self.transfers[CTRL_PIPE];
+                let desc = &transfer.buf[..transfer.actual_len as usize];
+                trace!("report desc {desc:02x?}");
+                let layout = mouse::Layout::parse(desc);
+                trace!("mouse layout {layout:?}");
+                let port = &mut self.ports[self.port as usize];
+                if let Some(layout) = layout {
+                    port.layout = layout;
+                    self.ctrl = CtrlState::Idle;
+                    self.start_device();
+                } else {
+                    port.layout = mouse::Layout::BOOT;
                     let setup = SetupPacket::new(
                         HOST_TO_DEVICE | CLASS_REQUEST | RECIPIENT_INTERFACE,
                         SET_PROTOCOL,
                         0,
-                        interface.number as u16,
+                        port.interface.number as u16,
                         0,
                     );
                     self.ctrl_device(self.port as u8 + 1, setup, CtrlState::ProtocolSet);
-                } else {
-                    self.ctrl = CtrlState::Idle;
-                    self.start_device();
                 }
             }
             CtrlState::ProtocolSet => {
@@ -825,7 +869,7 @@ impl UsbTask {
                 let transfer = &self.transfers[ix];
                 let report = &transfer.buf[0..transfer.actual_len as usize];
                 if self.ports[port].interface.kind == Kind::Mouse {
-                    mouse::report(report);
+                    mouse::report(report, &self.ports[port].layout);
                 } else {
                     trace!("report {report:02x?}");
                 }
@@ -923,6 +967,7 @@ impl Port {
             attempts: 0,
             low_speed: false,
             interface: Interface::new(),
+            layout: mouse::Layout::BOOT,
         }
     }
 }

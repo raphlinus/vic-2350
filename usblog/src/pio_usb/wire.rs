@@ -59,6 +59,10 @@ pub const INTERFACE_DESCRIPTOR: u8 = 4;
 
 pub const ENDPOINT_DESCRIPTOR: u8 = 5;
 
+pub const HID_DESCRIPTOR: u8 = 0x21;
+
+pub const REPORT_DESCRIPTOR: u8 = 0x22;
+
 pub const HUB_DESCRIPTOR: u8 = 0x29;
 
 // interfaces
