@@ -284,12 +284,14 @@ impl<PIO: PIOExt> UsbPio<PIO> {
     fn tx_handshake(&mut self, pid: u8, low_speed: bool) {
         self.setup_tx(2, low_speed);
         self.tx.write(SYNC as u32);
-        self.tx.write(pid as u32);
-        self.tx.write(0xff);
+        // SYNC takes far longer to send than the FIFO takes to fill, so
+        // start as soon as it's there, to cut the time to the packet.
         unsafe {
             pio_sm_start(&self.tx_sm);
         }
         self.tx_start = timing::cycles();
+        self.tx.write(pid as u32);
+        self.tx.write(0xff);
         while self.tx_sm.instruction_address() != TX_IDLE_ADDRESS {}
     }
 
@@ -329,23 +331,13 @@ impl<PIO: PIOExt> UsbPio<PIO> {
         let token_end = self.tx_idle;
         self.setup_tx(data.len() + 4, low_speed);
         self.tx.write(SYNC as u32);
-        self.tx.write(pid as u32);
-        let mut i = 0;
-        while i < data.len() {
-            if self.tx.write(data[i] as u32) {
-                i += 1;
-            } else {
-                break;
-            }
-        }
         unsafe {
             pio_sm_start(&self.tx_sm);
         }
         self.tx_start = timing::cycles();
-        while i < data.len() {
-            if self.tx.write(data[i] as u32) {
-                i += 1;
-            }
+        self.tx.write(pid as u32);
+        for &byte in data {
+            while !self.tx.write(byte as u32) {}
         }
         while !self.tx.write(crc as u8 as u32) {}
         while !self.tx.write((crc >> 8) as u32) {}
@@ -369,21 +361,12 @@ impl<PIO: PIOExt> UsbPio<PIO> {
     #[link_section = ".data"]
     fn tx_packet(&mut self, packet: &[u8], low_speed: bool) {
         self.setup_tx(packet.len(), low_speed);
-        let mut i = 0;
-        while i < packet.len() {
-            if self.tx.write(packet[i] as u32) {
-                i += 1;
-            } else {
-                break;
-            }
-        }
+        self.tx.write(packet[0] as u32);
         unsafe {
             pio_sm_start(&self.tx_sm);
         }
-        while i < packet.len() {
-            if self.tx.write(packet[i] as u32) {
-                i += 1;
-            }
+        for &byte in &packet[1..] {
+            while !self.tx.write(byte as u32) {}
         }
         self.finish_tx();
     }
