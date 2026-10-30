@@ -38,6 +38,7 @@ demo() {
 demo colorbars "vec.sy render.sy display_list.sy stats.sy colorbars.sy pico_alloc.sy alloc.sy" build/fill.o
 demo rects "vec.sy render.sy display_list.sy stats.sy rects.sy pico_alloc.sy alloc.sy" build/fill.o
 demo textdemo "vec.sy render.sy display_list.sy stats.sy font.sy text.sy textdemo.sy pico_alloc.sy alloc.sy" build/fill.o
+demo console "vec.sy render.sy display_list.sy stats.sy font.sy text.sy console.sy pico_alloc.sy alloc.sy" build/fill.o
 demo image image.sy build/image_data.o
 demo tiles "render_tiles.sy tiles.sy"
 demo psram_test psram_test.sy

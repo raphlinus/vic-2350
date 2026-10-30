@@ -84,6 +84,49 @@ static mut CONSOLE: UsbLog = UsbLog {
     buf: [0; LOG_SIZE],
 };
 
+const SCREEN_ROWS: usize = 32;
+const SCREEN_COLS: usize = 128;
+
+/// The latest lines of console output, for core 0 to draw. Row
+/// `lines % SCREEN_ROWS` is being written. Text is printable ASCII, and
+/// `len` is published after the bytes it covers, so a reader racing a write
+/// sees at worst a torn line.
+#[repr(C)]
+pub struct Screen {
+    pub lines: u32,
+    pub len: [u32; SCREEN_ROWS],
+    pub text: [[u8; SCREEN_COLS]; SCREEN_ROWS],
+}
+
+#[no_mangle]
+pub static mut USBSCREEN: Screen = Screen {
+    lines: 0,
+    len: [0; SCREEN_ROWS],
+    text: [[0; SCREEN_COLS]; SCREEN_ROWS],
+};
+
+unsafe fn screen_write(s: &str) {
+    let screen = addr_of_mut!(USBSCREEN);
+    let mut lines = (*screen).lines;
+    for b in s.bytes() {
+        if b == b'\n' {
+            lines = lines.wrapping_add(1);
+            addr_of_mut!((*screen).len[lines as usize % SCREEN_ROWS]).write_volatile(0);
+            dmb();
+            addr_of_mut!((*screen).lines).write_volatile(lines);
+        } else {
+            let row = lines as usize % SCREEN_ROWS;
+            let len = (*screen).len[row] as usize;
+            if len < SCREEN_COLS {
+                let c = if (32..127).contains(&b) { b } else { b'?' };
+                (*screen).text[row][len] = c;
+                dmb();
+                addr_of_mut!((*screen).len[row]).write_volatile(len as u32 + 1);
+            }
+        }
+    }
+}
+
 struct Console;
 
 impl core::fmt::Write for Console {
@@ -101,6 +144,7 @@ impl core::fmt::Write for Console {
             }
             dmb();
             addr_of_mut!((*log).head).write_volatile(head);
+            screen_write(s);
         }
         Ok(())
     }

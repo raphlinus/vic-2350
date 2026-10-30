@@ -1,0 +1,109 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+use "main.sy"
+use "render.sy"
+use "alloc.sy"
+use "display_list.sy"
+use "stats.sy"
+use "text.sy"
+
+// Console: the latest lines printed by the USB host, built into a new
+// display list each frame.
+
+const TEXT_TOP = 8
+const TEXT_LEFT = 8
+const LINE_PITCH = 16
+const BG_COLOR = 0x0841
+const COLORS = 0xffff | (BG_COLOR << 16)
+
+// Must match usblog's Screen
+const SCREEN_ROWS = 32
+const SCREEN_COLS = 128
+
+struct Screen {
+    lines: u32
+    len: [u32; SCREEN_ROWS]
+    text: [u8; SCREEN_ROWS * SCREEN_COLS]
+}
+
+symbol USBSCREEN: *Screen
+
+const VISIBLE_ROWS = 29
+
+// Built alternately: one is rendered while the other is built.
+static mut frame_lists: [DisplayList; 2]
+
+fn demo_init() {
+    push(r4, lr)
+    call stats_init()
+    call init_alloc()
+    call render_init()
+    call text_init()
+    pop(r4, pc)
+}
+
+// Each frame, build a list in one of frame_lists, which the renderer
+// isn't using, and swap it in.
+fn demo_main() {
+    list @r4 = &frame_lists as *DisplayList
+    other @r5 = list + size(DisplayList)
+    loop {
+        l @r0 = list
+        call dl_clear(l)
+
+        l @r0 = list
+        sz @r1 = size(Solid)
+        obj @r0 = call dl_alloc(l, sz)
+        if {
+            if obj == 0 goto end
+            vt @r1 = &solid_vtable
+            zero @r2 = 0
+            x1y1 @r3 = H_ACTIVE | (V_ACTIVE << 16)
+            color @r12 = BG_COLOR
+            *obj = (vt, zero, x1y1, color)
+        }
+
+        // The oldest visible line; the newest is the one being written.
+        screen @r8 = USBSCREEN
+        lines @r0 = screen.lines
+        #(first @r7 = lines - (VISIBLE_ROWS - 1))
+        if #lo {
+            first = 0
+        }
+        i @r6 = 0
+        loop {
+            row @r1 = first + i
+            row &= SCREEN_ROWS - 1
+            lens @r0 = &screen.len
+            len @r12 = *(lens + row * 4)
+            #(len - 0)
+            if #eq goto next
+            s @r3 = &screen.text
+            s += row << 7
+            y @r0 = i << 4
+            y += TEXT_TOP
+            x @r2 = TEXT_LEFT
+            xy @r1 = pkhbt(x, y << 16)
+            l @r0 = list
+            c @r2 = COLORS
+            // lr pads the stack argument to keep sp 8 byte aligned
+            push(len, lr)
+            call text_add(l, xy, c, s, sp.len)
+            sp += 8
+next:
+            i += 1
+            #(i - VISIBLE_ROWS)
+            if #ne goto loop
+        }
+
+        l @r0 = list
+        call dl_finish(l)
+        l @r0 = list
+        call render_swap(l)
+        t @r0 = list
+        list = other
+        other = t
+        goto loop
+    }
+}
