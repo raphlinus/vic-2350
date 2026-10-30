@@ -67,6 +67,21 @@ done:
     pop(r4, r5, r6, pc)
 }
 
+// Append a bordered rectangle (see render.sy). Otherwise as dl_solid.
+fn dl_bordered(list: *DisplayList, x0y0: u32, x1y1: u32, colors: u32) -> obj: *u32 {
+    push(r4, r5, r6, lr)
+    a @r4 = x0y0
+    b @r5 = x1y1
+    c @r6 = colors
+    sz @r1 = size(Bordered)
+    obj @r0 = call dl_alloc(list, sz)
+    if obj == 0 goto done
+    vt @r3 = &bordered_vtable
+    *obj = (vt, a, b, c)
+done:
+    pop(r4, r5, r6, pc)
+}
+
 // Append a sprite (see render.sy), with stride on the stack. Otherwise as
 // dl_solid.
 fn dl_sprite(list: *DisplayList, x0y0: u32, x1y1: u32, pixels: *u16) -> obj: *u32 {

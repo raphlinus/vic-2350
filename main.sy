@@ -293,6 +293,19 @@ fn dvi_init() {
     bx lr
 }
 
+// Sleep until the interrupts reach line v, as counted by Dvi.v_ctr. Thread
+// mode only. Interrupts come every line, so none is missed.
+fn dvi_wait_line(v: u32) {
+    p @r1 = &dvi
+    loop {
+        wfi
+        c @r2 = p.v_ctr
+        #(c - v)
+        if #ne goto loop
+    }
+    bx lr
+}
+
 // Take the next line to render, if there is one. Returns its number y in
 // r0 and a pointer to its pixels in r1, which belong to the caller until
 // dvi_release_line(y), or -1 in r0 if the queue is empty.

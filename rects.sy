@@ -129,7 +129,7 @@ fn demo_main() {
         n @r7 = N_RECTS
         loop {
             l @r0 = list
-            sz @r1 = size(Solid)
+            sz @r1 = size(Bordered)
             obj @r0 = call dl_alloc(l, sz)
             if obj == 0 goto break
             obj @r8 = obj
@@ -166,12 +166,17 @@ fn demo_main() {
             }
             m.y = ny
 
-            vt @r0 = &solid_vtable
+            vt @r0 = &bordered_vtable
             x0y0 @r1 = pkhbt(x0, ny << 16)
             y1 @r3 = ny + h
             x1y1 @r2 = pkhbt(x1, y1 << 16)
-            color @r3 = m.color
-            *obj = (vt, x0y0, x1y1, color)
+            colors @r3 = m.color
+            // The border is half the brightness of the fill.
+            border @r12 = colors >> 1
+            mask @r9 = 0x7bef
+            border &= mask
+            colors |= border << 16
+            *obj = (vt, x0y0, x1y1, colors)
             m += size(Mover)
             #(n -= 1)
             if #ne goto loop
