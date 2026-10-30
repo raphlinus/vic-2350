@@ -150,6 +150,9 @@ impl core::fmt::Write for Console {
     }
 }
 
+/// How often to print USB host timing.
+const REPORT_US: u32 = 5_000_000;
+
 const FAILSAFE_MS: u32 = 8000;
 /// The bootrom's `reboot` flag for a reboot into BOOTSEL. Unlike
 /// `hal::reboot::reboot`, which always waits 500 ms and doesn't return,
@@ -276,10 +279,15 @@ unsafe fn core1_main() {
     usb_enable_irq();
     let mut usb_task = pio_usb::UsbTask::new();
     pio_usb::start();
+    let mut next_report = pio_usb::now_us().wrapping_add(REPORT_US);
     loop {
         // Woken by an interrupt, or by sev from a logging core 0.
         wfe();
         usb_task.poll();
+        if pio_usb::now_us().wrapping_sub(next_report) < 0x8000_0000 {
+            next_report = next_report.wrapping_add(REPORT_US);
+            pio_usb::timing_report();
+        }
         critical_section::with(|_| {
             if let Some(usb) = (*addr_of_mut!(USB)).as_mut() {
                 if usb.dev.state() == UsbDeviceState::Configured && usb.serial.dtr() {

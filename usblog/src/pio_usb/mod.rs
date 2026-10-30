@@ -1,6 +1,7 @@
 mod crc;
 mod host_task;
 mod iface;
+mod timing;
 mod wire;
 
 use core::{cell::UnsafeCell, mem::MaybeUninit};
@@ -22,6 +23,7 @@ use self::{
 };
 
 pub use self::host_task::UsbTask;
+pub use self::timing::report as timing_report;
 
 struct UsbPioWrapper<P: PIOExt>(UnsafeCell<MaybeUninit<UsbPio<P>>>);
 
@@ -123,6 +125,10 @@ unsafe fn fast_alarm_schedule(timestamp: u32) {
     }
 }
 
+pub fn now_us() -> u32 {
+    fast_get_timer()
+}
+
 const TX_IDLE_ADDRESS: u32 = 4;
 
 // Clock dividers for clk_sys at 144 MHz. TX runs at 4 cycles per bit and RX
@@ -148,6 +154,12 @@ struct UsbPio<PIO: PIOExt> {
     sof_timestamp: u32,
     int_iface: IntIface,
     held_pipes: u32,
+    // Cycle stamps, for timing
+    tx_start: u32,
+    tx_idle: u32,
+    rx_start: u32,
+    rx_eop: u32,
+    rx_max_poll: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -205,6 +217,11 @@ impl<PIO: PIOExt> UsbPio<PIO> {
             sof_timestamp: 0,
             int_iface: IntIface::default(),
             held_pipes: 0,
+            tx_start: 0,
+            tx_idle: 0,
+            rx_start: 0,
+            rx_eop: 0,
+            rx_max_poll: 0,
         }
     }
 
@@ -256,6 +273,7 @@ impl<PIO: PIOExt> UsbPio<PIO> {
         unsafe {
             pio_sm_start(&self.tx_sm);
         }
+        self.tx_start = timing::cycles();
         while self.tx_sm.instruction_address() != TX_IDLE_ADDRESS {}
     }
 
@@ -291,6 +309,7 @@ impl<PIO: PIOExt> UsbPio<PIO> {
     /// We calcuate CRC on the fly.
     #[link_section = ".data"]
     fn tx_data(&mut self, pid: u8, data: &[u8], low_speed: bool) {
+        let token_end = self.tx_idle;
         self.setup_tx(data.len() + 4, low_speed);
         self.tx.write(SYNC as u32);
         self.tx.write(pid as u32);
@@ -308,6 +327,7 @@ impl<PIO: PIOExt> UsbPio<PIO> {
         unsafe {
             pio_sm_start(&self.tx_sm);
         }
+        self.tx_start = timing::cycles();
         while i < data.len() {
             let data = data[i];
             if self.tx.write(data as u32) {
@@ -319,12 +339,17 @@ impl<PIO: PIOExt> UsbPio<PIO> {
         while !self.tx.write(crc as u8 as u32) {}
         while !self.tx.write((crc >> 8) as u32) {}
         self.finish_tx();
+        timing::record(
+            timing::TOKEN_TO_DATA + low_speed as usize,
+            self.tx_start.wrapping_sub(token_end),
+        );
     }
 
     #[link_section = ".data"]
     fn finish_tx(&mut self) {
         while !self.tx.write(0xff) {}
         while self.tx_sm.instruction_address() != TX_IDLE_ADDRESS {}
+        self.tx_idle = timing::cycles();
     }
 
     /// Transmit a packet.
@@ -367,7 +392,12 @@ impl<PIO: PIOExt> UsbPio<PIO> {
         let mut ix = 0;
         let mut result = RxResult::Ok;
         let mut crc = 0xffff;
+        let mut last_poll = timing::cycles();
+        let mut max_poll = 0;
         loop {
+            let now = timing::cycles();
+            max_poll = max_poll.max(now.wrapping_sub(last_poll));
+            last_poll = now;
             let irq = self.pio.get_irq_raw();
             let ix_start = ix;
             while let Some(data) = self.rx.read() {
@@ -379,6 +409,7 @@ impl<PIO: PIOExt> UsbPio<PIO> {
                 ix += 1;
             }
             if irq != 0 {
+                self.rx_eop = now;
                 break;
             }
             let timestamp = fast_get_timer();
@@ -402,6 +433,7 @@ impl<PIO: PIOExt> UsbPio<PIO> {
         }
         self.pio.clear_irq(2);
         self.buf_ix = ix;
+        self.rx_max_poll = max_poll;
         result
     }
 
@@ -485,6 +517,7 @@ impl<PIO: PIOExt> UsbPio<PIO> {
             pio_sm_exec(&self.rx_sm, 0xa0eb); // mov osr, !null
             pio_sm_start(&self.rx_sm);
         }
+        self.rx_start = timing::cycles();
     }
 
     #[link_section = ".data"]
@@ -497,15 +530,36 @@ impl<PIO: PIOExt> UsbPio<PIO> {
         self.state = 2;
     }
 
+    /// Account for a transaction's stamps. This can't run within one: the
+    /// time from receiving data to sending its ACK has a hard deadline.
+    #[link_section = ".data"]
+    fn record_rx(&mut self, low_speed: bool) {
+        timing::record(
+            timing::TX_TO_RX + low_speed as usize,
+            self.rx_start.wrapping_sub(self.tx_idle),
+        );
+        if self.rx_max_poll != 0 {
+            timing::record(timing::RX_POLL + low_speed as usize, self.rx_max_poll);
+            self.rx_max_poll = 0;
+        }
+    }
+
     #[link_section = ".data"]
     fn handle_requests(&mut self) {
         let mut reqs = self.int_iface.poll() | self.held_pipes;
         self.held_pipes = 0;
+        let mut recording: Option<bool> = None;
         while reqs != 0 {
+            if let Some(low_speed) = recording.take() {
+                self.record_rx(low_speed);
+            }
             let pipe_ix = reqs.trailing_zeros() as usize;
             reqs &= reqs - 1;
             unsafe {
                 let mut pipe = self.int_iface.pipe(pipe_ix);
+                if matches!(pipe.req, Request::Setup | Request::In | Request::Out) {
+                    recording = Some(pipe.low_speed);
+                }
                 match pipe.req {
                     Request::Setup => {
                         self.tx_token(PID_SETUP, pipe.addr, pipe.ep, pipe.low_speed);
@@ -524,11 +578,16 @@ impl<PIO: PIOExt> UsbPio<PIO> {
                     }
                     Request::In => {
                         self.tx_token(PID_IN, pipe.addr, pipe.ep, pipe.low_speed);
-                        match self.rx_packet(pipe.low_speed) {
+                        let rx_result = self.rx_packet(pipe.low_speed);
+                        match rx_result {
                             RxResult::Ok => {
                                 let expected_pid = pid_data(pipe.toggle);
                                 if self.buf[1] == expected_pid && self.buf_ix >= 4 {
                                     self.tx_handshake(PID_ACK, pipe.low_speed);
+                                    timing::record(
+                                        timing::EOP_TO_ACK + pipe.low_speed as usize,
+                                        self.tx_start.wrapping_sub(self.rx_eop),
+                                    );
                                     let len = self.buf_ix - 4;
                                     // This copy could be avoided by having rx_packet decode into the
                                     // provided buf. But that's a bit tricky.
@@ -588,6 +647,9 @@ impl<PIO: PIOExt> UsbPio<PIO> {
                 self.int_iface.send_response(pipe);
             }
         }
+        if let Some(low_speed) = recording {
+            self.record_rx(low_speed);
+        }
     }
 }
 
@@ -608,6 +670,7 @@ pub unsafe fn init(pio: PIO0, resets: &mut RESETS) {
 /// Start the host timer interrupt on the calling core, at the highest
 /// priority, as it blocks through timing-critical turnarounds.
 pub unsafe fn start() {
+    timing::init();
     fast_alarm_schedule(fast_get_timer().wrapping_add(12_000));
     (TIMER0_INTE as *mut u32).write_volatile(1);
     cortex_m::Peripherals::steal()
@@ -633,12 +696,18 @@ pub unsafe extern "C" fn TIMER0_IRQ_0() {
             usb_pio.state = 2;
         }
         2 => {
+            let entry = timing::cycles();
             if usb_pio.frame_number == 0 {
                 usb_pio.sof_timestamp = fast_get_timer();
             }
+            timing::record(
+                timing::SOF_LATE,
+                fast_get_timer().wrapping_sub(usb_pio.sof_timestamp),
+            );
             usb_pio.tx_with_crc5(PID_SOF, usb_pio.frame_number as u16 & 0x7ff, false);
             usb_pio.handle_requests();
             usb_pio.wait_next_sof();
+            timing::record(timing::HANDLER, timing::cycles().wrapping_sub(entry));
         }
         _ => (),
     }
