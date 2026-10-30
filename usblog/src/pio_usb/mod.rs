@@ -125,11 +125,27 @@ unsafe fn fast_alarm_schedule(timestamp: u32) {
     }
 }
 
+/// The CRC16 field of a data packet.
+#[link_section = ".data"]
+fn data_crc(data: &[u8]) -> u16 {
+    let mut crc = 0xffff;
+    let mut i = 0;
+    while i < data.len() {
+        crc = update_crc_16(crc, data[i]);
+        i += 1;
+    }
+    !crc
+}
+
 pub fn now_us() -> u32 {
     fast_get_timer()
 }
 
 const TX_IDLE_ADDRESS: u32 = 4;
+
+/// The running CRC16 after a data packet's payload and CRC field, when
+/// the packet is intact.
+const CRC16_RESIDUAL: u16 = 0xb001;
 
 // Clock dividers for clk_sys at 144 MHz. TX runs at 4 cycles per bit and RX
 // at 12.
@@ -306,19 +322,17 @@ impl<PIO: PIOExt> UsbPio<PIO> {
 
     /// Transmit a data packet.
     ///
-    /// We calcuate CRC on the fly.
+    /// The time from the token to this packet is critical, so the caller
+    /// provides `crc`, from `data_crc`, computed before the token.
     #[link_section = ".data"]
-    fn tx_data(&mut self, pid: u8, data: &[u8], low_speed: bool) {
+    fn tx_data(&mut self, pid: u8, data: &[u8], crc: u16, low_speed: bool) {
         let token_end = self.tx_idle;
         self.setup_tx(data.len() + 4, low_speed);
         self.tx.write(SYNC as u32);
         self.tx.write(pid as u32);
         let mut i = 0;
-        let mut crc = 0xffff;
         while i < data.len() {
-            let data = data[i];
-            if self.tx.write(data as u32) {
-                crc = update_crc_16(crc, data);
+            if self.tx.write(data[i] as u32) {
                 i += 1;
             } else {
                 break;
@@ -329,13 +343,10 @@ impl<PIO: PIOExt> UsbPio<PIO> {
         }
         self.tx_start = timing::cycles();
         while i < data.len() {
-            let data = data[i];
-            if self.tx.write(data as u32) {
-                crc = update_crc_16(crc, data);
+            if self.tx.write(data[i] as u32) {
                 i += 1;
             }
         }
-        crc ^= 0xffff;
         while !self.tx.write(crc as u8 as u32) {}
         while !self.tx.write((crc >> 8) as u32) {}
         self.finish_tx();
@@ -403,8 +414,8 @@ impl<PIO: PIOExt> UsbPio<PIO> {
             while let Some(data) = self.rx.read() {
                 let byte = (data >> 24) as u8;
                 self.buf[ix] = byte;
-                if ix >= 4 {
-                    crc = update_crc_16(crc, self.buf[ix - 2]);
+                if ix >= 2 {
+                    crc = update_crc_16(crc, byte);
                 }
                 ix += 1;
             }
@@ -420,11 +431,8 @@ impl<PIO: PIOExt> UsbPio<PIO> {
                 break;
             }
         }
-        if ix >= 4 {
-            crc = !crc;
-            if self.buf[ix - 2] != crc as u8 || self.buf[ix - 1] != (crc >> 8) as u8 {
-                result = RxResult::CrcMismatch;
-            }
+        if ix >= 4 && crc != CRC16_RESIDUAL {
+            result = RxResult::CrcMismatch;
             //console!("crc fail");
         }
         unsafe {
@@ -562,8 +570,9 @@ impl<PIO: PIOExt> UsbPio<PIO> {
                 }
                 match pipe.req {
                     Request::Setup => {
+                        let crc = data_crc(&pipe.buf[0..8]);
                         self.tx_token(PID_SETUP, pipe.addr, pipe.ep, pipe.low_speed);
-                        self.tx_data(PID_DATA0, &pipe.buf[0..8], pipe.low_speed);
+                        self.tx_data(PID_DATA0, &pipe.buf[0..8], crc, pipe.low_speed);
                         let handshake = self.rx_handshake(pipe.low_speed);
                         if handshake == Some(PID_ACK) {
                             pipe.toggle = 1;
@@ -621,9 +630,10 @@ impl<PIO: PIOExt> UsbPio<PIO> {
                         }
                     }
                     Request::Out => {
-                        self.tx_token(PID_OUT, pipe.addr, pipe.ep, pipe.low_speed);
+                        let crc = data_crc(&pipe.buf[..pipe.len as usize]);
                         let pid = pid_data(pipe.toggle);
-                        self.tx_data(pid, &pipe.buf[..pipe.len as usize], pipe.low_speed);
+                        self.tx_token(PID_OUT, pipe.addr, pipe.ep, pipe.low_speed);
+                        self.tx_data(pid, &pipe.buf[..pipe.len as usize], crc, pipe.low_speed);
                         let handshake = self.rx_handshake(pipe.low_speed);
                         if handshake == Some(PID_ACK) {
                             pipe.toggle = 1;
