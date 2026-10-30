@@ -5,6 +5,7 @@
 
 use core::{
     cell::UnsafeCell,
+    mem::{offset_of, size_of},
     ops::{Deref, DerefMut},
     sync::atomic::{
         AtomicU32,
@@ -16,6 +17,7 @@ use crate::pio_usb::host_task::SetupPacket;
 
 const N_PIPES: usize = 16;
 
+#[repr(C)]
 pub struct Iface {
     // Bitmask of requests
     request: AtomicU32,
@@ -43,44 +45,65 @@ pub struct IntIface {}
 /// arrangement closer to the RP2350 chip, where there is a buffer space.
 const BUF_SIZE: usize = 64;
 
+// Word aligned, so the interrupt side can move buf by words.
+#[repr(C, align(4))]
 pub struct Pipe {
     pub buf: [u8; BUF_SIZE],
     pub addr: u8,
     pub ep: u8,
     // consider changing this to PID_DATA0 or PID_DATA1, rather than 0 or 1 as now
     pub toggle: u8,
+    pub low_speed: bool,
     pub len: u16,
     pub timer: u16,
     pub req: Request,
     pub status: Status,
-    pub low_speed: bool,
 }
+
+// The interrupt side's view of the interface; these must match its layout.
+const _: () = {
+    assert!(offset_of!(Iface, request) == 0);
+    assert!(offset_of!(Iface, response) == 4);
+    assert!(offset_of!(Iface, pipes) == 8);
+    assert!(offset_of!(Pipe, buf) == 0);
+    assert!(offset_of!(Pipe, addr) == 64);
+    assert!(offset_of!(Pipe, ep) == 65);
+    assert!(offset_of!(Pipe, toggle) == 66);
+    assert!(offset_of!(Pipe, low_speed) == 67);
+    assert!(offset_of!(Pipe, len) == 68);
+    assert!(offset_of!(Pipe, timer) == 70);
+    assert!(offset_of!(Pipe, req) == 72);
+    assert!(offset_of!(Pipe, status) == 73);
+    assert!(size_of::<Pipe>() == 76);
+};
 
 pub struct PipeGuard {
     pipe_ix: usize,
 }
 
+#[repr(u8)]
 #[derive(Clone, Copy, PartialEq)]
 pub enum Request {
-    Empty,
-    Setup,
-    In,
-    Out,
-    Delay,
+    Empty = 0,
+    Setup = 1,
+    In = 2,
+    Out = 3,
+    Delay = 4,
 }
 
+#[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Status {
-    Empty,
-    Success,
+    Empty = 0,
+    Success = 1,
     #[expect(unused, reason = "TODO: haven't implemented timeouts yet")]
-    Timeout,
+    Timeout = 2,
     #[expect(
         unused,
         reason = "TODO: signal this when hub signals port disconnected"
     )]
-    Disconnected,
-    Error,
+    Disconnected = 3,
+    Error = 4,
 }
 
 impl Pipe {
@@ -90,11 +113,11 @@ impl Pipe {
             addr: 0,
             ep: 0,
             toggle: 0,
+            low_speed: false,
             len: 0,
             timer: 0,
             req: Request::Empty,
             status: Status::Empty,
-            low_speed: false,
         }
     }
 
