@@ -1,0 +1,247 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+use "usb_crc.sy"
+
+// Transmitting USB packets, with PIO state machine 0. Timing-critical, and
+// called from the USB host's interrupt, so everything here is in RAM.
+//
+// SYNC takes far longer to send than the FIFO takes to fill, so a packet
+// starts as soon as SYNC is in the FIFO, to cut the time to the packet.
+// Nothing here may stall for the length of SYNC.
+
+const PIO_CTRL_SET = 0x50202000
+const PIO_CTRL_CLR = 0x50203000
+const DWT_CYCCNT = 0xe0001004
+
+// Clock dividers for clk_sys at 144 MHz; RX runs at 12 cycles per bit, TX
+// at 4.
+const TX_DIV_FULL = 3 << 16
+const RX_DIV_FULL = 1 << 16
+const TX_DIV_LOW = 24 << 16
+const RX_DIV_LOW = 8 << 16
+
+const PID_PRE = 0x3c
+const SYNC = 0x80
+// Ends a packet, as the FIFO holds no more bits than the count in x
+const TX_END = 0xff
+// Where the program waits when it's done
+const TX_IDLE_ADDRESS = 4
+const FSTAT_TXFULL0 = 1 << 16
+
+const SM_ENABLE0 = 1
+const SM_RESTART0 = 1 << 4
+
+// Must match usblog's TxStamps
+struct TxStamps {
+    // when the latest handshake or data packet was started
+    start: u32
+    // when the latest packet other than a handshake ended
+    idle: u32
+}
+
+symbol USB_TX_STAMPS: *TxStamps
+
+// Prime the state machine for a packet of bits bits, sending PRE first
+// for low speed.
+#[link_section = ".ram"]
+fn usb_setup_tx(bits: u32, low_speed: u32) {
+    if low_speed != 0 goto low
+    tx_div @r1 = TX_DIV_FULL
+    rx_div @r2 = RX_DIV_FULL
+    #[tail] call usb_prime_tx(bits, tx_div, rx_div)
+low:
+    push(r4, lr)
+    bits @r4 = bits
+    call usb_tx_pre()
+    arg @r0 = bits
+    tx_div @r1 = TX_DIV_LOW
+    rx_div @r2 = RX_DIV_LOW
+    call usb_prime_tx(arg, tx_div, rx_div)
+    pop(r4, pc)
+}
+
+#[link_section = ".ram"]
+fn usb_prime_tx(bits: u32, tx_div: u32, rx_div: u32) {
+    pio @r3 = peripherals.PIO0
+    pio.SM0_CLKDIV = tx_div
+    pio.SM1_CLKDIV = rx_div
+    clr @r2 = PIO_CTRL_CLR as *u32
+    enable @r1 = SM_ENABLE0
+    *clr = enable
+    // jmp bit_zero [1], restoring what RX patches
+    instr @r2 = 0x0105
+    pio.INSTR_MEM9 = instr
+    // set pins, J
+    instr @r2 = 0xe001
+    pio.SM0_INSTR = instr
+    // set pindirs, 3
+    instr @r2 = 0xe083
+    pio.SM0_INSTR = instr
+    set @r2 = PIO_CTRL_SET as *u32
+    restart @r1 = SM_RESTART0
+    *set = restart
+    // out x, 32
+    instr @r2 = 0x6020
+    pio.SM0_INSTR = instr
+    pio.TXF0 = bits
+    // out pc, 1
+    instr @r2 = 0x60a1
+    pio.SM0_INSTR = instr
+    bx lr
+}
+
+// Send PRE at full speed, leaving the line driven to J as the hub needs
+// before a low speed packet.
+#[link_section = ".ram"]
+fn usb_tx_pre() {
+    push(r4, lr)
+    pio @r1 = peripherals.PIO0
+    // set pins, J [7]
+    instr @r2 = 0xe701
+    pio.INSTR_MEM2 = instr
+    // set pindirs, 3
+    instr @r2 = 0xe083
+    pio.INSTR_MEM4 = instr
+    pid @r0 = PID_PRE
+    low_speed @r1 = 0
+    call usb_tx_handshake(pid, low_speed)
+    pio @r1 = peripherals.PIO0
+    // set pins, SE0 [7]
+    instr @r2 = 0xe700
+    pio.INSTR_MEM2 = instr
+    // set pindirs, 0
+    instr @r2 = 0xe080
+    pio.INSTR_MEM4 = instr
+    pop(r4, pc)
+}
+
+#[link_section = ".ram"]
+fn usb_tx_handshake(pid: u32, low_speed: u32) {
+    push(r4, lr)
+    pid @r4 = pid
+    bits @r0 = 16
+    call usb_setup_tx(bits, low_speed)
+    pio @r0 = peripherals.PIO0
+    sync @r1 = SYNC
+    pio.TXF0 = sync
+    set @r2 = PIO_CTRL_SET as *u32
+    enable @r3 = SM_ENABLE0
+    *set = enable
+    cyccnt @r1 = DWT_CYCCNT as *u32
+    t @r1 = *cyccnt
+    stamps @r2 = USB_TX_STAMPS
+    stamps.start = t
+    pio.TXF0 = pid
+    end @r1 = TX_END
+    pio.TXF0 = end
+    loop {
+        a @r1 = pio.SM0_ADDR
+        #(a - TX_IDLE_ADDRESS)
+        if #ne goto loop
+    }
+    pop(r4, pc)
+}
+
+// Send a token, or anything else that's 11 bits and a CRC5.
+#[link_section = ".ram"]
+fn usb_tx_token(pid: u32, data: u32, low_speed: u32) {
+    push(r4, r5, r6, lr)
+    pid @r4 = pid
+    word @r5 = data
+    low_speed @r6 = low_speed
+    arg @r0 = data
+    crc @r0 = call calc_usb_crc5(arg)
+    word |= crc << 11
+    bits @r0 = 32
+    low_speed @r1 = low_speed
+    call usb_setup_tx(bits, low_speed)
+    pio @r0 = peripherals.PIO0
+    sync @r1 = SYNC
+    pio.TXF0 = sync
+    set @r2 = PIO_CTRL_SET as *u32
+    enable @r3 = SM_ENABLE0
+    *set = enable
+    pio.TXF0 = pid
+    b @r1 = word[0..8]
+    pio.TXF0 = b
+    b @r1 = word >> 8
+    pio.TXF0 = b
+    b @r1 = TX_END
+    pio.TXF0 = b
+    call usb_tx_finish()
+    pop(r4, r5, r6, pc)
+}
+
+// Wait for a packet to end, and stamp it.
+#[link_section = ".ram"]
+fn usb_tx_finish() {
+    pio @r0 = peripherals.PIO0
+    loop {
+        a @r1 = pio.SM0_ADDR
+        #(a - TX_IDLE_ADDRESS)
+        if #ne goto loop
+    }
+    cyccnt @r1 = DWT_CYCCNT as *u32
+    t @r1 = *cyccnt
+    stamps @r2 = USB_TX_STAMPS
+    stamps.idle = t
+    bx lr
+}
+
+// Push a byte, waiting for room.
+#[link_section = ".ram"]
+fn usb_tx_push(b: u32) {
+    pio @r1 = peripherals.PIO0
+    loop {
+        st @r2 = pio.FSTAT
+        #(st & FSTAT_TXFULL0)
+        if #ne goto loop
+    }
+    pio.TXF0 = b
+    bx lr
+}
+
+// Send a data packet. crc_speed has the CRC in its low half, computed
+// before the token as the time from there to this packet is critical,
+// and low speed in its high half.
+#[link_section = ".ram"]
+fn usb_tx_data(pid: u32, data: *u8, len: u32, crc_speed: u32) {
+    push(r4, r5, r6, r7, r8, lr)
+    pid @r4 = pid
+    p @r5 = data
+    end @r6 = data + len
+    crc_speed @r7 = crc_speed
+    bits @r0 = len + 4
+    bits <<= 3
+    low_speed @r1 = crc_speed >> 16
+    call usb_setup_tx(bits, low_speed)
+    pio @r0 = peripherals.PIO0
+    sync @r1 = SYNC
+    pio.TXF0 = sync
+    set @r2 = PIO_CTRL_SET as *u32
+    enable @r3 = SM_ENABLE0
+    *set = enable
+    cyccnt @r1 = DWT_CYCCNT as *u32
+    t @r1 = *cyccnt
+    stamps @r2 = USB_TX_STAMPS
+    stamps.start = t
+    pio.TXF0 = pid
+    while {
+        #(p - end)
+        if #eq goto break
+    } loop {
+        b @r0 = *p++
+        call usb_tx_push(b)
+        #(p - end)
+        if #ne goto loop
+    }
+    b @r0 = crc_speed[0..8]
+    call usb_tx_push(b)
+    b @r0 = crc_speed[8..16]
+    call usb_tx_push(b)
+    b @r0 = TX_END
+    call usb_tx_push(b)
+    call usb_tx_finish()
+    pop(r4, r5, r6, r7, r8, pc)
+}

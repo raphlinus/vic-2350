@@ -17,7 +17,7 @@ use rp235x_hal as hal;
 use crate::pio_usb::wire::{pid_data_toggle, PID_PRE};
 
 use self::{
-    crc::{calc_usb_crc5, update_crc_16},
+    crc::update_crc_16,
     iface::{IntIface, Request, Status},
     wire::{pid_data, PID_ACK, PID_DATA0, PID_IN, PID_NAK, PID_OUT, PID_SETUP, PID_SOF, SYNC},
 };
@@ -125,6 +125,40 @@ unsafe fn fast_alarm_schedule(timestamp: u32) {
     }
 }
 
+/// Must match usb_tx.sy's TxStamps.
+#[repr(C)]
+struct TxStamps {
+    start: u32,
+    idle: u32,
+}
+
+#[no_mangle]
+static mut USB_TX_STAMPS: TxStamps = TxStamps { start: 0, idle: 0 };
+
+extern "C" {
+    fn usb_tx_handshake(pid: u32, low_speed: u32);
+    fn usb_tx_token(pid: u32, data: u32, low_speed: u32);
+    fn usb_tx_data(pid: u32, data: *const u8, len: u32, crc_speed: u32);
+}
+
+#[inline(always)]
+unsafe fn tx_token(pid: u8, addr: u8, ep_num: u8, low_speed: bool) {
+    let data = ((ep_num as u32 & 0xf) << 7) | (addr as u32 & 0x7f);
+    usb_tx_token(pid as u32, data, low_speed as u32);
+}
+
+/// Send a data packet, recording the time since the token.
+#[inline(always)]
+unsafe fn tx_data(pid: u8, data: &[u8], crc: u16, low_speed: bool) {
+    let token_end = USB_TX_STAMPS.idle;
+    let crc_speed = crc as u32 | (low_speed as u32) << 16;
+    usb_tx_data(pid as u32, data.as_ptr(), data.len() as u32, crc_speed);
+    timing::record(
+        timing::TOKEN_TO_DATA + low_speed as usize,
+        USB_TX_STAMPS.start.wrapping_sub(token_end),
+    );
+}
+
 /// The CRC16 field of a data packet.
 #[link_section = ".data"]
 fn data_crc(data: &[u8]) -> u16 {
@@ -171,8 +205,6 @@ struct UsbPio<PIO: PIOExt> {
     int_iface: IntIface,
     held_pipes: u32,
     // Cycle stamps, for timing
-    tx_start: u32,
-    tx_idle: u32,
     rx_start: u32,
     rx_eop: u32,
     rx_max_poll: u32,
@@ -233,142 +265,10 @@ impl<PIO: PIOExt> UsbPio<PIO> {
             sof_timestamp: 0,
             int_iface: IntIface::default(),
             held_pipes: 0,
-            tx_start: 0,
-            tx_idle: 0,
             rx_start: 0,
             rx_eop: 0,
             rx_max_poll: 0,
         }
-    }
-
-    #[link_section = ".data"]
-    fn setup_tx_raw(&mut self, n_bytes: usize) {
-        // Prime the state machine for transmit
-        unsafe {
-            pio_sm_stop(&self.tx_sm);
-            pio_write_instr(&self.pio, 9, 0x0105); // jmp bit_zero [1]
-            pio_sm_exec(&self.tx_sm, 0xe001); // set pins, LINE_STATE_J
-            pio_sm_exec(&self.tx_sm, 0xe083); // set pindirs, 3
-            pio_sm_restart(&self.tx_sm);
-            pio_sm_exec(&self.tx_sm, 0x6020); // out x, 32
-            self.tx.write(n_bytes as u32 * 8);
-            pio_sm_exec(&self.tx_sm, 0x60a1); // out pc, 1
-        }
-    }
-
-    #[link_section = ".data"]
-    fn setup_tx(&mut self, n_bytes: usize, low_speed: bool) {
-        if low_speed {
-            unsafe {
-                pio_write_instr(&self.pio, 2, 0xe701); // set pins, J [7]
-                pio_write_instr(&self.pio, 4, 0xe083); // set pindirs, 3
-            }
-            self.tx_handshake(PID_PRE, false);
-            unsafe {
-                pio_write_instr(&self.pio, 2, 0xe700); // set pins, SE0 [7]
-                pio_write_instr(&self.pio, 4, 0xe080); // set pindirs, 0
-            }
-            self.tx_sm.clock_divisor_fixed_point(TX_DIV_LOW_SPEED, 0);
-            self.rx_sm.clock_divisor_fixed_point(RX_DIV_LOW_SPEED, 0);
-        } else {
-            self.tx_sm.clock_divisor_fixed_point(TX_DIV_FULL_SPEED, 0);
-            self.rx_sm.clock_divisor_fixed_point(RX_DIV_FULL_SPEED, 0);
-        }
-        self.setup_tx_raw(n_bytes);
-    }
-
-    /// Transmit a 2-byte handshake packet.
-    ///
-    /// This method might go away, subsumed by `tx_packet`.
-    #[link_section = ".data"]
-    fn tx_handshake(&mut self, pid: u8, low_speed: bool) {
-        self.setup_tx(2, low_speed);
-        self.tx.write(SYNC as u32);
-        // SYNC takes far longer to send than the FIFO takes to fill, so
-        // start as soon as it's there, to cut the time to the packet.
-        unsafe {
-            pio_sm_start(&self.tx_sm);
-        }
-        self.tx_start = timing::cycles();
-        self.tx.write(pid as u32);
-        self.tx.write(0xff);
-        while self.tx_sm.instruction_address() != TX_IDLE_ADDRESS {}
-    }
-
-    #[link_section = ".data"]
-    fn tx_with_crc5(&mut self, pid: u8, data: u16, low_speed: bool) {
-        let crc = calc_usb_crc5(data);
-        let packet = [SYNC, pid, data as u8, (crc << 3) | (data >> 8) as u8];
-        self.tx_packet(&packet, low_speed);
-    }
-
-    #[link_section = ".data"]
-    fn tx_token(&mut self, pid: u8, addr: u8, ep_num: u8, low_speed: bool) {
-        let data = ((ep_num as u16 & 0xf) << 7) | (addr as u16 & 0x7f);
-        self.tx_with_crc5(pid, data, low_speed);
-    }
-
-    #[link_section = ".data"]
-    fn tx_pre_token(&mut self) {
-        unsafe {
-            pio_write_instr(&self.pio, 2, 0xe701); // set pins, J [7]
-            pio_write_instr(&self.pio, 4, 0xe083); // set pindirs, 3
-        }
-        self.tx_handshake(PID_PRE, false);
-        unsafe {
-            pio_write_instr(&self.pio, 2, 0xe700); // set pins, SE0 [7]
-            pio_write_instr(&self.pio, 4, 0xe080); // set pindirs, 0
-        }
-        self.tx_sm.clock_divisor_fixed_point(TX_DIV_LOW_SPEED, 0);
-    }
-
-    /// Transmit a data packet.
-    ///
-    /// The time from the token to this packet is critical, so the caller
-    /// provides `crc`, from `data_crc`, computed before the token.
-    #[link_section = ".data"]
-    fn tx_data(&mut self, pid: u8, data: &[u8], crc: u16, low_speed: bool) {
-        let token_end = self.tx_idle;
-        self.setup_tx(data.len() + 4, low_speed);
-        self.tx.write(SYNC as u32);
-        unsafe {
-            pio_sm_start(&self.tx_sm);
-        }
-        self.tx_start = timing::cycles();
-        self.tx.write(pid as u32);
-        for &byte in data {
-            while !self.tx.write(byte as u32) {}
-        }
-        while !self.tx.write(crc as u8 as u32) {}
-        while !self.tx.write((crc >> 8) as u32) {}
-        self.finish_tx();
-        timing::record(
-            timing::TOKEN_TO_DATA + low_speed as usize,
-            self.tx_start.wrapping_sub(token_end),
-        );
-    }
-
-    #[link_section = ".data"]
-    fn finish_tx(&mut self) {
-        while !self.tx.write(0xff) {}
-        while self.tx_sm.instruction_address() != TX_IDLE_ADDRESS {}
-        self.tx_idle = timing::cycles();
-    }
-
-    /// Transmit a packet.
-    ///
-    /// The packet must include SYNC (0x80) and any CRC.
-    #[link_section = ".data"]
-    fn tx_packet(&mut self, packet: &[u8], low_speed: bool) {
-        self.setup_tx(packet.len(), low_speed);
-        self.tx.write(packet[0] as u32);
-        unsafe {
-            pio_sm_start(&self.tx_sm);
-        }
-        for &byte in &packet[1..] {
-            while !self.tx.write(byte as u32) {}
-        }
-        self.finish_tx();
     }
 
     /// Receive a packet.
@@ -527,7 +427,7 @@ impl<PIO: PIOExt> UsbPio<PIO> {
     fn record_rx(&mut self, low_speed: bool) {
         timing::record(
             timing::TX_TO_RX + low_speed as usize,
-            self.rx_start.wrapping_sub(self.tx_idle),
+            self.rx_start.wrapping_sub(unsafe { USB_TX_STAMPS.idle }),
         );
         if self.rx_max_poll != 0 {
             timing::record(timing::RX_POLL + low_speed as usize, self.rx_max_poll);
@@ -554,8 +454,8 @@ impl<PIO: PIOExt> UsbPio<PIO> {
                 match pipe.req {
                     Request::Setup => {
                         let crc = data_crc(&pipe.buf[0..8]);
-                        self.tx_token(PID_SETUP, pipe.addr, pipe.ep, pipe.low_speed);
-                        self.tx_data(PID_DATA0, &pipe.buf[0..8], crc, pipe.low_speed);
+                        tx_token(PID_SETUP, pipe.addr, pipe.ep, pipe.low_speed);
+                        tx_data(PID_DATA0, &pipe.buf[0..8], crc, pipe.low_speed);
                         let handshake = self.rx_handshake(pipe.low_speed);
                         if handshake == Some(PID_ACK) {
                             pipe.toggle = 1;
@@ -569,16 +469,16 @@ impl<PIO: PIOExt> UsbPio<PIO> {
                         }
                     }
                     Request::In => {
-                        self.tx_token(PID_IN, pipe.addr, pipe.ep, pipe.low_speed);
+                        tx_token(PID_IN, pipe.addr, pipe.ep, pipe.low_speed);
                         let rx_result = self.rx_packet(pipe.low_speed);
                         match rx_result {
                             RxResult::Ok => {
                                 let expected_pid = pid_data(pipe.toggle);
                                 if self.buf[1] == expected_pid && self.buf_ix >= 4 {
-                                    self.tx_handshake(PID_ACK, pipe.low_speed);
+                                    usb_tx_handshake(PID_ACK as u32, pipe.low_speed as u32);
                                     timing::record(
                                         timing::EOP_TO_ACK + pipe.low_speed as usize,
-                                        self.tx_start.wrapping_sub(self.rx_eop),
+                                        USB_TX_STAMPS.start.wrapping_sub(self.rx_eop),
                                     );
                                     let len = self.buf_ix - 4;
                                     // This copy could be avoided by having rx_packet decode into the
@@ -599,7 +499,7 @@ impl<PIO: PIOExt> UsbPio<PIO> {
                                 } else if self.buf[1] == pid_data_toggle(expected_pid) {
                                     // if wrong data pid, then our last ack got lost, send ack
                                     // again but retry transaction.
-                                    self.tx_handshake(PID_ACK, pipe.low_speed);
+                                    usb_tx_handshake(PID_ACK as u32, pipe.low_speed as u32);
                                     self.held_pipes |= 1 << pipe_ix;
                                     continue;
                                 } else {
@@ -615,8 +515,8 @@ impl<PIO: PIOExt> UsbPio<PIO> {
                     Request::Out => {
                         let crc = data_crc(&pipe.buf[..pipe.len as usize]);
                         let pid = pid_data(pipe.toggle);
-                        self.tx_token(PID_OUT, pipe.addr, pipe.ep, pipe.low_speed);
-                        self.tx_data(pid, &pipe.buf[..pipe.len as usize], crc, pipe.low_speed);
+                        tx_token(PID_OUT, pipe.addr, pipe.ep, pipe.low_speed);
+                        tx_data(pid, &pipe.buf[..pipe.len as usize], crc, pipe.low_speed);
                         let handshake = self.rx_handshake(pipe.low_speed);
                         if handshake == Some(PID_ACK) {
                             pipe.toggle = 1;
@@ -697,7 +597,7 @@ pub unsafe extern "C" fn TIMER0_IRQ_0() {
                 timing::SOF_LATE,
                 fast_get_timer().wrapping_sub(usb_pio.sof_timestamp),
             );
-            usb_pio.tx_with_crc5(PID_SOF, usb_pio.frame_number as u16 & 0x7ff, false);
+            usb_tx_token(PID_SOF as u32, usb_pio.frame_number & 0x7ff, 0);
             usb_pio.handle_requests();
             usb_pio.wait_next_sof();
             timing::record(timing::HANDLER, timing::cycles().wrapping_sub(entry));
