@@ -34,10 +34,56 @@ The RP2350 register definitions come from the [rp235x-pac] crate, which the buil
 Put the board in BOOTSEL mode, then run, for example:
 
 ```
-tools/run.sh build/colorbars.elf
+picotool -x build/colorbars.elf
 ```
 
-This loads the demo with [picotool] and prints its log over USB serial. Development has been on macOS; Linux should work but hasn't been tested.
+You can also use `tools/run.sh`, which, in addition to picotool, prints logs sent over USB serial. It can also start from an existing running demo, using the "1200 bps touch" method.
+
+## Demos
+
+### colorbars
+
+![The colorbars demo](docs/screenshots/colorbars.png)
+
+This just demonstrates a simple bringup of video out, and can also be useful for calibrating video capture.
+
+### console
+
+(no screenshot)
+
+Displays raw USB reports; useful for debugging mice, keyboards, and other devices.
+
+### image
+
+![The image demo](docs/screenshots/image.png)
+
+Displays an image encoded using the [nibnib] image compression format. The image is stored in flash.
+
+### rects & drag
+
+![The rects demo](docs/screenshots/rects.png)
+
+The rects demo displays 64 colored rectangles bouncing around, showing off the animation capabilities of the race-the-beam renderer. There is also a drag variant that lets you drag the rectangles around with a USB mouse. That demo also shows off sprite rendering capabilities, for the mouse cursor.
+
+### sd_video
+
+![A screencap from the sd_video demo](docs/screenshots/sd_video.png)
+
+Plays a video clip from the SD card. The screenshot above is from [Big Buck Bunny] by the Blender (licensed as [CC-BY 3.0]). Copy the encoded video to VIDEO.NIB in the root of the SD card.
+
+Coming soon: a link to the encoded version, and link to the encoding tool.
+
+### textdemo
+
+![A demo of text rendering](docs/screenshots/textdemo.png)
+
+A demo of text rendering. It's a proportionally spaced font (helvR10.bdf from adobe-100dpi from the xorg distribution). One line scrolls, showing basic animation.
+
+### tiles
+
+![A demo of tiles rendering](docs/screenshots/tiles.png)
+
+A demo of 16x16 tile rendering, 16 colors each, with multiple palettes. The tileset is by Dandelion Pixel Art; see the maps/ subdirectory for more info.
 
 ## License
 
@@ -55,3 +101,6 @@ at your option.
 [pico-dvi-rs]: https://github.com/DusterTheFirst/pico-dvi-rs
 [rp235x-pac]: https://crates.io/crates/rp235x-pac
 [picotool]: https://github.com/raspberrypi/picotool
+[Big Buck Bunny]: https://peach.blender.org/about/
+[CC-BY 3.0]: https://creativecommons.org/licenses/by/3.0/
+[nibnib]: https://github.com/raphlinus/nibnib
