@@ -57,7 +57,7 @@ Displays raw USB reports; useful for debugging mice, keyboards, and other device
 
 ![The image demo](docs/screenshots/image.png)
 
-Displays an image encoded using the [nibnib] image compression format. The image is stored in flash.
+Displays an image encoded using the [nibnib] image compression format. The image is stored in flash. It should be 640x480.
 
 ### rects & drag
 
@@ -69,9 +69,9 @@ The rects demo displays 64 colored rectangles bouncing around, showing off the a
 
 ![A screencap from the sd_video demo](docs/screenshots/sd_video.png)
 
-Plays a video clip from the SD card. The screenshot above is from [Big Buck Bunny] by the Blender (licensed as [CC-BY 3.0]). Copy the encoded video to VIDEO.NIB in the root of the SD card.
+Plays a video clip from the SD card. The screenshot above is from [Big Buck Bunny] by the Blender Foundation (licensed as [CC-BY 3.0]). Copy the encoded video to VIDEO.NIB in the root of the SD card.
 
-Coming soon: a link to the encoded version, and link to the encoding tool.
+The re-encoded video binary can be found in the [v0.1.0 release] assets.
 
 ### textdemo
 
@@ -104,3 +104,4 @@ at your option.
 [Big Buck Bunny]: https://peach.blender.org/about/
 [CC-BY 3.0]: https://creativecommons.org/licenses/by/3.0/
 [nibnib]: https://github.com/raphlinus/nibnib
+[v0.1.0 release]: https://github.com/raphlinus/vic-2350/releases/tag/v0.1.0
