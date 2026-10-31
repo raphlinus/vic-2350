@@ -1,0 +1,313 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+// SD card experiment, run once in demo_init and logged over USB, then a
+// solid green screen, using the driver in sd.sy.
+//
+// The test brings the card up (sd_init) and reads block 0 in 1-bit mode at
+// 9 MHz. Then it switches to 4-bit (ACMD6), reads block 0 again and times
+// a multi-block read, checks that bad CRCs are caught, switches to high
+// speed (CMD6) and repeats the 4-bit reads at 36 MHz. Last, it lists the
+// root directory of the card's FAT32 volume (fat.sy). Every command's
+// response is logged raw, with the CRC7 computed from it and the one
+// received (R3's is all ones), until the FAT32 listing, and every block's
+// CRC16s are checked.
+//
+// Its functions each have a section of their own, as in sd.sy.
+
+const N_MULTI = 32
+static mut sd_block1: [u32; BLOCK_WORDS]
+static mut sd_block4: [u32; BLOCK_WORDS]
+static mut sd_multi: [u32; BLOCK_WORDS * N_MULTI]
+static fail_str: [u8; _] = "failed"
+static rd1_str: [u8; _] = "1-bit block 0:"
+static rd4_str: [u8; _] = "  4-bit block 0:"
+static rdm_str: [u8; _] = "  4-bit 32 blocks:"
+static status_str: [u8; _] = "    status "
+static rdcyc_str: [u8; _] = "    cycles "
+static ds_str: [u8; _] = "9 MHz, default speed"
+static hs_str: [u8; _] = "36 MHz, high speed"
+static res1_str: [u8; _] = "  CRC16 residue (0 is good) "
+static bad_str: [u8; _] = "    blocks with bad CRCs "
+static crccyc_str: [u8; _] = "    cycles to check their CRCs "
+static inj3_str: [u8; _] = "  bad lines with a data bit flipped on DAT3 (8 is right) "
+static inj0_str: [u8; _] = "  bad lines with a CRC bit flipped on DAT0 (1 is right) "
+static same4_str: [u8; _] = "    words differing from the 1-bit read "
+
+#[link_section = ".text"]
+fn demo_init() {
+    push(r4, r5, r6, lr)
+    one @r1 = 1
+    p @r0 = &sd_verbose
+    *p = one
+    status @r0 = call sd_init()
+    #(status - 0)
+    if #ne goto fail
+
+    // block 0 in 1-bit mode
+    p @r0 = &rd1_str
+    len @r1 = count(rd1_str)
+    call log_line(p, len)
+    p @r0 = &sd_block1
+    wide @r1 = 0
+    n @r2 = 1
+    status @r0 = call sd_read_logged(p, wide, n)
+    #(status - 0)
+    if #ne goto fail
+    p @r0 = &sd_block1
+    n @r1 = 514
+    out @r0 = call crc16(p, n)
+    v @r2 = out
+    p @r0 = &res1_str
+    len @r1 = count(res1_str)
+    call log_kv(p, len, v)
+
+    status @r0 = call sd_set_wide()
+    #(status - 0)
+    if #ne goto fail
+    p @r0 = &ds_str
+    len @r1 = count(ds_str)
+    call log_line(p, len)
+    status @r0 = call sd_test_4bit()
+    #(status - 0)
+    if #ne goto fail
+    call crc_inject_test()
+
+    status @r0 = call sd_switch_hs()
+    #(status - 0)
+    if #ne goto fail
+    p @r0 = &hs_str
+    len @r1 = count(hs_str)
+    call log_line(p, len)
+    status @r0 = call sd_test_4bit()
+    #(status - 0)
+    if #ne goto fail
+
+    // the FAT32 volume's root directory, in fat.sy, without logging each
+    // block's command
+    zero @r0 = 0
+    p @r1 = &sd_verbose
+    *p = zero
+    status @r0 = call fat_mount()
+    #(status - 0)
+    if #ne goto fail
+    status @r0 = call fat_list_root()
+    #(status - 0)
+    if #ne goto fail
+    goto finish
+
+fail:
+    p @r0 = &fail_str
+    len @r1 = count(fail_str)
+    call log_line(p, len)
+finish:
+    call log_end()
+    pop(r4, r5, r6, pc)
+}
+
+// sd_read, logging the status, and the cycles taken if it worked. Returns
+// the status.
+#[link_section = ".text"]
+fn sd_read_logged(p: *u32, wide: u32, n: u32) -> status: u32 {
+    push(r4, r5, r6, lr)
+    cyc @r12 = &peripherals.PPB.DWT_CYCCNT
+    t0 @r5 = *cyc
+    lba @r3 = 0
+    status @r0 = call sd_read(p, wide, n, lba)
+    saved @r4 = status
+    cyc @r0 = &peripherals.PPB.DWT_CYCCNT
+    t @r6 = *cyc
+    t -= t0
+    p @r0 = &status_str
+    len @r1 = count(status_str)
+    v @r2 = r4
+    call log_kvd(p, len, v)
+    if {
+        #(saved - 0)
+        if #ne goto end
+        p @r0 = &rdcyc_str
+        len @r1 = count(rdcyc_str)
+        v @r2 = r6
+        call log_kvd(p, len, v)
+    }
+    status @r0 = saved
+    pop(r4, r5, r6, pc)
+}
+
+// Read block 0 and then 32 blocks in 4-bit mode, checking their CRCs and
+// comparing block 0 with the 1-bit read. The buffers are cleared first,
+// so that stale data can't pass. Returns 0, or a read's status.
+#[link_section = ".text"]
+fn sd_test_4bit() -> status: u32 {
+    push(r4, r5, r6, r7, r8, lr)
+    p @r0 = &sd_block4
+    n @r1 = BLOCK_WORDS
+    call zero_words(p, n)
+    p @r0 = &sd_multi
+    n @r1 = BLOCK_WORDS * N_MULTI
+    call zero_words(p, n)
+
+    p @r0 = &rd4_str
+    len @r1 = count(rd4_str)
+    call log_line(p, len)
+    p @r0 = &sd_block4
+    wide @r1 = 1
+    n @r2 = 1
+    status @r0 = call sd_read_logged(p, wide, n)
+    #(status - 0)
+    if #ne goto done
+    p @r0 = &sd_block4
+    n @r1 = BLOCK_WORDS * 4
+    status @r0 = call crc16_4bit(p, n)
+    v @r2 = status
+    p @r0 = &res4_str
+    len @r1 = count(res4_str)
+    call log_kv(p, len, v)
+    a @r0 = &sd_block1
+    b @r1 = &sd_block4
+    n @r2 = 128
+    status @r0 = call count_diff(a, b, n)
+    v @r2 = status
+    p @r0 = &same4_str
+    len @r1 = count(same4_str)
+    call log_kvd(p, len, v)
+
+    p @r0 = &rdm_str
+    len @r1 = count(rdm_str)
+    call log_line(p, len)
+    p @r0 = &sd_multi
+    wide @r1 = 1
+    n @r2 = N_MULTI
+    status @r0 = call sd_read_logged(p, wide, n)
+    #(status - 0)
+    if #ne goto done
+    cyc @r0 = &peripherals.PPB.DWT_CYCCNT
+    t0 @r7 = *cyc
+    bad @r4 = 0
+    blk @r5 = &sd_multi
+    left @r6 = N_MULTI
+    loop {
+        p @r0 = r5
+        n @r1 = BLOCK_WORDS * 4
+        out @r0 = call crc16_4bit(p, n)
+        if {
+            if out == 0 goto end
+            bad += 1
+        }
+        blk += BLOCK_WORDS * 4
+        #(left -= 1)
+        if #ne goto loop
+    }
+    cyc @r0 = &peripherals.PPB.DWT_CYCCNT
+    t @r5 = *cyc
+    t -= t0
+    p @r0 = &bad_str
+    len @r1 = count(bad_str)
+    v @r2 = r4
+    call log_kvd(p, len, v)
+    p @r0 = &crccyc_str
+    len @r1 = count(crccyc_str)
+    v @r2 = r5
+    call log_kvd(p, len, v)
+    a @r0 = &sd_block1
+    b @r1 = &sd_multi
+    n @r2 = 128
+    status @r0 = call count_diff(a, b, n)
+    v @r2 = status
+    p @r0 = &same4_str
+    len @r1 = count(same4_str)
+    call log_kvd(p, len, v)
+    status @r0 = 0
+done:
+    pop(r4, r5, r6, r7, r8, pc)
+}
+
+// Check that crc16_4bit catches errors, and finds the right line, in
+// block 0 as read in 4-bit mode: flip byte 100's bit 3 (low nibble, DAT3),
+// then byte 515's bit 4 (high nibble, DAT0, in the CRCs), logging the bad
+// lines for each, and put them back.
+#[link_section = ".text"]
+fn crc_inject_test() {
+    push(r4, r5, r6, lr)
+    blk @r4 = &sd_block4
+    b @r0 = *((blk as *u8) + 100)
+    b ^= 8
+    *((blk as *u8) + 100) = b
+    p @r0 = r4
+    n @r1 = BLOCK_WORDS * 4
+    out @r0 = call crc16_4bit(p, n)
+    bad @r5 = out
+    b @r0 = *((blk as *u8) + 100)
+    b ^= 8
+    *((blk as *u8) + 100) = b
+    p @r0 = &inj3_str
+    len @r1 = count(inj3_str)
+    v @r2 = r5
+    call log_kv(p, len, v)
+
+    blk @r4 = &sd_block4
+    b @r0 = *((blk as *u8) + 515)
+    b ^= 0x10
+    *((blk as *u8) + 515) = b
+    p @r0 = r4
+    n @r1 = BLOCK_WORDS * 4
+    out @r0 = call crc16_4bit(p, n)
+    bad @r5 = out
+    b @r0 = *((blk as *u8) + 515)
+    b ^= 0x10
+    *((blk as *u8) + 515) = b
+    p @r0 = &inj0_str
+    len @r1 = count(inj0_str)
+    v @r2 = r5
+    call log_kv(p, len, v)
+    pop(r4, r5, r6, pc)
+}
+
+// Zero n words at p.
+#[link_section = ".text"]
+fn zero_words(p: *u32, n: u32) {
+    zero @r2 = 0
+    loop {
+        *p++ = zero
+        #(n -= 1)
+        if #ne goto loop
+    }
+    bx lr
+}
+
+// Count the words that differ between a and b, n words each.
+#[link_section = ".text"]
+fn count_diff(a: *u32, b: *u32, n: u32) -> out: u32 {
+    push(r4, lr)
+    diff @r3 = 0
+    loop {
+        x @r12 = *a++
+        y @r4 = *b++
+        #(x - y)
+        if {
+            if #eq goto end
+            diff += 1
+        }
+        #(n -= 1)
+        if #ne goto loop
+    }
+    out @r0 = diff
+    pop(r4, pc)
+}
+
+#[link_section = ".text"]
+fn demo_line(y: u32, pixels: *u32) {
+    color @r2 = 0x07e007e0
+    n @r3 = H_ACTIVE / 2
+    loop {
+        *pixels++ = color
+        #(n -= 1)
+        if #ne goto loop
+    }
+    bx lr
+}
+
+// Nothing to do in thread mode
+fn demo_main() {
+    bx lr
+}

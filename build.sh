@@ -6,6 +6,7 @@ set -e
 
 SYMBOLASM=${SYMBOLASM:-../symbolasm}
 TILESET=${TILESET:-maps/alien_world.png}
+PIOASM=${PIOASM:-$HOME/dl/pico-examples/build/pioasm/pioasm}
 
 python3 tools/tiles.py "$TILESET" maps/colony.tmx > tiles.sy
 
@@ -47,3 +48,8 @@ demo console "vec.sy render.sy display_list.sy stats.sy font.sy text.sy console.
 demo image image.sy build/image_data.o
 demo tiles "render_tiles.sy tiles.sy"
 demo psram_test psram_test.sy
+"$PIOASM" -o json sd.pio | python3 tools/pio2sy.py sd_pio_program > sd_pio.sy
+demo sd_test "sd_pio.sy sd.sy sd_test.sy fat.sy"
+demo sd_image "sd_pio.sy sd.sy fat.sy sd_image.sy"
+demo sd_video "sd_pio.sy sd.sy fat.sy sd_video.sy"
+demo sd_bench "sd_pio.sy sd.sy fat.sy sd_bench.sy"

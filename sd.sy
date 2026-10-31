@@ -1,0 +1,1257 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+// SD card driver, native SD bus mode on PIO1, with the programs in sd.pio:
+// SM0 drives CLK and paces the others, SM2 sends commands on CMD, SM3 reads
+// their responses, and SM1 receives data blocks, which DMA channel 2 copies
+// out, CRCs included.
+//
+// sd_init brings the card up to the transfer state at 9 MHz in 1-bit mode;
+// sd_set_wide switches to 4-bit, and sd_switch_hs then to high speed, at 36
+// MHz. sd_read reads blocks, and sd_read_sector one block with its CRCs
+// checked.
+//
+// Fruit Jam wiring: card detect GPIO33 (high with a card), CLK 34, CMD 35,
+// DAT0..DAT3 36..39. Only DAT3 has an external pull-up (10k); the others
+// use the pad pull-ups.
+//
+// sd_pio.sy is generated from sd.pio by pioasm and tools/pio2sy.py.
+//
+// Each function is in a section of its own (.text.<name>), so that its
+// literal pool is right after it. Otherwise the SD code is enough to put
+// the end of .text, where the assembler puts the one pool, out of ldr's
+// 4 KB reach from main.sy's start.
+
+// Card detect, then CLK, CMD and DAT0..DAT3
+const SD_DET_PIN = 33
+const SD_LAST_PIN = 39
+
+// DAT0 in SIO's GPIO_HI registers, which hold GPIO32..47 in bits 0..15
+// (card detect is bit 1)
+const DAT0_BIT = 1 << 4
+
+// PIO pin numbers, with GPIOBASE 16
+const PIO_CLK = 18
+const PIO_CMD = 19
+const PIO_DAT0 = 20
+
+// IE, 4mA, pull-up, Schmitt, and ISO clear
+const SD_PAD = 0x5a
+const RESET_PIO1 = 1 << 12
+const FUNC_SIO = 5
+const FUNC_PIO1 = 7
+
+// SM0's clock divider, at four instructions per SD clock. 144 MHz / 400 =
+// 360 kHz for identification, / 16 = 9 MHz after, and / 4 = 36 MHz in high
+// speed mode. Default speed could go faster, but sd.pio's one sample point
+// would be out of its valid window, and it only lasts until sd_switch_hs. A
+// card without high speed would stay at 9 MHz.
+const SLOW_DIV = 100
+const FAST_DIV = 4
+const HS_DIV = 1
+
+// pio.CTRL, for what's running: the bus with SM1 stopped, with SM1 running,
+// and SM1 with the clock stopped, which holds the bus still
+const SD_CTRL_BUS = 0xd
+const SD_CTRL_ALL = 0xf
+const SD_CTRL_STOPPED = 0xe
+// CMD's flags: sd_resp's restart in CTRL, then IRQ 2 (sd_tx is done) and
+// IRQ 3 (sd_tx may start)
+const SM3_RESTART = 1 << 7
+const IRQ_TX_DONE = 1 << 2
+const IRQ_TX_GO = 1 << 3
+
+// Timeouts in cycles at 144 MHz: 10 ms for a response, 0.5 s for busy, 1 s
+// for all of a read's data
+const CMD_TIMEOUT = 1440000
+const BUSY_TIMEOUT = 72000000
+const DATA_TIMEOUT = 144000000
+const ACMD41_TRIES = 2000
+
+// HCS (high capacity supported), 2.7-3.6 V
+const ACMD41_ARG = 0x40ff8000
+
+// Instructions for SMx_INSTR
+const PIO_PULL = 0x80a0
+const PIO_OUT_X_32 = 0x6020
+const PIO_OUT_Y_16 = 0x6050
+const PIO_SET_PINS_1 = 0xe001
+const PIO_SET_PINDIRS_1 = 0xe081
+
+// SM0: one side-set pin, CLK
+const SD_SM0_PINCTRL = (PIO_CLK << 10) | (1 << 29)
+const SD_SM0_EXECCTRL = (SD_CLK_WRAP << 12) | (SD_CLK_WRAP_TARGET << 7)
+// SM1: IN and JMP_PIN on DAT0; autopush. (Not FJOIN_RX, which would take
+// away the TX FIFO, which sd_rx_arm loads X through.)
+const SD_SM1_PINCTRL = PIO_DAT0 << 15
+const SD_SM1_SHIFTCTRL = 1 << 16
+const SD_SM1_EXECCTRL = (PIO_DAT0 << 24) | (SD_RX_WRAP << 12) | (SD_RX_WRAP_TARGET << 7)
+// SM2: OUT on CMD, one side-set pin, also CMD, setting its direction;
+// autopull at 16 bits. SET too, to rest the pin high.
+const SD_SM2_PINCTRL = PIO_CMD | (PIO_CMD << 5) | (PIO_CMD << 10) | (1 << 20) | (1 << 26) | (1 << 29)
+const SD_SM2_EXECCTRL = (1 << 29) | (SD_TX_WRAP << 12) | (SD_TX_WRAP_TARGET << 7)
+const SD_SM2_SHIFTCTRL = (1 << 17) | (16 << 25)
+// SM3: IN and JMP_PIN on CMD; autopull and autopush at 32 bits
+const SD_SM3_PINCTRL = PIO_CMD << 15
+const SD_SM3_EXECCTRL = (PIO_CMD << 24) | (SD_RESP_WRAP << 12) | (SD_RESP_WRAP_TARGET << 7)
+const SD_SM3_SHIFTCTRL = (1 << 17) | (1 << 16)
+// sd_rx's IN, for each width
+const PIO_IN_PINS_1 = 0x4001
+const PIO_IN_PINS_4 = 0x4004
+
+// A block in 1-bit mode is 4096 bits and a 16-bit CRC; SM1 reads 16 more
+// bits (the end bit and idle) to make whole words. In 4-bit mode it's
+// 1024 nibbles and 16 nibbles of CRC, one CRC16 per line.
+const RX1_BITS = 4128
+const RX1_WORDS = 129
+const RX4_NIBBLES = 1040
+const BLOCK_WORDS = 130
+// CMD6's status: 512 bits and the CRCs, in 4-bit mode
+const STATUS_NIBBLES = 144
+const STATUS_WORDS = 18
+// Mode 1 (switch), group 1 function 1 (high speed), the others unchanged
+const CMD6_HIGH_SPEED = 0x80fffff1
+
+// DMA channel 2: words from SM1's RX FIFO (DREQ 13) to memory, byte-swapped
+// so that the bytes land in the order they came off the bus
+const SD_DMA_CTRL = 1 | (2 << 2) | (1 << 6) | (2 << 13) | (13 << 17) | (1 << 24)
+
+// A response as read, start bit first, the last word left-aligned
+static mut sd_resp_buf: [u32; 5]
+static mut sd_resp_len: u32
+// The CRC7 computed from the response, and the one it carried
+static mut sd_resp_crc: u32
+static mut sd_resp_rcrc: u32
+// Whether sd_command logs each response
+static mut sd_verbose: u32
+static mut sd_rca: u32
+// 0 for block addressing (SDHC and SDXC), 9 for byte addressing (SDSC)
+static mut sd_addr_shift: u32
+static mut sd_name: [u8; 5]
+static mut sd_status: [u32; STATUS_WORDS]
+
+static det_str: [u8; _] = "card detect "
+static cmd_str: [u8; _] = "CMD"
+static timeout_str: [u8; _] = " timeout"
+static crc_str: [u8; _] = " crc "
+static nocard_str: [u8; _] = "no card"
+static tries_str: [u8; _] = "ACMD41 tries "
+static cycles_str: [u8; _] = "ACMD41 cycles "
+static name_str: [u8; _] = "name "
+static csize_str: [u8; _] = "C_SIZE "
+static mib_str: [u8; _] = "MiB "
+static busy_str: [u8; _] = "CMD7 busy cycles "
+static sw_str: [u8; _] = "CMD6 status [0..18]:"
+static fn_str: [u8; _] = "  group 1 function (1 is high speed) "
+static res4_str: [u8; _] = "    CRC16 residues, DAT3..DAT0 (0 is good) "
+
+// Bring the card up: card detect, identification at 360 kHz (CMD0, CMD8,
+// ACMD41, CMD2, CMD3, CMD9), then select it (CMD7) and go to 9 MHz, in
+// 1-bit mode. Logs the card's name and size, and each response if
+// sd_verbose. Returns 0, 1 if a command timed out, 8 if there's no card,
+// or 9 if the card never became ready.
+#[link_section = ".text"]
+fn sd_init() -> status: u32 {
+    push(r4, r5, r6, lr)
+    // enable the DWT cycle counter, for delays and timeouts
+    demcr @r0 = &peripherals.PPB.DEMCR
+    v @r1 = *demcr
+    v |= 1 << 24
+    *demcr = v
+    dwt_ctrl @r0 = &peripherals.PPB.DWT_CTRL
+    v = *dwt_ctrl
+    v |= 1
+    *dwt_ctrl = v
+
+    call sd_pins_init()
+    // let the pull-ups settle
+    t @r0 = 14400
+    call delay_cycles(t)
+    sio @r0 = peripherals.SIO
+    pins @r4 = sio.GPIO_HI_IN
+    det @r4 = pins[1..2]
+    p @r0 = &det_str
+    len @r1 = count(det_str)
+    v @r2 = r4
+    call log_kv(p, len, v)
+    if {
+        if det != 0 goto end
+        p @r0 = &nocard_str
+        len @r1 = count(nocard_str)
+        call log_line(p, len)
+        status @r0 = 8
+        goto done
+    }
+
+    // SM0 starts clocking; give the card its 74 clocks, then CMD0
+    call sd_pio_init()
+    t @r0 = 144000
+    call delay_cycles(t)
+    index @r0 = 0
+    arg @r1 = 0
+    rbits @r2 = 0
+    call sd_command(index, arg, rbits)
+
+    // CMD8: 2.7-3.6 V, check pattern 0xaa; R7 echoes it
+    index @r0 = 8
+    arg @r1 = 0x1aa
+    rbits @r2 = 48
+    status @r0 = call sd_command(index, arg, rbits)
+    #(status - 0)
+    if #ne goto done
+
+    // ACMD41 until the card is ready (OCR bit 31, response bit 23), quietly
+    pw @r0 = &sd_verbose
+    verbose @r6 = *pw
+    zero @r1 = 0
+    *pw = zero
+    cyc @r0 = &peripherals.PPB.DWT_CYCCNT
+    t0 @r5 = *cyc
+    tries @r4 = 0
+    loop {
+        index @r0 = 55
+        arg @r1 = 0
+        rbits @r2 = 48
+        status @r0 = call sd_command(index, arg, rbits)
+        #(status - 0)
+        if #ne goto not_ready
+        index @r0 = 41
+        arg @r1 = ACMD41_ARG
+        rbits @r2 = 48
+        status @r0 = call sd_command(index, arg, rbits)
+        #(status - 0)
+        if #ne goto not_ready
+        tries += 1
+        resp @r0 = &sd_resp_buf
+        w @r0 = *resp
+        #(w & (1 << 23))
+        if #ne goto break
+        #(tries - ACMD41_TRIES)
+        if #lo goto loop
+        status @r0 = 9
+        goto not_ready
+    }
+    pw @r0 = &sd_verbose
+    *pw = verbose
+    // CCS, OCR bit 30 (response bit 9): set for block addressing
+    resp @r0 = &sd_resp_buf
+    w @r0 = *resp
+    shift @r1 = 0
+    #(w & (1 << 22))
+    if {
+        if #ne goto end
+        shift = 9
+    }
+    pw @r0 = &sd_addr_shift
+    *pw = shift
+    cyc @r0 = &peripherals.PPB.DWT_CYCCNT
+    t @r6 = *cyc
+    t -= t0
+    p @r0 = &tries_str
+    len @r1 = count(tries_str)
+    v @r2 = r4
+    call log_kvd(p, len, v)
+    p @r0 = &cycles_str
+    len @r1 = count(cycles_str)
+    v @r2 = r6
+    call log_kvd(p, len, v)
+    // log the last ACMD41 response, with the OCR
+    pw @r0 = &sd_verbose
+    v @r0 = *pw
+    if {
+        if v == 0 goto end
+        index @r0 = 41
+        call sd_log_resp(index)
+    }
+
+    // CMD2: CID, with the product name in response bits 32..71
+    index @r0 = 2
+    arg @r1 = 0
+    rbits @r2 = 136
+    status @r0 = call sd_command(index, arg, rbits)
+    #(status - 0)
+    if #ne goto done
+    resp @r0 = &sd_resp_buf
+    name @r1 = &sd_name
+    w @r2 = *(resp + 4)
+    b @r3 = w[24..32]
+    *((name as *u8) + 0) = b
+    b = w[16..24]
+    *((name as *u8) + 1) = b
+    b = w[8..16]
+    *((name as *u8) + 2) = b
+    b = w[0..8]
+    *((name as *u8) + 3) = b
+    w = *(resp + 8)
+    b = w[24..32]
+    *((name as *u8) + 4) = b
+    p @r0 = &name_str
+    len @r1 = count(name_str)
+    call log_str(p, len)
+    p @r0 = &sd_name
+    len @r1 = count(sd_name)
+    call log_line(p, len)
+
+    // CMD3: the card publishes its RCA, in response bits 8..23
+    index @r0 = 3
+    arg @r1 = 0
+    rbits @r2 = 48
+    status @r0 = call sd_command(index, arg, rbits)
+    #(status - 0)
+    if #ne goto done
+    resp @r0 = &sd_resp_buf
+    w @r1 = *resp
+    rca @r1 = w[8..24]
+    rca <<= 16
+    pw @r0 = &sd_rca
+    *pw = rca
+
+    // CMD9: CSD. For CSD version 2, C_SIZE is bits 69..48 (response bits
+    // 66..87), and the capacity is (C_SIZE + 1) * 512 KiB.
+    index @r0 = 9
+    pw @r1 = &sd_rca
+    arg @r1 = *pw
+    rbits @r2 = 136
+    status @r0 = call sd_command(index, arg, rbits)
+    #(status - 0)
+    if #ne goto done
+    resp @r0 = &sd_resp_buf
+    w @r4 = *(resp + 8)
+    csize @r4 = w[8..30]
+    p @r0 = &csize_str
+    len @r1 = count(csize_str)
+    v @r2 = r4
+    call log_kvd(p, len, v)
+    mib @r2 = r4
+    mib += 1
+    mib >>= 1
+    p @r0 = &mib_str
+    len @r1 = count(mib_str)
+    call log_kvd(p, len, mib)
+
+    // CMD7: select the card, which moves it to the transfer state. The
+    // response is R1b, with busy on DAT0.
+    index @r0 = 7
+    pw @r1 = &sd_rca
+    arg @r1 = *pw
+    rbits @r2 = 48
+    status @r0 = call sd_command(index, arg, rbits)
+    #(status - 0)
+    if #ne goto done
+    status @r0 = call sd_wait_busy()
+    v @r2 = status
+    p @r0 = &busy_str
+    len @r1 = count(busy_str)
+    call log_kvd(p, len, v)
+
+    pio @r0 = peripherals.PIO1
+    div @r1 = FAST_DIV << 16
+    pio.SM0_CLKDIV = div
+    status @r0 = 0
+done:
+    pop(r4, r5, r6, pc)
+
+    // the status is in r0; put sd_verbose back
+not_ready:
+    pw @r1 = &sd_verbose
+    *pw = verbose
+    pop(r4, r5, r6, pc)
+}
+
+// ACMD6: switch the bus to 4-bit. Returns 0, or 1 if a command timed out.
+#[link_section = ".text"]
+fn sd_set_wide() -> status: u32 {
+    push(r4, lr)
+    index @r0 = 55
+    p @r1 = &sd_rca
+    arg @r1 = *p
+    rbits @r2 = 48
+    status @r0 = call sd_command(index, arg, rbits)
+    #(status - 0)
+    if #ne goto done
+    index @r0 = 6
+    arg @r1 = 2
+    rbits @r2 = 48
+    status @r0 = call sd_command(index, arg, rbits)
+done:
+    pop(r4, pc)
+}
+
+// Wait t cycles.
+#[link_section = ".text"]
+fn delay_cycles(t: u32) {
+    cyc @r1 = &peripherals.PPB.DWT_CYCCNT
+    t0 @r2 = *cyc
+    loop {
+        now @r3 = *cyc
+        now -= t0
+        #(now - t)
+        if #lo goto loop
+    }
+    bx lr
+}
+
+// Card detect to SIO, the SD pins to PIO1, all pulled up.
+#[link_section = ".text"]
+fn sd_pins_init() {
+    pads @r0 = peripherals.PADS_BANK0
+    pads += 4 + 4 * SD_DET_PIN
+    io @r1 = peripherals.IO_BANK0
+    io += 4 + 8 * SD_DET_PIN
+    pad @r2 = SD_PAD
+    function @r3 = FUNC_SIO
+    *pads = pad; pads += 4
+    *io = function; io += 8
+    function = FUNC_PIO1
+    n @r12 = SD_LAST_PIN - SD_DET_PIN
+    loop {
+        *pads = pad; pads += 4
+        *io = function; io += 8
+        #(n -= 1)
+        if #ne goto loop
+    }
+    bx lr
+}
+
+// Load the programs, configure SM0 and SM1, and start SM0 (and so CLK) at
+// the identification rate.
+#[link_section = ".text"]
+fn sd_pio_init() {
+    push(r4, lr)
+    mask @r0 = RESET_PIO1
+    call reset(mask)
+    pio @r0 = peripherals.PIO1
+    base @r1 = 16
+    pio.GPIOBASE = base
+    src @r1 = &sd_pio_program
+    dst @r2 = &pio.INSTR_MEM0
+    n @r3 = count(sd_pio_program)
+    loop {
+        w @r12 = *src++
+        *dst++ = w
+        #(n -= 1)
+        if #ne goto loop
+    }
+
+    v @r1 = SLOW_DIV << 16
+    pio.SM0_CLKDIV = v
+    v = SD_SM0_EXECCTRL
+    pio.SM0_EXECCTRL = v
+    // CLK is an output: SET PINDIRS with SET_BASE on CLK, once
+    v = (PIO_CLK << 5) | (1 << 26)
+    pio.SM0_PINCTRL = v
+    v = PIO_SET_PINDIRS_1
+    pio.SM0_INSTR = v
+    v = SD_SM0_PINCTRL
+    pio.SM0_PINCTRL = v
+    v = SD_CLK_OFFSET
+    pio.SM0_INSTR = v
+
+    v = 1 << 16
+    pio.SM1_CLKDIV = v
+    pio.SM2_CLKDIV = v
+    pio.SM3_CLKDIV = v
+    v = SD_SM1_PINCTRL
+    pio.SM1_PINCTRL = v
+    v = SD_SM1_SHIFTCTRL
+    pio.SM1_SHIFTCTRL = v
+    v = SD_SM1_EXECCTRL
+    pio.SM1_EXECCTRL = v
+
+    v = SD_SM2_EXECCTRL
+    pio.SM2_EXECCTRL = v
+    v = SD_SM2_SHIFTCTRL
+    pio.SM2_SHIFTCTRL = v
+    v = SD_SM2_PINCTRL
+    pio.SM2_PINCTRL = v
+    // CMD's output level is high, for when it's enabled
+    v = PIO_SET_PINS_1
+    pio.SM2_INSTR = v
+    // Y is sd_tx's bit count
+    v = 47 << 16
+    pio.TXF2 = v
+    v = PIO_PULL
+    pio.SM2_INSTR = v
+    v = PIO_OUT_Y_16
+    pio.SM2_INSTR = v
+    v = SD_TX_OFFSET
+    pio.SM2_INSTR = v
+
+    v = SD_SM3_EXECCTRL
+    pio.SM3_EXECCTRL = v
+    v = SD_SM3_SHIFTCTRL
+    pio.SM3_SHIFTCTRL = v
+    v = SD_SM3_PINCTRL
+    pio.SM3_PINCTRL = v
+    v = SD_RESP_OFFSET
+    pio.SM3_INSTR = v
+
+    v = SD_CTRL_BUS
+    pio.CTRL = v
+    pop(r4, pc)
+}
+
+// After a response timeout, SM3 is stuck looking for a start bit: restart
+// it, with its RX FIFO drained. Leaves SM1 stopped.
+#[link_section = ".text"]
+fn sd_pio_recover() {
+    pio @r0 = peripherals.PIO1
+    v @r1 = SD_CTRL_BUS | SM3_RESTART
+    pio.CTRL = v
+    loop {
+        fstat @r1 = pio.FSTAT
+        #(fstat & (1 << 11))
+        if #ne goto break
+        w @r1 = pio.RXF3
+        goto loop
+    }
+    v @r1 = SD_RESP_OFFSET
+    pio.SM3_INSTR = v
+    bx lr
+}
+
+// CRC7 (x^7 + x^3 + 1) of the top n bits of word, continuing from crc.
+#[link_section = ".text"]
+fn crc7_bits(word: u32, n: u32, crc: u32) -> out: u32 {
+    loop {
+        fb @r3 = crc >> 6
+        fb ^= word >> 31
+        fb &= 1
+        crc <<= 1
+        crc &= 0x7f
+        if {
+            if fb == 0 goto end
+            crc ^= 0x09
+        }
+        word <<= 1
+        #(n -= 1)
+        if #ne goto loop
+    }
+    out @r0 = crc
+    bx lr
+}
+
+// Send a command through SM0, and if rbits (48 or 136) isn't 0, read a
+// response of that many bits into sd_resp_buf, with its CRC7s in
+// sd_resp_crc and sd_resp_rcrc. Logs the response if sd_verbose. Returns
+// 0, or 1 on timeout.
+#[link_section = ".text"]
+fn sd_command(index: u32, arg: u32, rbits: u32) -> status: u32 {
+    push(r4, r5, r6, r7, r8, lr)
+    index @r4 = index
+    arg @r5 = arg
+    rbits @r6 = rbits
+    // CRC7 of the start, transmission, index and argument bits
+    word @r0 = index | 0x40
+    word <<= 24
+    n @r1 = 8
+    crc @r2 = 0
+    status @r0 = call crc7_bits(word, n, crc)
+    crc @r2 = status
+    word @r0 = r5
+    n @r1 = 32
+    status @r0 = call crc7_bits(word, n, crc)
+    crc @r7 = status
+
+    // the three halves of the command for SM2, and the response bits after
+    // the start bit minus one for SM3
+    pio @r0 = peripherals.PIO1
+    v @r1 = IRQ_TX_DONE
+    pio.IRQ = v
+    if {
+        if rbits == 0 goto end
+        y @r1 = rbits - 2
+        pio.TXF3 = y
+    }
+    h @r1 = index | 0x40
+    h <<= 24
+    arg @r2 = r5
+    t @r3 = arg >> 24
+    h |= t << 16
+    pio.TXF2 = h
+    h = arg[8..24]
+    h <<= 16
+    pio.TXF2 = h
+    arg <<= 24
+    arg |= crc << 17
+    arg |= 1 << 16
+    pio.TXF2 = arg
+    v @r1 = IRQ_TX_GO
+    pio.IRQ_FORCE = v
+    #(rbits - 0)
+    if #ne goto response
+
+    // No response: wait for SM2 to finish
+    loop {
+        v @r1 = pio.IRQ
+        #(v & IRQ_TX_DONE)
+        if #eq goto loop
+    }
+    status @r0 = 0
+    pop(r4, r5, r6, r7, r8, pc)
+
+response:
+    n @r7 = rbits + 31
+    n >>= 5
+    dst @r5 = &sd_resp_buf
+    cyc @r0 = &peripherals.PPB.DWT_CYCCNT
+    t0 @r8 = *cyc
+    loop {
+        loop {
+            pio @r0 = peripherals.PIO1
+            fstat @r1 = pio.FSTAT
+            #(fstat & (1 << 11))
+            if #eq goto break
+            cyc @r1 = &peripherals.PPB.DWT_CYCCNT
+            t @r1 = *cyc
+            t -= t0
+            limit @r2 = CMD_TIMEOUT
+            #(t - limit)
+            if #lo goto loop
+            goto timeout
+        }
+        pio @r0 = peripherals.PIO1
+        w @r1 = pio.RXF3
+        *dst++ = w
+        #(n -= 1)
+        if #ne goto loop
+    }
+    // left-align the last word
+    n @r0 = rbits + 31
+    n >>= 5
+    p @r1 = &sd_resp_len
+    *p = n
+    sh @r1 = -rbits
+    sh &= 31
+    dst -= 4
+    w @r2 = *dst
+    w <<= sh
+    *dst = w
+
+    resp @r5 = &sd_resp_buf
+    // 48 bits: the CRC covers bits 0..39, and is in bits 40..46
+    if {
+        #(rbits - 48)
+        if #ne goto end
+        word @r0 = *resp
+        n @r1 = 32
+        crc @r2 = 0
+        status @r0 = call crc7_bits(word, n, crc)
+        crc @r2 = status
+        word @r0 = *(resp + 4)
+        n @r1 = 8
+        out @r0 = call crc7_bits(word, n, crc)
+        p @r1 = &sd_resp_crc
+        *p = out
+        w @r0 = *(resp + 4)
+        rcrc @r0 = w[17..24]
+        p @r1 = &sd_resp_rcrc
+        *p = rcrc
+    }
+    // R2: the CRC covers the register's bits 127..8 (response bits
+    // 8..127), and is in bits 128..134
+    if {
+        #(rbits - 136)
+        if #ne goto end
+        word @r0 = *resp
+        word <<= 8
+        n @r1 = 24
+        crc @r2 = 0
+        status @r0 = call crc7_bits(word, n, crc)
+        crc @r2 = status
+        word @r0 = *(resp + 4)
+        n @r1 = 32
+        status @r0 = call crc7_bits(word, n, crc)
+        crc @r2 = status
+        word @r0 = *(resp + 8)
+        n @r1 = 32
+        status @r0 = call crc7_bits(word, n, crc)
+        crc @r2 = status
+        word @r0 = *(resp + 12)
+        n @r1 = 32
+        out @r0 = call crc7_bits(word, n, crc)
+        p @r1 = &sd_resp_crc
+        *p = out
+        w @r0 = *(resp + 16)
+        rcrc @r0 = w >> 25
+        p @r1 = &sd_resp_rcrc
+        *p = rcrc
+    }
+    p @r0 = &sd_verbose
+    v @r0 = *p
+    if {
+        if v == 0 goto end
+        index @r0 = r4
+        call sd_log_resp(index)
+    }
+    status @r0 = 0
+    pop(r4, r5, r6, r7, r8, pc)
+
+timeout:
+    call sd_pio_recover()
+    p @r0 = &sd_verbose
+    v @r0 = *p
+    if {
+        if v == 0 goto end
+        index @r0 = r4
+        call sd_log_timeout(index)
+    }
+    status @r0 = 1
+    pop(r4, r5, r6, r7, r8, pc)
+}
+
+// Log "CMD<index> timeout".
+#[link_section = ".text"]
+fn sd_log_timeout(index: u32) {
+    push(r4, lr)
+    index @r4 = index
+    p @r0 = &cmd_str
+    len @r1 = count(cmd_str)
+    call log_str(p, len)
+    v @r0 = r4
+    call log_dec(v)
+    p @r0 = &timeout_str
+    len @r1 = count(timeout_str)
+    call log_str(p, len)
+    nl @r0 = 10
+    call log_byte(nl)
+    call log_flush()
+    pop(r4, pc)
+}
+
+// Log "CMD<index>", each word of sd_resp_buf in hex, and the computed and
+// received CRC7s.
+#[link_section = ".text"]
+fn sd_log_resp(index: u32) {
+    push(r4, r5, r6, lr)
+    index @r4 = index
+    p @r0 = &cmd_str
+    len @r1 = count(cmd_str)
+    call log_str(p, len)
+    v @r0 = r4
+    call log_dec(v)
+    resp @r4 = &sd_resp_buf
+    pw @r0 = &sd_resp_len
+    n @r5 = *pw
+    loop {
+        sp_ @r0 = 32
+        call log_byte(sp_)
+        v @r0 = *resp++
+        call log_hex(v)
+        #(n -= 1)
+        if #ne goto loop
+    }
+    p @r0 = &crc_str
+    len @r1 = count(crc_str)
+    call log_str(p, len)
+    pw @r0 = &sd_resp_crc
+    v @r0 = *pw
+    call log_hex(v)
+    sp_ @r0 = 32
+    call log_byte(sp_)
+    pw @r0 = &sd_resp_rcrc
+    v @r0 = *pw
+    call log_hex(v)
+    nl @r0 = 10
+    call log_byte(nl)
+    call log_flush()
+    pop(r4, r5, r6, pc)
+}
+
+// Wait until DAT0 is high (the card isn't busy); SM0 keeps the clock
+// running. Returns the cycles waited, or BUSY_TIMEOUT.
+#[link_section = ".text"]
+fn sd_wait_busy() -> t: u32 {
+    push(r4, lr)
+    cyc @r2 = &peripherals.PPB.DWT_CYCCNT
+    t0 @r4 = *cyc
+    loop {
+        t @r0 = *cyc
+        t -= t0
+        sio @r1 = peripherals.SIO
+        pins @r1 = sio.GPIO_HI_IN
+        #(pins & DAT0_BIT)
+        if #ne goto break
+        limit @r1 = BUSY_TIMEOUT
+        #(t - limit)
+        if #lo goto loop
+    }
+    pop(r4, pc)
+}
+
+// Start SM1 and DMA channel 2 receiving data into p: words words in all,
+// in blocks of x + 1 bits or nibbles, with in_ as sd_rx's IN.
+#[link_section = ".text"]
+fn sd_rx_arm(p: *u32, in_: u32, x: u32, words: u32) {
+    push(r4, r5, r6, lr)
+    p @r4 = p
+    words @r5 = words
+    in_ @r0 = in_
+    x @r1 = x
+    call sd_rx_load(in_, x)
+    p @r0 = r4
+    words @r1 = r5
+    ctrl @r2 = SD_DMA_CTRL
+    call sd_rx_start(p, words, ctrl)
+    pop(r4, r5, r6, pc)
+}
+
+// Restart SM1 (the bus keeps running) and load it for blocks of x + 1 bits or
+// nibbles, with in_ as sd_rx's IN, leaving it stopped at the start of
+// sd_rx.
+#[link_section = ".text"]
+fn sd_rx_load(in_: u32, x: u32) {
+    pio @r2 = peripherals.PIO1
+    v @r3 = SD_CTRL_BUS | (1 << 5)
+    pio.CTRL = v
+    // drain its RX FIFO
+    loop {
+        fstat @r3 = pio.FSTAT
+        #(fstat & (1 << 9))
+        if #ne goto break
+        w @r3 = pio.RXF1
+        goto loop
+    }
+    mem @r3 = &pio.INSTR_MEM0
+    *(mem + SD_RX_IN_DATA * 4) = in_
+    // load X through the TX FIFO, then jump to the program
+    pio.TXF1 = x
+    ins @r3 = PIO_PULL
+    pio.SM1_INSTR = ins
+    ins = PIO_OUT_X_32
+    pio.SM1_INSTR = ins
+    ins = SD_RX_OFFSET
+    pio.SM1_INSTR = ins
+    bx lr
+}
+
+// Start DMA channel 2 moving words words from SM1 to p, with ctrl as its
+// CTRL (SD_DMA_CTRL, or without INCR_WRITE to keep writing one word), and
+// start SM1.
+#[link_section = ".text"]
+fn sd_rx_start(p: *u32, words: u32, ctrl: u32) {
+    pio @r3 = peripherals.PIO1
+    ch @r12 = peripherals.DMA as *DmaChannel
+    ch += 0x80
+    rx @r3 = &pio.RXF1
+    ch.read_addr = rx
+    ch.write_addr = p
+    ch.trans_count = words
+    ch.ctrl_trig = ctrl
+    pio @r3 = peripherals.PIO1
+    v @r0 = SD_CTRL_ALL
+    pio.CTRL = v
+    bx lr
+}
+
+// Abort DMA channel 2 and stop SM1.
+#[link_section = ".text"]
+fn sd_rx_stop() {
+    dma @r0 = peripherals.DMA
+    v @r1 = 1 << 2
+    dma.CHAN_ABORT = v
+    pio @r0 = peripherals.PIO1
+    v = SD_CTRL_BUS
+    pio.CTRL = v
+    bx lr
+}
+
+// Wait for the DMA from sd_rx_arm to finish, then stop SM1. Returns 0, or
+// 2 on timeout.
+#[link_section = ".text"]
+fn sd_rx_wait() -> status: u32 {
+    push(r4, lr)
+    cyc @r0 = &peripherals.PPB.DWT_CYCCNT
+    t0 @r4 = *cyc
+    loop {
+        ch @r1 = peripherals.DMA as *DmaChannel
+        ch += 0x80
+        ctrl @r2 = ch.ctrl_trig
+        #(ctrl & (1 << 26))
+        if #eq goto break
+        cyc @r0 = &peripherals.PPB.DWT_CYCCNT
+        t @r0 = *cyc
+        t -= t0
+        limit @r2 = DATA_TIMEOUT
+        #(t - limit)
+        if #lo goto loop
+        goto timed_out
+    }
+    pio @r0 = peripherals.PIO1
+    v @r1 = SD_CTRL_BUS
+    pio.CTRL = v
+    status @r0 = 0
+    pop(r4, pc)
+
+timed_out:
+    call sd_rx_stop()
+    status @r0 = 2
+    pop(r4, pc)
+}
+
+// Read n blocks from block lba into p: CMD17 for one block, otherwise
+// CMD18 then CMD12. wide selects 4-bit mode. Each block takes BLOCK_WORDS
+// words (RX1_WORDS in 1-bit mode), its CRC included. Returns 0, 1 if a
+// command timed out, or 2 if the data did.
+#[link_section = ".text"]
+fn sd_read(p: *u32, wide: u32, n: u32, lba: u32) -> status: u32 {
+    push(r4, r5, r6, r7, r8, lr)
+    p @r4 = p
+    wide @r5 = wide
+    n @r6 = n
+    lba @r7 = lba
+    in_ @r1 = PIO_IN_PINS_1
+    x @r2 = RX1_BITS - 1
+    words @r3 = RX1_WORDS
+    if {
+        if wide == 0 goto end
+        in_ = PIO_IN_PINS_4
+        x = RX4_NIBBLES - 1
+        words = BLOCK_WORDS
+    }
+    words *= n
+    p @r0 = r4
+    call sd_rx_arm(p, in_, x, words)
+
+    index @r0 = 17
+    if {
+        #(n - 1)
+        if #eq goto end
+        index = 18
+    }
+    p @r1 = &sd_addr_shift
+    shift @r1 = *p
+    arg @r1 = lba << shift
+    rbits @r2 = 48
+    status @r0 = call sd_command(index, arg, rbits)
+    #(status - 0)
+    if #ne goto cmd_failed
+    status @r0 = call sd_rx_wait()
+    #(status - 0)
+    if #ne goto done
+    if {
+        #(n - 1)
+        if #eq goto end
+        index @r0 = 12
+        arg @r1 = 0
+        rbits @r2 = 48
+        status @r0 = call sd_command(index, arg, rbits)
+        #(status - 0)
+        if #ne goto done
+        call sd_wait_busy()
+    }
+    status @r0 = 0
+done:
+    pop(r4, r5, r6, r7, r8, pc)
+
+cmd_failed:
+    call sd_rx_stop()
+    status @r0 = 1
+    pop(r4, r5, r6, r7, r8, pc)
+}
+
+// Read block lba into p (BLOCK_WORDS words) in 4-bit mode, and check its
+// CRCs, reading it once more if they're bad. Returns 0, sd_read's status,
+// or 4 if the CRCs were bad both times.
+#[link_section = ".text"]
+fn sd_read_sector(p: *u32, lba: u32) -> status: u32 {
+    push(r4, r5, r6, lr)
+    p @r4 = p
+    lba @r5 = lba
+    tries @r6 = 2
+    loop {
+        p @r0 = r4
+        wide @r1 = 1
+        n @r2 = 1
+        lba_ @r3 = r5
+        status @r0 = call sd_read(p, wide, n, lba_)
+        #(status - 0)
+        if #ne goto done
+        p @r0 = r4
+        n @r1 = BLOCK_WORDS * 4
+        status @r0 = call crc16_4bit(p, n)
+        #(status - 0)
+        if #eq goto done
+        #(tries -= 1)
+        if #ne goto loop
+    }
+    status @r0 = 4
+done:
+    pop(r4, r5, r6, pc)
+}
+
+// CMD6: switch to high speed, in 4-bit mode, and CLK to 36 MHz. The card
+// answers with 512 bits of status on DAT, which are logged and CRC checked;
+// group 1's function, bits 379..376 (the low nibble of byte 16), should then
+// be 1. Returns 0, 1 if the command timed out, 2 if the data did, or 3 if the
+// switch didn't take.
+#[link_section = ".text"]
+fn sd_switch_hs() -> status: u32 {
+    push(r4, lr)
+    p @r0 = &sd_status
+    in_ @r1 = PIO_IN_PINS_4
+    x @r2 = STATUS_NIBBLES - 1
+    words @r3 = STATUS_WORDS
+    call sd_rx_arm(p, in_, x, words)
+    index @r0 = 6
+    arg @r1 = CMD6_HIGH_SPEED
+    rbits @r2 = 48
+    status @r0 = call sd_command(index, arg, rbits)
+    if {
+        #(status - 0)
+        if #eq goto end
+        call sd_rx_stop()
+        status @r0 = 1
+        goto done
+    }
+    status @r0 = call sd_rx_wait()
+    #(status - 0)
+    if #ne goto done
+
+    p @r0 = &sw_str
+    len @r1 = count(sw_str)
+    call log_str(p, len)
+    p @r0 = &sd_status
+    n @r1 = 18
+    call log_bytes(p, n)
+    p @r0 = &sd_status
+    n @r1 = STATUS_WORDS * 4
+    status @r0 = call crc16_4bit(p, n)
+    v @r2 = status
+    p @r0 = &res4_str
+    len @r1 = count(res4_str)
+    call log_kv(p, len, v)
+    p @r0 = &sd_status
+    b @r4 = *((p as *u8) + 16)
+    b &= 15
+    p @r0 = &fn_str
+    len @r1 = count(fn_str)
+    v @r2 = r4
+    call log_kvd(p, len, v)
+    status @r0 = 3
+    #(b - 1)
+    if #ne goto done
+    pio @r0 = peripherals.PIO1
+    div @r1 = HS_DIV << 16
+    pio.SM0_CLKDIV = div
+    status @r0 = 0
+done:
+    pop(r4, pc)
+}
+
+// CRC16-CCITT (x^16 + x^12 + x^5 + 1, initial 0) of n bytes at p, most
+// significant bit first. Over a block and its CRC, the result is 0.
+#[link_section = ".text"]
+fn crc16(p: *u8, n: u32) -> out: u32 {
+    push(r4, r5, r6, lr)
+    crc @r2 = 0
+    poly @r4 = 0x1021
+    loop {
+        b @r3 = *((p as *u8) + 0)
+        p += 1
+        crc ^= b << 8
+        k @r12 = 8
+        loop {
+            top @r3 = crc & 0x8000
+            crc <<= 1
+            if {
+                if top == 0 goto end
+                crc ^= poly
+            }
+            #(k -= 1)
+            if #ne goto loop
+        }
+        crc = crc[0..16]
+        #(n -= 1)
+        if #ne goto loop
+    }
+    out @r0 = crc
+    pop(r4, r5, r6, pc)
+}
+
+// Check the four lines' CRC16s of a 4-bit block of n bytes (a multiple of
+// 4) at p, data and CRCs, in bus order. Returns 0 for a good block, otherwise bit i set
+// if DATi's CRC is bad.
+//
+// The four CRC16s are one CRC over the stream of nibbles, with G(x) =
+// x^16 + x^12 + x^5 + 1 replaced by G(x^4) = x^64 + x^48 + x^20 + 1, as
+// its powers of x^4 keep the lines apart. That's checked a word at a time:
+// with the 64-bit remainder in hi:lo and the next 32 stream bits in w, t =
+// hi ^ w, and t * x^64 mod G(x^4) is (t ^ (t >> 16)) * (x^48 + x^20 + 1)
+// with the x^64 and up folded back in, which comes to u = t ^ (t >> 16),
+// hi = lo ^ (u << 16) ^ (u >> 12), lo = u ^ (u << 20). Over a block and
+// its CRCs the remainder is 0. Only if it isn't are the lines checked one
+// at a time, to say which is bad.
+//
+// Treating the four lines as one CRC and working a word at a time is the
+// method of sdio_crc16_4bit_checksum in ZuluSCSI, by Petteri Aimonen,
+// rearranged to compute a remainder.
+#[link_section = ".text"]
+fn crc16_4bit(p: *u32, n: u32) -> out: u32 {
+    push(r4, r5, r6, lr)
+    start @r4 = p
+    n @r5 = n
+    words @r1 = n >> 2
+    hi @r2 = 0
+    lo @r3 = 0
+    loop {
+        w @r12 = *p++
+        // bus order to stream order
+        w = rev(w)
+        t @r6 = hi ^ w
+        u @r6 = t ^ (t >> 16)
+        hi = lo ^ (u >> 12)
+        hi ^= u << 16
+        lo = u ^ (u << 20)
+        #(words -= 1)
+        if #ne goto loop
+    }
+    #(_ @r3 = hi | lo)
+    if {
+        if #eq goto end
+        p @r0 = r4
+        n @r1 = r5
+        pop(r4, r5, r6, lr)
+        #[tail] call crc16_4bit_lines(p, n)
+    }
+    out @r0 = 0
+    pop(r4, r5, r6, pc)
+}
+
+// crc16_4bit's slow path: each line's CRC16 bit by bit. Returns bit i set
+// if DATi's is bad.
+#[link_section = ".text"]
+fn crc16_4bit_lines(p: *u8, n: u32) -> out: u32 {
+    push(r4, r5, r6, r7, r8, lr)
+    p @r4 = p
+    n @r7 = n
+    bad @r5 = 0
+    line @r6 = 3
+    loop {
+        p @r0 = r4
+        line_ @r1 = r6
+        n @r2 = r7
+        out @r0 = call crc16_line(p, line_, n)
+        bad <<= 1
+        if {
+            if out == 0 goto end
+            bad |= 1
+        }
+        #(line -= 1)
+        if #pl goto loop
+    }
+    out @r0 = bad
+    pop(r4, r5, r6, r7, r8, pc)
+}
+
+// The CRC16 of one line of a 4-bit block of n bytes at p, data and CRC:
+// bit line of each nibble, high nibble first. 0 for a good block.
+#[link_section = ".text"]
+fn crc16_line(p: *u8, line: u32, n: u32) -> out: u32 {
+    push(r4, r5, r6, r7, r8, lr)
+    n @r6 = n
+    crc @r2 = 0
+    poly @r4 = 0x1021
+    hi @r5 = line + 4
+    loop {
+        b @r3 = *((p as *u8) + 0)
+        p += 1
+        bit @r8 = b >> hi
+        bit &= 1
+        crc ^= bit << 15
+        top @r7 = crc & 0x8000
+        crc <<= 1
+        if {
+            if top == 0 goto end
+            crc ^= poly
+        }
+        bit @r8 = b >> line
+        bit &= 1
+        crc ^= bit << 15
+        top @r7 = crc & 0x8000
+        crc <<= 1
+        if {
+            if top == 0 goto end
+            crc ^= poly
+        }
+        #(n -= 1)
+        if #ne goto loop
+    }
+    out @r0 = crc[0..16]
+    pop(r4, r5, r6, r7, r8, pc)
+}
+
+// Log len bytes from p and a newline.
+#[link_section = ".text"]
+fn log_line(p: *u8, len: u32) {
+    push(r4, lr)
+    call log_str(p, len)
+    nl @r0 = 10
+    call log_byte(nl)
+    call log_flush()
+    pop(r4, pc)
+}
+
+// Log n bytes from p in hex, each after a space, then a newline.
+#[link_section = ".text"]
+fn log_bytes(p: *u8, n: u32) {
+    push(r4, r5, r6, lr)
+    p @r4 = p
+    n @r5 = n
+    loop {
+        sp_ @r0 = 32
+        call log_byte(sp_)
+        b @r6 = *((p as *u8) + 0)
+        p += 1
+        d @r0 = b >> 4
+        call log_nibble(d)
+        d @r0 = b & 15
+        call log_nibble(d)
+        #(n -= 1)
+        if #ne goto loop
+    }
+    nl @r0 = 10
+    call log_byte(nl)
+    call log_flush()
+    pop(r4, r5, r6, pc)
+}
+
+// Log a hex digit.
+#[link_section = ".text"]
+fn log_nibble(d: u32) {
+    #(d - 10)
+    if {
+        if #lo goto end
+        d += 7
+    }
+    d += 48
+    #[tail] call log_byte(d)
+}
+
+// Log len bytes from p, then v in hex and a newline.
+#[link_section = ".text"]
+fn log_kv(p: *u8, len: u32, v: u32) {
+    push(r4, lr)
+    v_saved @r4 = v
+    call log_str(p, len)
+    v @r0 = r4
+    call log_hex(v)
+    nl @r0 = 10
+    call log_byte(nl)
+    call log_flush()
+    pop(r4, pc)
+}
+
+// Log len bytes from p, then v in decimal and a newline.
+#[link_section = ".text"]
+fn log_kvd(p: *u8, len: u32, v: u32) {
+    push(r4, lr)
+    v_saved @r4 = v
+    call log_str(p, len)
+    v @r0 = r4
+    call log_dec(v)
+    nl @r0 = 10
+    call log_byte(nl)
+    call log_flush()
+    pop(r4, pc)
+}

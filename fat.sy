@@ -1,0 +1,833 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+// Reading a FAT32 volume on the SD card, through sd_read_sector and
+// sd_read in sd.sy: find the volume (the first FAT32 partition in the MBR,
+// or the whole card if it has no partition table), list its root directory
+// over USB, or find a file there and read it. Listed entries show their
+// long name if they have one, as ASCII with '?' for anything else,
+// otherwise their 8.3 name.
+//
+// Each function is in a section of its own, as in sd.sy.
+
+// FAT32's partition types are 0x0b (CHS) and 0x0c (LBA)
+const PART_FAT32 = 0x0b
+const DIR_ENTRY = 32
+const ATTR_VOLUME = 0x08
+const ATTR_DIR = 0x10
+const ATTR_LFN = 0x0f
+// FAT32 entries are 28 bits; this and up ends a chain
+const FAT_EOC = 0x0ffffff8
+// A bound on the root directory's clusters, in case the chain loops
+const MAX_DIR_CLUSTERS = 1024
+// Long names are at most 255 characters, in up to 20 entries of 13
+const LFN_MAX = 260
+
+struct Fat {
+    part_lba: u32
+    sec_per_clus: u32
+    fat_lba: u32
+    data_lba: u32
+    root_clus: u32
+    // the FAT sector in fat_fat_buf, plus one; 0 for none
+    fat_cached: u32
+}
+
+static mut fat: Fat
+static mut fat_dir_buf: [u32; BLOCK_WORDS]
+static mut fat_fat_buf: [u32; BLOCK_WORDS]
+// A long name being collected, its length in characters (13 per entry,
+// so it may end early with a 0), 0 if there's none, and the checksum of
+// the short name it belongs to
+static mut fat_lfn: [u8; LFN_MAX]
+static mut fat_lfn_len: u32
+static mut fat_lfn_sum: u32
+// The 11-byte short name fat_walk_root looks for, 0 to list instead, and
+// what it found: the first cluster (0 if none) and the size
+static mut fat_find: u32
+static mut fat_found_clus: u32
+static mut fat_found_size: u32
+
+// fat_read_file reads up to this many blocks at a time, as read, CRCs
+// included
+const FAT_STAGE_BLOCKS = 32
+static mut fat_stage: [u32; BLOCK_WORDS * FAT_STAGE_BLOCKS]
+
+// Where a long name entry's 13 UTF-16 characters are
+static fat_lfn_offsets: [u8; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30]
+
+static part_str: [u8; _] = "FAT32 volume at block "
+static oem_str: [u8; _] = "  OEM name: "
+static vlab_str: [u8; _] = "  label: "
+static fstype_str: [u8; _] = "  type: "
+static spc_str: [u8; _] = "  sectors per cluster "
+static fats_str: [u8; _] = "  FATs "
+static fatsz_str: [u8; _] = "  sectors per FAT "
+static root_str: [u8; _] = "  root directory cluster "
+static notfat_str: [u8; _] = "not a FAT32 volume"
+static chain_str: [u8; _] = "bad cluster chain"
+static dirlab_str: [u8; _] = "volume label: "
+static listing_str: [u8; _] = "root directory:"
+static notfound_str: [u8; _] = "not found"
+
+// Find the FAT32 volume and fill in fat, logging what's found. Returns 0,
+// sd_read_sector's status, or 5 if it isn't FAT32.
+#[link_section = ".text"]
+fn fat_mount() -> status: u32 {
+    push(r4, r5, r6, lr)
+    p @r0 = &fat_dir_buf
+    lba @r1 = 0
+    status @r0 = call sd_read_sector(p, lba)
+    #(status - 0)
+    if #ne goto done
+    // the first FAT32 partition (type 0x0b or 0x0c) in the MBR
+    e @r1 = &fat_dir_buf
+    e += 446
+    part @r4 = 0
+    n @r2 = 4
+    loop {
+        // 0x0b or 0x0c
+        t @r3 = *((e as *u8) + 4)
+        t -= PART_FAT32
+        #(t - 1)
+        if {
+            if #hi goto end
+            part = *((e as *u32) + 8)
+            goto break
+        }
+        e += 16
+        #(n -= 1)
+        if #ne goto loop
+    }
+    p @r0 = &part_str
+    len @r1 = count(part_str)
+    v @r2 = r4
+    call log_kvd(p, len, v)
+    p @r0 = &fat_dir_buf
+    lba @r1 = r4
+    status @r0 = call sd_read_sector(p, lba)
+    #(status - 0)
+    if #ne goto done
+
+    // The boot sector: signature 0xaa55, 512-byte sectors, and the FAT16
+    // root entry count and FAT size both 0
+    b @r5 = &fat_dir_buf
+    sig @r0 = *((b as *u16) + 510)
+    want @r1 = 0xaa55
+    #(sig - want)
+    if #ne goto not_fat32
+    bps @r0 = *((b as *u16) + 11)
+    #(bps - 512)
+    if #ne goto not_fat32
+    fat16 @r0 = *((b as *u16) + 17)
+    sz16 @r1 = *((b as *u16) + 22)
+    fat16 |= sz16
+    #(fat16 - 0)
+    if #ne goto not_fat32
+    spc @r0 = *((b as *u8) + 13)
+    #(spc - 0)
+    if #eq goto not_fat32
+
+    f @r6 = &fat
+    f.part_lba = part
+    f.sec_per_clus = spc
+    rsvd @r1 = *((b as *u16) + 14)
+    flba @r1 = part + rsvd
+    f.fat_lba = flba
+    nfats @r2 = *((b as *u8) + 16)
+    fatsz @r3 = *((b as *u32) + 36)
+    data @r2 = flba + nfats * fatsz
+    f.data_lba = data
+    root @r1 = *((b as *u32) + 44)
+    f.root_clus = root
+    zero @r1 = 0
+    f.fat_cached = zero
+
+    p @r0 = &oem_str
+    len @r1 = count(oem_str)
+    call log_str(p, len)
+    p @r0 = r5
+    p += 3
+    len @r1 = 8
+    call log_line(p, len)
+    p @r0 = &vlab_str
+    len @r1 = count(vlab_str)
+    call log_str(p, len)
+    p @r0 = r5
+    p += 71
+    len @r1 = 11
+    call log_line(p, len)
+    p @r0 = &fstype_str
+    len @r1 = count(fstype_str)
+    call log_str(p, len)
+    p @r0 = r5
+    p += 82
+    len @r1 = 8
+    call log_line(p, len)
+    p @r0 = &spc_str
+    len @r1 = count(spc_str)
+    v @r2 = *((b as *u8) + 13)
+    call log_kvd(p, len, v)
+    p @r0 = &fats_str
+    len @r1 = count(fats_str)
+    v @r2 = *((b as *u8) + 16)
+    call log_kvd(p, len, v)
+    p @r0 = &fatsz_str
+    len @r1 = count(fatsz_str)
+    v @r2 = *((b as *u32) + 36)
+    call log_kvd(p, len, v)
+    p @r0 = &root_str
+    len @r1 = count(root_str)
+    v @r2 = *((b as *u32) + 44)
+    call log_kvd(p, len, v)
+    status @r0 = 0
+done:
+    pop(r4, r5, r6, pc)
+
+not_fat32:
+    p @r0 = &notfat_str
+    len @r1 = count(notfat_str)
+    call log_line(p, len)
+    status @r0 = 5
+    pop(r4, r5, r6, pc)
+}
+
+// The first block of cluster c.
+#[link_section = ".text"]
+fn fat_clus_lba(c: u32) -> out: u32 {
+    f @r1 = &fat
+    spc @r2 = f.sec_per_clus
+    data @r3 = f.data_lba
+    c -= 2
+    out @r0 = data + c * spc
+    bx lr
+}
+
+// The cluster after c in its chain, from the FAT: FAT_EOC or more at the
+// end, or 1 if the FAT couldn't be read.
+#[link_section = ".text"]
+fn fat_next(c: u32) -> next: u32 {
+    push(r4, r5, r6, lr)
+    c @r4 = c
+    // 128 entries per sector
+    f @r5 = &fat
+    lba @r6 = f.fat_lba
+    lba += c >> 7
+    cached @r0 = f.fat_cached
+    want @r1 = lba + 1
+    #(cached - want)
+    if {
+        if #eq goto end
+        p @r0 = &fat_fat_buf
+        lba_ @r1 = r6
+        next @r0 = call sd_read_sector(p, lba_)
+        #(next - 0)
+        if #ne goto failed
+        f @r5 = &fat
+        v @r0 = r6 + 1
+        f.fat_cached = v
+    }
+    buf @r0 = &fat_fat_buf
+    ix @r1 = c & 127
+    next @r0 = *(buf + ix * 4)
+    next = next[0..28]
+    pop(r4, r5, r6, pc)
+
+failed:
+    next @r0 = 1
+    pop(r4, r5, r6, pc)
+}
+
+// List the root directory. Returns as fat_walk_root.
+#[link_section = ".text"]
+fn fat_list_root() -> status: u32 {
+    push(r4, lr)
+    p @r0 = &listing_str
+    len @r1 = count(listing_str)
+    call log_line(p, len)
+    zero @r0 = 0
+    pw @r1 = &fat_find
+    *pw = zero
+    status @r0 = call fat_walk_root()
+    pop(r4, pc)
+}
+
+// Look for the 11-byte short name at name ("IMAGE   NIB" for IMAGE.NIB) in
+// the root directory, leaving its first cluster and size in fat_found_clus
+// and fat_found_size. Returns as fat_walk_root, or 7 if it isn't there.
+#[link_section = ".text"]
+fn fat_find_root(name: *u8) -> status: u32 {
+    push(r4, lr)
+    pw @r1 = &fat_find
+    *pw = name
+    zero @r0 = 0
+    pw @r1 = &fat_found_clus
+    *pw = zero
+    status @r0 = call fat_walk_root()
+    #(status - 0)
+    if #ne goto done
+    pw @r1 = &fat_found_clus
+    c @r1 = *pw
+    #(c - 0)
+    if #ne goto done
+    p @r0 = &notfound_str
+    len @r1 = count(notfound_str)
+    call log_line(p, len)
+    status @r0 = 7
+done:
+    pop(r4, pc)
+}
+
+// Walk the root directory: each sector of each cluster in its chain,
+// handing each entry to fat_entry, until one marks the end or is the one
+// fat_find names. Returns 0, sd_read_sector's status, or 6 for a bad
+// cluster chain.
+#[link_section = ".text"]
+fn fat_walk_root() -> status: u32 {
+    push(r4, r5, r6, r7, r8, lr)
+    zero @r0 = 0
+    pw @r1 = &fat_lfn_len
+    *pw = zero
+    f @r0 = &fat
+    c @r4 = f.root_clus
+    left @r8 = MAX_DIR_CLUSTERS
+    loop {
+        s @r5 = 0
+        loop {
+            c_ @r0 = r4
+            first @r0 = call fat_clus_lba(c_)
+            lba @r1 = first + r5
+            pw @r0 = &fat_dir_buf
+            status @r0 = call sd_read_sector(pw, lba)
+            #(status - 0)
+            if #ne goto done
+            e @r6 = &fat_dir_buf
+            k @r7 = 512 / DIR_ENTRY
+            loop {
+                e_ @r0 = r6
+                status @r0 = call fat_entry(e_)
+                #(status - 0)
+                if #ne goto finished
+                e += DIR_ENTRY
+                #(k -= 1)
+                if #ne goto loop
+            }
+            s += 1
+            f @r0 = &fat
+            spc @r0 = f.sec_per_clus
+            #(s - spc)
+            if #lo goto loop
+        }
+        c_ @r0 = r4
+        c @r0 = call fat_next(c_)
+        c @r4 = c
+        #(c - 2)
+        if #lo goto bad_chain
+        limit @r1 = FAT_EOC
+        #(c - limit)
+        if #hs goto finished
+        #(left -= 1)
+        if #ne goto loop
+        goto bad_chain
+    }
+finished:
+    status @r0 = 0
+done:
+    pop(r4, r5, r6, r7, r8, pc)
+
+bad_chain:
+    p @r0 = &chain_str
+    len @r1 = count(chain_str)
+    call log_line(p, len)
+    status @r0 = 6
+    pop(r4, r5, r6, r7, r8, pc)
+}
+
+// Handle one directory entry: collect a long name piece, log a volume label
+// or a file or directory (or with fat_find set, check its name), or skip a
+// deleted entry. Returns 1 at the end of the directory or when the entry
+// fat_find names is found, otherwise 0.
+#[link_section = ".text"]
+fn fat_entry(e: *u8) -> status: u32 {
+    push(r4, r5, r6, lr)
+    e @r4 = e
+    b0 @r0 = *((e as *u8) + 0)
+    #(b0 - 0)
+    if #eq goto end_dir
+    #(b0 - 0xe5)
+    if #eq goto skip
+    attr @r5 = *((e as *u8) + 11)
+    #(attr - ATTR_LFN)
+    if #ne goto not_lfn
+    e_ @r0 = r4
+    call fat_lfn_entry(e_)
+    goto next
+not_lfn:
+    #(attr & ATTR_VOLUME)
+    if #ne goto label
+    pw @r0 = &fat_find
+    name @r1 = *pw
+    #(name - 0)
+    if #ne goto find
+    e_ @r0 = r4
+    call fat_log_entry(e_)
+    goto skip
+find:
+    e_ @r0 = r4
+    status @r0 = call fat_match(e_, name)
+    #(status - 0)
+    if #eq goto skip
+    // the first cluster, its high half at 20 and low half at 26, and size
+    hi @r0 = *((e as *u16) + 20)
+    lo @r1 = *((e as *u16) + 26)
+    lo |= hi << 16
+    pw @r2 = &fat_found_clus
+    *pw = lo
+    size @r0 = *((e as *u32) + 28)
+    pw @r2 = &fat_found_size
+    *pw = size
+    goto end_dir
+label:
+    p @r0 = &dirlab_str
+    len @r1 = count(dirlab_str)
+    call log_str(p, len)
+    p @r0 = r4
+    len @r1 = 11
+    call log_line(p, len)
+skip:
+    zero @r0 = 0
+    pw @r1 = &fat_lfn_len
+    *pw = zero
+next:
+    status @r0 = 0
+    pop(r4, r5, r6, pc)
+
+end_dir:
+    status @r0 = 1
+    pop(r4, r5, r6, pc)
+}
+
+// 1 if the 11 bytes of short name at e and name match, otherwise 0.
+#[link_section = ".text"]
+fn fat_match(e: *u8, name: *u8) -> out: u32 {
+    n @r2 = 11
+    loop {
+        a @r3 = *((e as *u8) + 0)
+        b @r12 = *((name as *u8) + 0)
+        e += 1
+        name += 1
+        #(a - b)
+        if #ne goto differ
+        #(n -= 1)
+        if #ne goto loop
+    }
+    out @r0 = 1
+    bx lr
+
+differ:
+    out @r0 = 0
+    bx lr
+}
+
+// Read the file of size bytes starting at cluster clus into dst, whole
+// blocks, so dst needs room for size rounded up to a multiple of 512. Runs
+// of contiguous clusters are read with multi-block reads of up to
+// FAT_STAGE_BLOCKS. Returns 0, fat_read_chunk's status, or 6 for a bad
+// cluster chain.
+#[link_section = ".text"]
+fn fat_read_file(dst: *u32, clus: u32, size: u32) -> status: u32 {
+    push(r4, r5, r6, r7, r8, r9, r10, lr)
+    dst @r4 = dst
+    c @r5 = clus
+    // blocks left to read
+    left @r8 = size + 511
+    left >>= 9
+    #(left - 0)
+    if #eq goto finished
+    c_ @r0 = r5
+    out @r0 = call fat_clus_lba(c_)
+    // lba to read from, and blocks from there that are contiguous
+    lba @r6 = out
+    f @r0 = &fat
+    ext @r7 = f.sec_per_clus
+    loop {
+        // grow the run while the next cluster follows on
+        loop {
+            #(ext - FAT_STAGE_BLOCKS)
+            if #hs goto break
+            #(ext - left)
+            if #hs goto break
+            c_ @r0 = r5
+            next @r0 = call fat_next(c_)
+            follow @r1 = r5 + 1
+            #(next - follow)
+            if #ne goto break
+            c @r5 = next
+            f @r0 = &fat
+            spc @r0 = f.sec_per_clus
+            ext += spc
+            goto loop
+        }
+        // the least of ext, FAT_STAGE_BLOCKS and left
+        k @r9 = r7
+        #(k - FAT_STAGE_BLOCKS)
+        if {
+            if #ls goto end
+            k = FAT_STAGE_BLOCKS
+        }
+        #(k - left)
+        if {
+            if #ls goto end
+            k = left
+        }
+        lba_ @r0 = r6
+        k_ @r1 = r9
+        status @r0 = call fat_read_chunk(lba_, k_)
+        #(status - 0)
+        if #ne goto done
+        // copy the data out, leaving each block's CRCs
+        src @r0 = &fat_stage
+        n @r1 = r9
+        loop {
+            words @r2 = 128
+            loop {
+                w @r3 = *src++
+                *dst++ = w
+                #(words -= 1)
+                if #ne goto loop
+            }
+            src += 8
+            #(n -= 1)
+            if #ne goto loop
+        }
+        lba += k
+        ext -= k
+        left -= k
+        #(left - 0)
+        if #eq goto finished
+        #(ext - 0)
+        if #ne goto loop
+        // on to the next cluster
+        c_ @r0 = r5
+        status @r0 = call fat_next(c_)
+        c @r5 = status
+        #(c - 2)
+        if #lo goto bad_chain
+        limit @r1 = FAT_EOC
+        #(c - limit)
+        if #hs goto bad_chain
+        c_ @r0 = r5
+        status @r0 = call fat_clus_lba(c_)
+        lba @r6 = status
+        f @r0 = &fat
+        ext @r7 = f.sec_per_clus
+        goto loop
+    }
+finished:
+    status @r0 = 0
+done:
+    pop(r4, r5, r6, r7, r8, r9, r10, pc)
+
+bad_chain:
+    p @r0 = &chain_str
+    len @r1 = count(chain_str)
+    call log_line(p, len)
+    status @r0 = 6
+    pop(r4, r5, r6, r7, r8, r9, r10, pc)
+}
+
+// Read k blocks from lba into fat_stage and check their CRCs, reading them
+// once more if any is bad. Returns 0, sd_read's status, or 4 if the CRCs
+// were bad both times.
+#[link_section = ".text"]
+fn fat_read_chunk(lba: u32, k: u32) -> status: u32 {
+    push(r4, r5, r6, r7, r8, lr)
+    lba @r4 = lba
+    k @r5 = k
+    tries @r6 = 2
+    loop {
+        p @r0 = &fat_stage
+        wide @r1 = 1
+        n @r2 = r5
+        lba_ @r3 = r4
+        status @r0 = call sd_read(p, wide, n, lba_)
+        #(status - 0)
+        if #ne goto done
+        blk @r7 = &fat_stage
+        blocks @r8 = r5
+        loop {
+            p @r0 = r7
+            len @r1 = BLOCK_WORDS * 4
+            status @r0 = call crc16_4bit(p, len)
+            #(status - 0)
+            if #ne goto break
+            blk += BLOCK_WORDS * 4
+            #(blocks -= 1)
+            if #ne goto loop
+            status @r0 = 0
+            goto done
+        }
+        #(tries -= 1)
+        if #ne goto loop
+    }
+    status @r0 = 4
+done:
+    pop(r4, r5, r6, r7, r8, pc)
+}
+
+// Add a long name entry's characters to fat_lfn. The entries come last
+// piece first; the first one (flagged 0x40) gives the length and the
+// checksum, and the rest must match it.
+#[link_section = ".text"]
+fn fat_lfn_entry(e: *u8) {
+    push(r4, r5, r6, r7, r8, lr)
+    e @r4 = e
+    ord @r5 = *((e as *u8) + 0)
+    sum @r6 = *((e as *u8) + 13)
+    ix @r7 = ord & 0x1f
+    #(ord & 0x40)
+    if {
+        if #eq goto end
+        k @r1 = 13
+        len @r0 = ix * k
+        #(ix - 21)
+        if {
+            if #lo goto end
+            len = 0
+        }
+        p @r1 = &fat_lfn_len
+        *p = len
+        p @r1 = &fat_lfn_sum
+        *p = sum
+    }
+    // only as part of a pending name, with its checksum, and in range
+    p @r0 = &fat_lfn_len
+    len @r8 = *p
+    #(len - 0)
+    if #eq goto done
+    p @r0 = &fat_lfn_sum
+    s @r0 = *p
+    #(s - sum)
+    if #ne goto drop
+    #(ix - 0)
+    if #eq goto drop
+    ix -= 1
+    k @r1 = 13
+    pos @r7 = ix * k
+    #(pos - len)
+    if #hs goto drop
+
+    dst @r8 = &fat_lfn
+    dst += pos
+    offs @r6 = &fat_lfn_offsets
+    n @r5 = 13
+    loop {
+        off @r0 = *((offs as *u8) + 0)
+        offs += 1
+        lo @r1 = *((e as *u8) + off)
+        off += 1
+        hi @r2 = *((e as *u8) + off)
+        // 0 ends the name and 0xffff pads it; anything but ASCII is '?'
+        ch @r3 = lo
+        #(lo - 0x80)
+        if {
+            if #lo goto end
+            ch = 63
+        }
+        #(hi - 0)
+        if {
+            if #eq goto end
+            ch = 63
+            pad @r12 = lo & hi
+            #(pad - 0xff)
+            if {
+                if #ne goto end
+                ch = 0
+            }
+        }
+        *((dst as *u8) + 0) = ch
+        dst += 1
+        #(n -= 1)
+        if #ne goto loop
+    }
+done:
+    pop(r4, r5, r6, r7, r8, pc)
+
+drop:
+    zero @r0 = 0
+    p @r1 = &fat_lfn_len
+    *p = zero
+    pop(r4, r5, r6, r7, r8, pc)
+}
+
+// The checksum of an entry's 11-byte short name, which its long name
+// entries carry.
+#[link_section = ".text"]
+fn fat_sum(e: *u8) -> out: u32 {
+    sum @r1 = 0
+    n @r2 = 11
+    loop {
+        b @r3 = *((e as *u8) + 0)
+        e += 1
+        // rotate right by one within 8 bits, then add
+        t @r12 = sum << 7
+        t &= 0x80
+        sum = t | (sum >> 1)
+        sum += b
+        sum &= 0xff
+        #(n -= 1)
+        if #ne goto loop
+    }
+    out @r0 = sum
+    bx lr
+}
+
+// Log a file or directory entry: 'd' or '-', its size, and its name.
+#[link_section = ".text"]
+fn fat_log_entry(e: *u8) {
+    push(r4, r5, r6, lr)
+    e @r4 = e
+    attr @r1 = *((e as *u8) + 11)
+    ch @r0 = 45
+    #(attr & ATTR_DIR)
+    if {
+        if #eq goto end
+        ch = 100
+    }
+    call log_byte(ch)
+    size @r0 = *((e as *u32) + 28)
+    w @r1 = 11
+    call log_dec_pad(size, w)
+    sp_ @r0 = 32
+    call log_byte(sp_)
+
+    // the long name, if one is pending for this entry
+    p @r0 = &fat_lfn_len
+    len @r5 = *p
+    #(len - 0)
+    if #eq goto short
+    e_ @r0 = r4
+    out @r0 = call fat_sum(e_)
+    p @r1 = &fat_lfn_sum
+    s @r1 = *p
+    #(out - s)
+    if #ne goto short
+    p @r6 = &fat_lfn
+    loop {
+        b @r0 = *((p as *u8) + 0)
+        if b == 0 goto break
+        p += 1
+        call log_byte(b)
+        #(len -= 1)
+        if #ne goto loop
+    }
+    goto newline
+short:
+    e_ @r0 = r4
+    call fat_log_short(e_)
+newline:
+    nl @r0 = 10
+    call log_byte(nl)
+    call log_flush()
+    pop(r4, r5, r6, pc)
+}
+
+// Log an entry's 8.3 name, lowercasing the base and extension if the
+// entry's flags (byte 12, bits 3 and 4) say to.
+#[link_section = ".text"]
+fn fat_log_short(e: *u8) {
+    push(r4, r5, r6, lr)
+    e @r4 = e
+    nt @r5 = *((e as *u8) + 12)
+    p @r0 = r4
+    n @r1 = 8
+    lower @r2 = nt & 0x08
+    call fat_log_part(p, n, lower)
+    // an extension, unless it's blank
+    c @r0 = *((e as *u8) + 8)
+    #(c - 32)
+    if #eq goto done
+    dot @r0 = 46
+    call log_byte(dot)
+    p @r0 = r4
+    p += 8
+    n @r1 = 3
+    lower @r2 = nt & 0x10
+    call fat_log_part(p, n, lower)
+done:
+    pop(r4, r5, r6, pc)
+}
+
+// Log n bytes of a short name at p, without trailing spaces, lowercased if
+// lower is nonzero. Anything outside printable ASCII (including 0x05,
+// which stands for 0xe5) is '?'.
+#[link_section = ".text"]
+fn fat_log_part(p: *u8, n: u32, lower: u32) {
+    push(r4, r5, r6, lr)
+    p @r4 = p
+    end @r5 = p + n
+    lower @r6 = lower
+    loop {
+        #(end - p)
+        if #eq goto break
+        end -= 1
+        c @r0 = *((end as *u8) + 0)
+        #(c - 32)
+        if #eq goto loop
+        end += 1
+    }
+    loop {
+        #(p - end)
+        if #eq goto break
+        c @r0 = *((p as *u8) + 0)
+        p += 1
+        if {
+            if lower == 0 goto end
+            t @r1 = c - 65
+            #(t - 26)
+            if #hs goto end
+            c += 32
+        }
+        #(c - 0x7f)
+        if {
+            if #lo goto end
+            c = 63
+        }
+        #(c - 32)
+        if {
+            if #hs goto end
+            c = 63
+        }
+        call log_byte(c)
+        goto loop
+    }
+    pop(r4, r5, r6, pc)
+}
+
+// Log v in decimal, right-aligned in w columns.
+#[link_section = ".text"]
+fn log_dec_pad(v: u32, w: u32) {
+    push(r4, r5, r6, lr)
+    v @r4 = v
+    w @r5 = w
+    // w minus the number of digits
+    t @r0 = v
+    ten @r2 = 10
+    loop {
+        w -= 1
+        t = t / ten
+        #(t - 0)
+        if #ne goto loop
+    }
+    loop {
+        #(w - 0)
+        if #le goto break
+        sp_ @r0 = 32
+        call log_byte(sp_)
+        w -= 1
+        goto loop
+    }
+    v @r0 = r4
+    call log_dec(v)
+    pop(r4, r5, r6, pc)
+}

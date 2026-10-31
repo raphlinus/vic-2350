@@ -1,0 +1,120 @@
+; Copyright 2026 Raph Levien
+; SPDX-License-Identifier: Apache-2.0 OR MIT
+
+; SD bus programs for PIO1, with GPIOBASE 16 (so GPIO34 is pin 18).
+;
+; Only sd_clk touches CLK. Instead of watching the pin, the other programs
+; run at the full system clock and are paced by the IRQ flags sd_clk raises,
+; once per SD clock, at the phases the bus timing wants. WAIT clears a flag,
+; so one WAIT is one SD clock, and no stream needs to know how fast CLK is.
+; Stopping sd_clk holds everything exactly where it is, mid-bit if need be.
+;
+; Those phases, for four sd_clk instructions per SD clock (cycle 0 being
+; the first instruction, so CLK rises at the pad in cycle 1 and falls in
+; cycle 3, at CLKDIV 1):
+;
+; - A flag raised in cycle t lets its WAIT finish in cycle t + 1, so the
+;   next instruction runs in t + 2. If that's an OUT, the pin changes in
+;   t + 3. If it's an IN, the 2-cycle input synchronizer gives it the pin
+;   as of about t.
+; - IRQ 0 is raised in cycle 0. CMD output then changes on CLK's falling
+;   edge at 36 MHz, half a period either side of the card's sampling edge
+;   (it needs 6 ns of setup and 2 ns of hold). At lower rates it changes
+;   later than the rising edge by the same 14 ns, which is hold time to
+;   spare. Input sampled on it is taken at the end of the previous clock.
+; - IRQ 1 is raised in cycle 3, for DAT, which adds a cycle of delay: the
+;   same sample point, on a flag of its own.
+;
+; That sample point is 3/4 of the way through the SD clock. In high speed
+; mode the card's outputs change after the rising edge and are valid from
+; 14 ns after it to 2.5 ns after the next, which at 36 MHz is 14 to 30 ns
+; of 28. In default speed they change after the falling edge, within 14 ns,
+; so at 9 MHz and below they're valid from 3/4 of a period at the latest.
+; The one sample point suits both, and nothing changes at the switch.
+;
+; Sweeping the sample point on a real card at 36 MHz, the cycle 4 used here
+; and those either side read clean, and only the one opposite had errors.
+
+.pio_version 1
+
+; Drives CLK (side-set) and raises the flags, at CLKDIV 1 for 36 MHz.
+; SM0: stopping it is how to stop the bus.
+.program sd_clk
+.side_set 1
+.wrap_target
+    irq set 0           side 1
+    nop                 side 1
+    nop                 side 0
+    irq set 1           side 0
+.wrap
+
+; Sends a 48-bit command on CMD, with its output enable as side-set. SM2.
+;
+; The TX FIFO takes three words with 16 bits each in their top half. As
+; they're all in the FIFO before IRQ 3 starts the command, a late CPU
+; can't starve it, and an interrupt between the writes can't stretch a bit.
+; Y holds 47, loaded in sd_pio_init. The OUT latch rests high, from the last
+; end bit, so CMD is driven high for a clock before the start bit, and
+; released after the end bit, when IRQ 2 tells sd_resp to start looking.
+; The first WAIT only drops a stale flag.
+;
+; Pins: OUT and side-set are CMD.
+.program sd_tx
+.side_set 1 pindirs
+.wrap_target
+    wait 1 irq 3        side 0
+    mov x, y            side 0
+    wait 1 irq 0        side 0
+bit:
+    wait 1 irq 0        side 1
+    out pins, 1         side 1
+    jmp x-- bit         side 1
+    wait 1 irq 0        side 1
+    irq set 2           side 0
+.wrap
+
+; Receives a response on CMD, after sd_tx is done. SM3.
+;
+; The TX FIFO takes the bits to read after the start bit, minus one. The
+; response, with a 0 for the start bit, is shifted into the RX FIFO MSB
+; first, the last word right-aligned. A card that never answers leaves this
+; looking for a start bit, until sd_pio_recover restarts it.
+;
+; Pins: IN and JMP_PIN are CMD.
+.program sd_resp
+.wrap_target
+    out x, 32
+    wait 1 irq 2
+find_start:
+    wait 1 irq 0
+    jmp pin find_start
+    in null, 1
+resp_bit:
+    wait 1 irq 0
+    in pins, 1
+    jmp x-- resp_bit
+    push
+.wrap
+
+; Receives data blocks on DAT0..DAT3. SM1. X holds the nibbles to read after
+; each start bit, minus one. For 1-bit mode, the CPU patches the IN at
+; in_data to read one pin, and X counts bits.
+;
+; The start bit is looked for at the sample point only, so the end bit that
+; follows a block's CRC (always 1) takes care of itself in a multi-block
+; read. Each pass around the loop takes 4 cycles at most, keeping up with
+; 36 MHz.
+;
+; Pins: IN and JMP_PIN are DAT0.
+.program sd_rx
+.wrap_target
+    mov y, x
+find_block:
+    wait 1 irq 1 [1]
+    jmp pin find_block
+data_bit:
+    wait 1 irq 1 [1]
+public in_data:
+    in pins, 4
+    jmp y-- data_bit
+.wrap

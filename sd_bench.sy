@@ -1,0 +1,844 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+// Sustained SD read throughput, in 4-bit high speed mode at 36 MHz, logged
+// over USB. Each run is one CMD18 over a range of blocks, with DMA writing
+// every word to bench_sink (so any length fits) while the CPU polls the
+// DMA's remaining count and times each block as it lands. The data isn't
+// checked: a block lost to SM1 losing sync would leave the DMA short, which
+// times out.
+//
+// The ranges: IMAGE.NIB, BENCH.BIN if there is one (its longest run of
+// contiguous clusters, up to BENCH_MAX_BLOCKS), and a range nothing has been
+// written to, which a card may answer without reading its flash.
+// IMAGE.NIB and the start of the unwritten range are also read into RAM,
+// to check that streaming loses nothing: every block's CRCs, and PIO's
+// flag for SM1 stalling on a full RX FIFO.
+//
+// demo_init runs all that before DVI starts. Then, with DVI on, demo_line
+// runs BENCH.BIN's range (or the unwritten one) twice more: polling, as
+// before, which holds up drawing, then streaming in the background while
+// it draws IMAGE.NIB, which is how video would read.
+//
+// Its functions each have a section of their own, as in sd.sy.
+
+// A run of 1,000,000 blocks, 512 MB in, well past this card's files
+const IDLE_LBA = 1000000
+const IDLE_BLOCKS = 32768
+// Keeps blocks * 51200 (for hundredths of MB/s) within 32 bits
+const BENCH_MAX_BLOCKS = 65536
+// A block takes about 30 us at 36 MHz; slower than 70 us counts as slow,
+// and 1 ms as a stall
+const SLOW_CYCLES = 10080
+const STALL_CYCLES = 144000
+// SD_DMA_CTRL without INCR_WRITE
+const BENCH_DMA_CTRL = SD_DMA_CTRL & !(1 << 6)
+
+struct Bench {
+    blocks: u32
+    // cycles from sending CMD18 to the last block, and to the first
+    // when CMD18 went, while bench_run runs
+    t0: u32
+    total: u32
+    first: u32
+    // the time between blocks after the first
+    min: u32
+    max: u32
+    slow: u32
+    stalls: u32
+    // the longest time between two polls, which shows the CPU being held
+    // up, and whether SM1 ever stalled on a full RX FIFO, which would lose
+    // data
+    poll_max: u32
+    rxstall: u32
+}
+
+static mut bench: Bench
+static mut bench_sink: u32
+// The longest run of contiguous clusters bench_runs found: its first
+// cluster, and its length in clusters
+static mut bench_long_clus: u32
+static mut bench_long_len: u32
+// For checking the data: the blocks of a run, as read, CRCs included. (All
+// of .bss has to stay under 256 KB, for start in main.sy.)
+const BUF_BLOCKS = 400
+#[link_section = ".uninit"]
+static mut bench_buf: [u32; BLOCK_WORDS * BUF_BLOCKS]
+
+// Once DVI is on, demo_line runs the range dvi_lba, dvi_blocks twice: with
+// bench_run, which holds up drawing, then with DMA streaming in the
+// background while it draws IMAGE.NIB from bench_buf. dvi_phase steps
+// through these.
+const PHASE_FAILED = 0
+const PHASE_POLL = 1
+// streaming, waiting for the first line of a frame to count missed lines
+// from
+const PHASE_STREAM_START = 2
+const PHASE_STREAM = 3
+const PHASE_DONE = 4
+static mut dvi_phase: u32
+static mut dvi_lba: u32
+static mut dvi_blocks: u32
+// for the background stream: when CMD18 went, and the missed line count
+// at the first frame after
+static mut dvi_t0: u32
+static mut dvi_missed0: u32
+// whether SM1 stalled on a full RX FIFO during it
+static mut dvi_rxstall: u32
+
+// A nibnib file, as in sd_image.sy: the width and height as u16s, 256
+// pixel pair deltas, then the lines, each padded to a multiple of 4 bytes.
+const NIB_PALETTE = 4
+const NIB_STRIDE = 4 + H_ACTIVE / 2
+
+static image_name: [u8; _] = "IMAGE   NIB"
+static bench_name: [u8; _] = "BENCH   BIN"
+static img_str: [u8; _] = "IMAGE.NIB:"
+static file_str: [u8; _] = "BENCH.BIN:"
+static idle_str: [u8; _] = "unwritten blocks:"
+static nobench_str: [u8; _] = "no BENCH.BIN"
+static blocks_str: [u8; _] = "  blocks "
+static total_str: [u8; _] = "  cycles "
+static rate_str: [u8; _] = "  MB/s x 100, all "
+static srate_str: [u8; _] = "  MB/s x 100, after the first block "
+static first_str: [u8; _] = "  cycles to the first block "
+static min_str: [u8; _] = "  cycles between blocks, least "
+static max_str: [u8; _] = "  cycles between blocks, most "
+static slow_str: [u8; _] = "  gaps over 70 us "
+static stall_str: [u8; _] = "  gaps over 1 ms "
+static fsize_str: [u8; _] = "  bytes "
+static run_str: [u8; _] = "  run from cluster "
+static runlen_str: [u8; _] = "    clusters "
+static nruns_str: [u8; _] = "  runs "
+static nclus_str: [u8; _] = "  clusters "
+static longest_str: [u8; _] = "  longest run, clusters "
+static end_str: [u8; _] = "  chain ends with "
+static poll_str: [u8; _] = "  most cycles between polls "
+static rxstall_str: [u8; _] = "  SM1 RX FIFO stalled (0 is good) "
+static buf_str: [u8; _] = "unwritten blocks, into RAM:"
+static bufimg_str: [u8; _] = "IMAGE.NIB, into RAM:"
+static bad_str: [u8; _] = "  blocks with bad CRCs "
+static fail_str: [u8; _] = "failed"
+static dvipoll_str: [u8; _] = "DVI on, polling, drawing held up:"
+static dvistream_str: [u8; _] = "DVI on, streaming in the background while drawing:"
+static missed_str: [u8; _] = "  lines missed "
+
+#[link_section = ".text"]
+fn demo_init() {
+    push(r4, r5, r6, lr)
+    zero @r1 = 0
+    pw @r0 = &sd_verbose
+    *pw = zero
+    status @r0 = call sd_init()
+    #(status - 0)
+    if #ne goto fail
+    status @r0 = call sd_set_wide()
+    #(status - 0)
+    if #ne goto fail
+    status @r0 = call sd_switch_hs()
+    #(status - 0)
+    if #ne goto fail
+    status @r0 = call fat_mount()
+    #(status - 0)
+    if #ne goto fail
+
+    // IMAGE.NIB
+    p @r0 = &image_name
+    status @r0 = call fat_find_root(p)
+    #(status - 0)
+    if #ne goto fail
+    pw @r0 = &fat_found_clus
+    c @r0 = *pw
+    out @r0 = call fat_clus_lba(c)
+    lba @r4 = out
+    pw @r0 = &fat_found_size
+    size @r1 = *pw
+    blocks @r1 = size + 511
+    blocks >>= 9
+    lba_ @r0 = r4
+    buf @r2 = 0
+    status @r0 = call bench_run(lba_, blocks, buf)
+    #(status - 0)
+    if #ne goto fail
+    p @r0 = &img_str
+    len @r1 = count(img_str)
+    call bench_log(p, len)
+    // and into RAM, to check its CRCs
+    lba_ @r0 = r4
+    b @r1 = &bench
+    blocks @r1 = b.blocks
+    buf @r2 = &bench_buf
+    status @r0 = call bench_run(lba_, blocks, buf)
+    #(status - 0)
+    if #ne goto fail
+    p @r0 = &bufimg_str
+    len @r1 = count(bufimg_str)
+    call bench_log(p, len)
+    call bench_check()
+
+    // the range for the runs with DVI on: BENCH.BIN's longest run if
+    // there is one, otherwise the unwritten range
+    lba @r0 = IDLE_LBA
+    pw @r1 = &dvi_lba
+    *pw = lba
+    blocks @r0 = IDLE_BLOCKS
+    pw @r1 = &dvi_blocks
+    *pw = blocks
+
+    // BENCH.BIN, its longest contiguous run
+    p @r0 = &bench_name
+    status @r0 = call fat_find_root(p)
+    #(status - 7)
+    if {
+        if #ne goto end
+        p @r0 = &nobench_str
+        len @r1 = count(nobench_str)
+        call log_line(p, len)
+        goto idle
+    }
+    #(status - 0)
+    if #ne goto fail
+    p @r0 = &file_str
+    len @r1 = count(file_str)
+    call log_line(p, len)
+    pw @r0 = &fat_found_size
+    v @r2 = *pw
+    p @r0 = &fsize_str
+    len @r1 = count(fsize_str)
+    call log_kvd(p, len, v)
+    pw @r0 = &fat_found_clus
+    c @r0 = *pw
+    call bench_runs(c)
+    // the longest run, up to BENCH_MAX_BLOCKS
+    f @r0 = &fat
+    spc @r1 = f.sec_per_clus
+    pw @r0 = &bench_long_len
+    n @r0 = *pw
+    blocks @r5 = n * spc
+    cap @r1 = BENCH_MAX_BLOCKS
+    #(r5 - cap)
+    if {
+        if #ls goto end
+        blocks = cap
+    }
+    pw @r0 = &bench_long_clus
+    c @r0 = *pw
+    lba @r0 = call fat_clus_lba(c)
+    pw @r1 = &dvi_lba
+    *pw = lba
+    pw @r1 = &dvi_blocks
+    *pw = r5
+    blocks @r1 = r5
+    buf @r2 = 0
+    status @r0 = call bench_run(lba, blocks, buf)
+    #(status - 0)
+    if #ne goto fail
+    p @r0 = &file_str
+    len @r1 = count(file_str)
+    call bench_log(p, len)
+
+idle:
+    lba @r0 = IDLE_LBA
+    blocks @r1 = IDLE_BLOCKS
+    buf @r2 = 0
+    status @r0 = call bench_run(lba, blocks, buf)
+    #(status - 0)
+    if #ne goto fail
+    p @r0 = &idle_str
+    len @r1 = count(idle_str)
+    call bench_log(p, len)
+    lba @r0 = IDLE_LBA
+    blocks @r1 = BUF_BLOCKS
+    buf @r2 = &bench_buf
+    status @r0 = call bench_run(lba, blocks, buf)
+    #(status - 0)
+    if #ne goto fail
+    p @r0 = &buf_str
+    len @r1 = count(buf_str)
+    call bench_log(p, len)
+    call bench_check()
+
+    // IMAGE.NIB again, into bench_buf, for demo_line to show while the
+    // runs with DVI on go
+    p @r0 = &image_name
+    status @r0 = call fat_find_root(p)
+    #(status - 0)
+    if #ne goto fail
+    dst @r0 = &bench_buf
+    pw @r1 = &fat_found_clus
+    clus @r1 = *pw
+    pw @r2 = &fat_found_size
+    size @r2 = *pw
+    status @r0 = call fat_read_file(dst, clus, size)
+    #(status - 0)
+    if #ne goto fail
+    phase @r1 = PHASE_POLL
+    pw @r0 = &dvi_phase
+    *pw = phase
+    pop(r4, r5, r6, pc)
+
+fail:
+    p @r0 = &fail_str
+    len @r1 = count(fail_str)
+    call log_line(p, len)
+    call log_end()
+    pop(r4, r5, r6, pc)
+}
+
+// Log the first few runs of contiguous clusters in the chain from c, then
+// the whole chain's runs, clusters, longest run and end mark, and keep the
+// longest run in bench_long_clus and bench_long_len.
+#[link_section = ".text"]
+fn bench_runs(c: u32) {
+    push(r4, r5, r6, r7, r8, r9, r10, lr)
+    c @r4 = c
+    runs @r6 = 0
+    total @r7 = 0
+    longest @r8 = 0
+    loop {
+        start @r9 = r4
+        n @r5 = 1
+        loop {
+            c_ @r0 = r4
+            next @r0 = call fat_next(c_)
+            follow @r1 = r4 + 1
+            #(next - follow)
+            if #ne goto break
+            c @r4 = next
+            n += 1
+            goto loop
+        }
+        c @r4 = next
+        runs += 1
+        total += n
+        #(n - longest)
+        if {
+            if #ls goto end
+            longest = n
+            pw @r0 = &bench_long_clus
+            *pw = r9
+            pw @r0 = &bench_long_len
+            *pw = r5
+        }
+        #(r6 - 4)
+        if {
+            if #hi goto end
+            p @r0 = &run_str
+            len @r1 = count(run_str)
+            v @r2 = r9
+            call log_kv(p, len, v)
+            p @r0 = &runlen_str
+            len @r1 = count(runlen_str)
+            v @r2 = r5
+            call log_kvd(p, len, v)
+        }
+        eoc @r1 = 0x0ffffff8
+        #(r4 - eoc)
+        if #hs goto break
+        #(r4 - 2)
+        if #lo goto break
+        goto loop
+    }
+    p @r0 = &nruns_str
+    len @r1 = count(nruns_str)
+    v @r2 = r6
+    call log_kvd(p, len, v)
+    p @r0 = &nclus_str
+    len @r1 = count(nclus_str)
+    v @r2 = r7
+    call log_kvd(p, len, v)
+    p @r0 = &longest_str
+    len @r1 = count(longest_str)
+    v @r2 = r8
+    call log_kvd(p, len, v)
+    p @r0 = &end_str
+    len @r1 = count(end_str)
+    v @r2 = r4
+    call log_kv(p, len, v)
+    pop(r4, r5, r6, r7, r8, r9, r10, pc)
+}
+
+// Read blocks blocks from lba with one CMD18, timing each, into bench. The
+// data goes to buf, BLOCK_WORDS words a block, or if buf is 0, all to
+// bench_sink. Returns 0, 1 if a command timed out, or 2 if the data did.
+#[link_section = ".text"]
+fn bench_run(lba: u32, blocks: u32, buf: *u32) -> status: u32 {
+    push(r3, r4, r5, r6, r7, r8, r9, r10, r11, lr)
+    lba @r4 = lba
+    left @r11 = blocks
+    buf @r5 = buf
+    b @r0 = &bench
+    b.blocks = left
+    zero @r1 = 0
+    b.slow = zero
+    b.stalls = zero
+    b.rxstall = zero
+
+    in_ @r0 = PIO_IN_PINS_4
+    x @r1 = RX4_NIBBLES - 1
+    call sd_rx_load(in_, x)
+    // clear SM1's RX stall flag
+    pio @r0 = peripherals.PIO1
+    v @r1 = 1 << 1
+    pio.FDEBUG = v
+    p @r0 = r5
+    ctrl @r2 = SD_DMA_CTRL
+    if {
+        if p != 0 goto end
+        p = &bench_sink
+        ctrl = BENCH_DMA_CTRL
+    }
+    words @r1 = BLOCK_WORDS
+    words *= left
+    call sd_rx_start(p, words, ctrl)
+
+    cyc @r0 = &peripherals.PPB.DWT_CYCCNT
+    t0 @r6 = *cyc
+    b @r1 = &bench
+    b.t0 = t0
+    index @r0 = 18
+    pw @r1 = &sd_addr_shift
+    shift @r1 = *pw
+    arg @r1 = lba << shift
+    rbits @r2 = 48
+    status @r0 = call sd_command(index, arg, rbits)
+    #(status - 0)
+    if #ne goto cmd_failed
+
+    // the DMA's remaining count once the next block is in
+    next @r5 = BLOCK_WORDS
+    next *= left
+    next -= BLOCK_WORDS
+    // when the previous block came in, to start with when CMD18 went
+    prev @r6 = r6
+    min @r7 = -1
+    max @r8 = 0
+    // polls start now, not when CMD18 went
+    cyc @r0 = &peripherals.PPB.DWT_CYCCNT
+    last @r9 = *cyc
+    poll_max @r10 = 0
+    ch @r4 = peripherals.DMA as *DmaChannel
+    ch += 0x80
+    loop {
+        rem @r2 = ch.trans_count
+        cyc @r3 = &peripherals.PPB.DWT_CYCCNT
+        now @r3 = *cyc
+        gap @r12 = now - last
+        last = now
+        #(gap - poll_max)
+        if {
+            if #ls goto end
+            poll_max = gap
+        }
+        dt @r12 = now - prev
+        #(rem - next)
+        if #hi goto waiting
+        // a block is in; the first one's time includes the command
+        prev = now
+        b @r0 = &bench
+        all @r1 = b.blocks
+        #(left - all)
+        if {
+            if #ne goto end
+            b.first = dt
+            goto counted
+        }
+        #(dt - min)
+        if {
+            if #hs goto end
+            min = dt
+        }
+        #(dt - max)
+        if {
+            if #ls goto end
+            max = dt
+        }
+        limit @r1 = SLOW_CYCLES
+        #(dt - limit)
+        if {
+            if #ls goto end
+            n @r1 = b.slow
+            n += 1
+            b.slow = n
+        }
+        limit @r1 = STALL_CYCLES
+        #(dt - limit)
+        if {
+            if #ls goto end
+            n @r1 = b.stalls
+            n += 1
+            b.stalls = n
+        }
+    counted:
+        next -= BLOCK_WORDS
+        #(left -= 1)
+        if #eq goto break
+        // SM1's stall flag, before the last block: after it, with the DMA
+        // done, the card's next block fills the RX FIFO
+        pio @r1 = peripherals.PIO1
+        v @r0 = pio.FDEBUG
+        v = v[1..2]
+        b @r1 = &bench
+        b.rxstall = v
+        goto loop
+    waiting:
+        limit @r1 = DATA_TIMEOUT
+        #(dt - limit)
+        if #lo goto loop
+        goto data_failed
+    }
+    b @r0 = &bench
+    t0 @r1 = b.t0
+    t @r1 = prev - t0
+    b.total = t
+    b.min = min
+    b.max = max
+    b.poll_max = poll_max
+
+    pio @r0 = peripherals.PIO1
+    v @r1 = SD_CTRL_BUS
+    pio.CTRL = v
+    index @r0 = 12
+    arg @r1 = 0
+    rbits @r2 = 48
+    status @r0 = call sd_command(index, arg, rbits)
+    #(status - 0)
+    if #ne goto done
+    call sd_wait_busy()
+    status @r0 = 0
+done:
+    pop(r3, r4, r5, r6, r7, r8, r9, r10, r11, pc)
+
+cmd_failed:
+    call sd_rx_stop()
+    status @r0 = 1
+    pop(r3, r4, r5, r6, r7, r8, r9, r10, r11, pc)
+data_failed:
+    call sd_rx_stop()
+    status @r0 = 2
+    pop(r3, r4, r5, r6, r7, r8, r9, r10, r11, pc)
+}
+
+// Check the CRCs of the blocks bench_run put in bench_buf, and log how many
+// were bad.
+#[link_section = ".text"]
+fn bench_check() {
+    push(r4, r5, r6, lr)
+    bad @r4 = 0
+    blk @r5 = &bench_buf
+    b @r0 = &bench
+    left @r6 = b.blocks
+    loop {
+        p @r0 = r5
+        n @r1 = BLOCK_WORDS * 4
+        out @r0 = call crc16_4bit(p, n)
+        if {
+            if out == 0 goto end
+            bad += 1
+        }
+        blk += BLOCK_WORDS * 4
+        #(left -= 1)
+        if #ne goto loop
+    }
+    p @r0 = &bad_str
+    len @r1 = count(bad_str)
+    v @r2 = r4
+    call log_kvd(p, len, v)
+    pop(r4, r5, r6, pc)
+}
+
+// Log label (p, len) and bench's results.
+#[link_section = ".text"]
+fn bench_log(p: *u8, len: u32) {
+    push(r4, r5, r6, lr)
+    call log_line(p, len)
+    b @r4 = &bench
+    p @r0 = &blocks_str
+    len @r1 = count(blocks_str)
+    v @r2 = b.blocks
+    call log_kvd(p, len, v)
+    p @r0 = &total_str
+    len @r1 = count(total_str)
+    v @r2 = b.total
+    call log_kvd(p, len, v)
+    // hundredths of MB/s: bytes * 100 / us, us = cycles / 144
+    k @r1 = 51200
+    v @r0 = b.blocks
+    v *= k
+    c @r1 = b.total
+    k @r2 = 144
+    c = c / k
+    v = v / c
+    v @r2 = v
+    p @r0 = &rate_str
+    len @r1 = count(rate_str)
+    call log_kvd(p, len, v)
+    // and over the blocks after the first, from when the first came in
+    k @r1 = 51200
+    v @r0 = b.blocks
+    v -= 1
+    v *= k
+    c @r1 = b.total
+    f @r2 = b.first
+    c -= f
+    k @r2 = 144
+    c = c / k
+    v = v / c
+    v @r2 = v
+    p @r0 = &srate_str
+    len @r1 = count(srate_str)
+    call log_kvd(p, len, v)
+    p @r0 = &first_str
+    len @r1 = count(first_str)
+    v @r2 = b.first
+    call log_kvd(p, len, v)
+    p @r0 = &min_str
+    len @r1 = count(min_str)
+    v @r2 = b.min
+    call log_kvd(p, len, v)
+    p @r0 = &max_str
+    len @r1 = count(max_str)
+    v @r2 = b.max
+    call log_kvd(p, len, v)
+    p @r0 = &slow_str
+    len @r1 = count(slow_str)
+    v @r2 = b.slow
+    call log_kvd(p, len, v)
+    p @r0 = &stall_str
+    len @r1 = count(stall_str)
+    v @r2 = b.stalls
+    call log_kvd(p, len, v)
+    p @r0 = &poll_str
+    len @r1 = count(poll_str)
+    v @r2 = b.poll_max
+    call log_kvd(p, len, v)
+    p @r0 = &rxstall_str
+    len @r1 = count(rxstall_str)
+    v @r2 = b.rxstall
+    call log_kvd(p, len, v)
+    pop(r4, r5, r6, pc)
+}
+
+#[link_section = ".ram"]
+fn demo_line(y: u32, pixels: *u32) {
+    push(r4, r5, r6, lr)
+    y @r4 = y
+    pixels @r5 = pixels
+    pw @r2 = &dvi_phase
+    phase @r2 = *pw
+    if phase == 0 goto failed
+    #(phase - PHASE_POLL)
+    if {
+        if #ne goto end
+        call dvi_poll()
+        goto draw
+    }
+    #(phase - PHASE_STREAM_START)
+    if {
+        if #ne goto end
+        if y != 0 goto draw
+        p @r0 = &dvi
+        m @r1 = p.missed_lines
+        pw @r0 = &dvi_missed0
+        *pw = m
+        phase @r1 = PHASE_STREAM
+        pw @r0 = &dvi_phase
+        *pw = phase
+        goto draw
+    }
+    #(phase - PHASE_STREAM)
+    if {
+        if #ne goto end
+        ch @r0 = peripherals.DMA as *DmaChannel
+        ch += 0x80
+        rem @r0 = ch.trans_count
+        if {
+            if rem == 0 goto end
+            // SM1 stalling on a full RX FIFO, while the DMA still has
+            // words to take (after, it's just the card sending on)
+            pio @r0 = peripherals.PIO1
+            v @r1 = pio.FDEBUG
+            v = v[1..2]
+            pw @r0 = &dvi_rxstall
+            old @r2 = *pw
+            old |= v
+            *pw = old
+            goto draw
+        }
+        call dvi_stream_done()
+    }
+
+    // decode line y of IMAGE.NIB, as sd_image.sy does
+draw:
+    stride @r3 = NIB_STRIDE
+    pal @r12 = &bench_buf
+    pal += NIB_PALETTE
+    src @r2 = pal + 256 * 4
+    src += y * stride
+    pair @r0 = *src++
+    src8 @r2 = src as *u8
+    count @r3 = H_ACTIVE / 2 - 1
+    loop {
+        ix @r6 = *src8++
+        *pixels++ = pair
+        delta @r6 = *(pal + ix * 4)
+        pair = pkhtb(pair, pair >> 16)
+        #(count -= 1)
+        pair += delta
+        if #ne goto loop
+    }
+    *pixels++ = pair
+    pop(r4, r5, r6, pc)
+
+failed:
+    color @r2 = 0x001f001f
+    n @r3 = H_ACTIVE / 2
+    loop {
+        *pixels++ = color
+        #(n -= 1)
+        if #ne goto loop
+    }
+    pop(r4, r5, r6, pc)
+}
+
+// The run with DVI on that polls: bench_run, logged with the lines it made
+// DVI miss. Then start the background stream: CMD18 with DMA to
+// bench_sink.
+#[link_section = ".text"]
+fn dvi_poll() {
+    push(r4, lr)
+    p @r0 = &dvi
+    m @r4 = p.missed_lines
+    pw @r0 = &dvi_lba
+    lba @r0 = *pw
+    pw @r1 = &dvi_blocks
+    blocks @r1 = *pw
+    buf @r2 = 0
+    status @r0 = call bench_run(lba, blocks, buf)
+    #(status - 0)
+    if #ne goto fail
+    p @r0 = &dvipoll_str
+    len @r1 = count(dvipoll_str)
+    call bench_log(p, len)
+    p @r0 = &dvi
+    m_ @r2 = p.missed_lines
+    v @r2 = m_ - r4
+    p @r0 = &missed_str
+    len @r1 = count(missed_str)
+    call log_kvd(p, len, v)
+
+    in_ @r0 = PIO_IN_PINS_4
+    x @r1 = RX4_NIBBLES - 1
+    call sd_rx_load(in_, x)
+    pio @r0 = peripherals.PIO1
+    v @r1 = 1 << 1
+    pio.FDEBUG = v
+    p @r0 = &bench_sink
+    pw @r1 = &dvi_blocks
+    blocks @r1 = *pw
+    k @r2 = BLOCK_WORDS
+    words @r1 = blocks * k
+    ctrl @r2 = BENCH_DMA_CTRL
+    call sd_rx_start(p, words, ctrl)
+    cyc @r0 = &peripherals.PPB.DWT_CYCCNT
+    t0 @r1 = *cyc
+    pw @r0 = &dvi_t0
+    *pw = t0
+    index @r0 = 18
+    pw @r1 = &dvi_lba
+    lba @r2 = *pw
+    pw @r1 = &sd_addr_shift
+    shift @r1 = *pw
+    arg @r1 = lba << shift
+    rbits @r2 = 48
+    status @r0 = call sd_command(index, arg, rbits)
+    #(status - 0)
+    if #ne goto fail
+    phase @r1 = PHASE_STREAM_START
+    pw @r0 = &dvi_phase
+    *pw = phase
+    pop(r4, pc)
+
+fail:
+    call sd_rx_stop()
+    p @r0 = &fail_str
+    len @r1 = count(fail_str)
+    call log_line(p, len)
+    call log_end()
+    phase @r1 = PHASE_DONE
+    pw @r0 = &dvi_phase
+    *pw = phase
+    pop(r4, pc)
+}
+
+// The background stream is in: log its time, rate, the lines DVI missed
+// while it ran, and whether SM1 stalled, then stop it with CMD12.
+#[link_section = ".text"]
+fn dvi_stream_done() {
+    push(r4, r5, r6, lr)
+    cyc @r0 = &peripherals.PPB.DWT_CYCCNT
+    t @r4 = *cyc
+    pw @r0 = &dvi_t0
+    t0 @r0 = *pw
+    t -= t0
+    p @r0 = &dvi
+    m @r5 = p.missed_lines
+    pw @r0 = &dvi_missed0
+    m0 @r0 = *pw
+    m -= m0
+    pw @r0 = &dvi_rxstall
+    v @r6 = *pw
+    phase @r1 = PHASE_DONE
+    pw @r0 = &dvi_phase
+    *pw = phase
+
+    pio @r0 = peripherals.PIO1
+    v_ @r1 = SD_CTRL_BUS
+    pio.CTRL = v_
+    index @r0 = 12
+    arg @r1 = 0
+    rbits @r2 = 48
+    call sd_command(index, arg, rbits)
+    call sd_wait_busy()
+
+    p @r0 = &dvistream_str
+    len @r1 = count(dvistream_str)
+    call log_line(p, len)
+    p @r0 = &blocks_str
+    len @r1 = count(blocks_str)
+    pw @r2 = &dvi_blocks
+    v_ @r2 = *pw
+    call log_kvd(p, len, v_)
+    p @r0 = &total_str
+    len @r1 = count(total_str)
+    v_ @r2 = r4
+    call log_kvd(p, len, v_)
+    // hundredths of MB/s, as in bench_log
+    k @r1 = 51200
+    pw @r0 = &dvi_blocks
+    n @r0 = *pw
+    n *= k
+    c @r1 = r4
+    k @r2 = 144
+    c = c / k
+    n = n / c
+    v_ @r2 = n
+    p @r0 = &rate_str
+    len @r1 = count(rate_str)
+    call log_kvd(p, len, v_)
+    p @r0 = &missed_str
+    len @r1 = count(missed_str)
+    v_ @r2 = r5
+    call log_kvd(p, len, v_)
+    p @r0 = &rxstall_str
+    len @r1 = count(rxstall_str)
+    v_ @r2 = r6
+    call log_kvd(p, len, v_)
+    call log_end()
+    pop(r4, r5, r6, pc)
+}
+
+// Nothing to do in thread mode
+fn demo_main() {
+    bx lr
+}

@@ -33,6 +33,12 @@ SECTIONS
         _bss_end = .;
     } > RAM
 
+    /* big buffers that don't need zeroing at startup */
+    .uninit (NOLOAD) : {
+        . = ALIGN(4);
+        *(.uninit*)
+    } > RAM
+
     /* unwind tables from the usblog crate, unused with panic = "abort" */
     /DISCARD/ : {
         *(.ARM.exidx*)

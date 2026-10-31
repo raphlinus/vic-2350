@@ -1,0 +1,154 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+// Show IMAGE.NIB from the root directory of the SD card's FAT32 volume: a
+// 640x480 nibnib image, as in image.sy (which has the same image in
+// flash). demo_init brings the card up in 4-bit high speed mode (sd.sy),
+// reads the file into RAM (fat.sy) and checks its header, logging over
+// USB; demo_line decodes the image, or draws red if anything failed.
+//
+// Its functions each have a section of their own, as in sd.sy.
+
+// A nibnib file: the width and height as u16s, 256 pixel pair deltas, then
+// the lines. Each line is its first pixel pair, then one byte per following
+// pair, which indexes the deltas, padded to a multiple of 4 bytes.
+const NIB_PALETTE = 4
+const NIB_LINES = NIB_PALETTE + 256 * 4
+const NIB_STRIDE = 4 + H_ACTIVE / 2
+const NIB_SIZE = NIB_LINES + V_ACTIVE * NIB_STRIDE
+// The file, in whole blocks
+const NIB_BLOCKS = (NIB_SIZE + 511) / 512
+const NIB_WORDS = NIB_BLOCKS * 128
+// Red, in RGB565, for a failure
+const FAIL_PIXELS = 0xf800f800
+
+static mut nib_buf: [u32; NIB_WORDS]
+// Whether nib_buf holds a good image
+static mut nib_ok: u32
+
+// The 8.3 name, as in a directory entry
+static nib_name: [u8; _] = "IMAGE   NIB"
+static size_str: [u8; _] = "IMAGE.NIB bytes "
+static load_str: [u8; _] = "IMAGE.NIB cycles to read "
+static badsize_str: [u8; _] = "IMAGE.NIB isn't a 640x480 nibnib image"
+static fail_str: [u8; _] = "failed"
+
+#[link_section = ".text"]
+fn demo_init() {
+    push(r4, r5, r6, lr)
+    zero @r1 = 0
+    pw @r0 = &sd_verbose
+    *pw = zero
+    status @r0 = call sd_init()
+    #(status - 0)
+    if #ne goto fail
+    status @r0 = call sd_set_wide()
+    #(status - 0)
+    if #ne goto fail
+    status @r0 = call sd_switch_hs()
+    #(status - 0)
+    if #ne goto fail
+
+    status @r0 = call fat_mount()
+    #(status - 0)
+    if #ne goto fail
+    p @r0 = &nib_name
+    status @r0 = call fat_find_root(p)
+    #(status - 0)
+    if #ne goto fail
+    pw @r0 = &fat_found_size
+    size @r4 = *pw
+    p @r0 = &size_str
+    len @r1 = count(size_str)
+    v @r2 = r4
+    call log_kvd(p, len, v)
+    size @r1 = NIB_SIZE
+    #(r4 - size)
+    if #ne goto bad_size
+
+    cyc @r0 = &peripherals.PPB.DWT_CYCCNT
+    t0 @r5 = *cyc
+    dst @r0 = &nib_buf
+    pw @r1 = &fat_found_clus
+    clus @r1 = *pw
+    size @r2 = r4
+    status @r0 = call fat_read_file(dst, clus, size)
+    #(status - 0)
+    if #ne goto fail
+    cyc @r0 = &peripherals.PPB.DWT_CYCCNT
+    t @r6 = *cyc
+    t -= t0
+    p @r0 = &load_str
+    len @r1 = count(load_str)
+    v @r2 = r6
+    call log_kvd(p, len, v)
+
+    // the header: width and height
+    pw @r0 = &nib_buf
+    wh @r1 = *pw
+    want @r2 = H_ACTIVE | (V_ACTIVE << 16)
+    #(wh - want)
+    if #ne goto bad_size
+    one @r1 = 1
+    pw @r0 = &nib_ok
+    *pw = one
+    goto finish
+
+bad_size:
+    p @r0 = &badsize_str
+    len @r1 = count(badsize_str)
+    call log_line(p, len)
+fail:
+    p @r0 = &fail_str
+    len @r1 = count(fail_str)
+    call log_line(p, len)
+finish:
+    call log_end()
+    pop(r4, r5, r6, pc)
+}
+
+// Decode line y of the image, as image.sy does: each pair is the previous
+// pair's right pixel, doubled, plus its delta.
+#[link_section = ".ram"]
+fn demo_line(y: u32, pixels: *u32) {
+    push(r4, r5)
+    pw @r2 = &nib_ok
+    ok @r2 = *pw
+    if ok == 0 goto failed
+    stride @r3 = NIB_STRIDE
+    pal @r12 = &nib_buf
+    pal += NIB_PALETTE
+    src @r2 = pal + 256 * 4
+    src += y * stride
+    pair @r4 = *src++
+    src8 @r2 = src as *u8
+    count @r3 = H_ACTIVE / 2 - 1
+    loop {
+        ix @r5 = *src8++
+        *pixels++ = pair
+        delta @r5 = *(pal + ix * 4)
+        pair = pkhtb(pair, pair >> 16)
+        #(count -= 1)
+        pair += delta
+        if #ne goto loop
+    }
+    *pixels++ = pair
+    pop(r4, r5)
+    bx lr
+
+failed:
+    color @r2 = FAIL_PIXELS
+    n @r3 = H_ACTIVE / 2
+    loop {
+        *pixels++ = color
+        #(n -= 1)
+        if #ne goto loop
+    }
+    pop(r4, r5)
+    bx lr
+}
+
+// Nothing to do in thread mode
+fn demo_main() {
+    bx lr
+}
