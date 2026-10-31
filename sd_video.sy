@@ -3,19 +3,20 @@
 
 // Play VIDEO.NIB from the root directory of the SD card at 60 fps: 640x480
 // nibnib frames (as in sd_image.sy), each padded to FRAME_BLOCKS blocks,
-// as made by tools/nibvid. Only the longest run of whole frames that's
-// contiguous on the card is played, looping.
+// as made by tools/nibvid, looping.
 //
-// The whole file is one CMD18, read into a ring of two frame slots with
-// DMA channels 2 and 3, chained: each writes one slot, CRCs included,
-// then triggers the other, and demo_line puts its write address back.
-// Frame g goes in slot g & 1. Flow control is stopping SM0, which stops
+// Each run of contiguous clusters is one CMD18, read into a ring of two
+// frame slots with DMA channels 2 and 3, chained: each writes one slot, CRCs
+// included, then triggers the other, and vid_poll sets it up again. Frame g
+// goes in slot g & 1. Flow control is stopping SM0, which stops
 // CLK, so the card waits: the stream may run into the slot on screen, with
 // the frame after next, but only up to MARGIN_BLOCKS behind the line being
 // drawn. A new frame is shown at line 0 only if all its blocks are in,
 // otherwise the last one is shown again.
-// At the end of the file, the channel with the last frame doesn't chain,
-// and the next pass is CMD12, then a new CMD18.
+// At the end of a run, which can be anywhere in a slot, the channel doesn't
+// chain, and the next run is CMD12, then a new CMD18 and the rest of the
+// slot. Each one costs about a quarter of a millisecond of the card's time,
+// out of the 7 ms a frame has to spare.
 //
 // demo_line polls all this every line, then copies the line's words out
 // of the slot (skipping each block's CRC words) and decodes them. Stats
@@ -39,6 +40,8 @@ const NIB_HEADER = H_ACTIVE | (V_ACTIVE << 16)
 const MARGIN_BLOCKS = 80
 const RESUME_BLOCKS = 16
 const LOG_PASSES = 3
+// The runs of clusters a file can be in
+const MAX_RUNS = 512
 const FAIL_PIXELS = 0xf800f800
 
 // DMA channels 2 and 3 as in SD_DMA_CTRL, chaining to channel 2 or 3
@@ -46,18 +49,16 @@ const VID_CTRL_TO2 = (SD_DMA_CTRL & !(15 << 13)) | (2 << 13)
 const VID_CTRL_TO3 = (SD_DMA_CTRL & !(15 << 13)) | (3 << 13)
 
 struct Video {
-    // the first block of the run of the file that's played, its first
-    // frame and how many frames it has, and the file's runs of clusters
-    lba: u32
-    frames: u32
-    first: u32
+    // the file's runs of clusters and whole frames
     runs: u32
-    // the file's whole frames
     total: u32
-    // frames the DMA has finished, and the frame count at which the
-    // current CMD18 ends
+    // the run being read, the block of the stream where it ends, and
+    // whether the DMA has got there
+    run: u32
+    run_end: u32
+    at_end: u32
+    // frames the DMA has finished
     done: u32
-    pass_end: u32
     // the frame on screen, whether one is yet, and how far it is into the
     // file
     cur: u32
@@ -79,6 +80,8 @@ struct Video {
 }
 
 static mut vid: Video
+// Each run of the file: its first block and how many blocks to read
+static mut vid_runs: [u32; 2 * MAX_RUNS]
 // a line's words, and the frame's palette, out of the slot
 static mut vid_line: [u32; NIB_STRIDE_W]
 static mut vid_pal: [u32; 256]
@@ -88,9 +91,8 @@ static mut vid_ring: [u32; 2 * SLOT_WORDS]
 
 static video_name: [u8; _] = "VIDEO   NIB"
 static size_str: [u8; _] = "VIDEO.NIB bytes "
-static frames_str: [u8; _] = "  frames in the longest run "
+static frames_str: [u8; _] = "VIDEO.NIB frames "
 static runs_str: [u8; _] = "VIDEO.NIB runs of clusters "
-static first_str: [u8; _] = "  longest run starts at frame "
 static pass_str: [u8; _] = "pass "
 static shown_str: [u8; _] = "  frames shown "
 static repeats_str: [u8; _] = "  frames repeated (the next wasn't in) "
@@ -100,7 +102,8 @@ static bad_str: [u8; _] = "  bad frame headers "
 static missed_str: [u8; _] = "  lines missed "
 static rmax_str: [u8; _] = "  longest restart, cycles "
 static lmax_str: [u8; _] = "  longest pass log, cycles "
-static short_str: [u8; _] = "VIDEO.NIB has under 2 contiguous frames"
+static short_str: [u8; _] = "VIDEO.NIB has under 2 frames"
+static badchain_str: [u8; _] = "VIDEO.NIB's cluster chain is too long or too short"
 static cmdfail_str: [u8; _] = "command failed"
 static fail_str: [u8; _] = "failed"
 
@@ -137,31 +140,34 @@ fn demo_init() {
     n @r1 = r4 / k
     vd @r0 = &vid
     vd.total = n
-    pw @r0 = &fat_found_clus
-    c @r0 = *pw
-    call vid_best_run(c)
-    p @r0 = &runs_str
-    len @r1 = count(runs_str)
-    vd @r2 = &vid
-    v @r2 = vd.runs
-    call log_kvd(p, len, v)
-    p @r0 = &first_str
-    len @r1 = count(first_str)
-    vd @r2 = &vid
-    v @r2 = vd.first
-    call log_kvd(p, len, v)
     p @r0 = &frames_str
     len @r1 = count(frames_str)
     vd @r2 = &vid
-    v @r2 = vd.frames
+    v @r2 = vd.total
     call log_kvd(p, len, v)
     vd @r0 = &vid
-    n @r0 = vd.frames
+    n @r0 = vd.total
     #(n - 2)
     if {
         if #hs goto end
         p @r0 = &short_str
         len @r1 = count(short_str)
+        call log_line(p, len)
+        goto fail
+    }
+    pw @r0 = &fat_found_clus
+    c @r0 = *pw
+    status @r0 = call vid_find_runs(c)
+    failed @r4 = status
+    p @r0 = &runs_str
+    len @r1 = count(runs_str)
+    vd @r2 = &vid
+    v @r2 = vd.runs
+    call log_kvd(p, len, v)
+    if {
+        if failed == 0 goto end
+        p @r0 = &badchain_str
+        len @r1 = count(badchain_str)
         call log_line(p, len)
         goto fail
     }
@@ -182,16 +188,20 @@ fail:
     pop(r4, r5, r6, pc)
 }
 
-// Find the longest run of whole frames that's contiguous on the card, in
-// the chain from cluster c: set vid.lba to its first block, vid.first to
-// its first frame and vid.frames to how many frames it has, and count the
-// runs of clusters in vid.runs.
+// Fill in vid_runs and vid.runs from the chain from cluster c, up to the
+// file's last whole frame. Returns 0, or 1 if the chain has more than
+// MAX_RUNS runs or stops short.
 #[link_section = ".text"]
-fn vid_best_run(c: u32) {
+fn vid_find_runs(c: u32) -> status: u32 {
     push(r4, r5, r6, r7, r8, r9, r10, lr)
     c @r4 = c
     f @r0 = &fat
     spc @r6 = f.sec_per_clus
+    vd @r0 = &vid
+    limit @r10 = vd.total
+    k @r1 = FRAME_BLOCKS
+    limit *= k
+    table @r5 = &vid_runs
     // the file's blocks so far, and the run's first cluster and block
     o @r7 = 0
     loop {
@@ -209,58 +219,111 @@ fn vid_best_run(c: u32) {
             goto loop
         }
         c @r4 = next
-        vd @r5 = &vid
-        n @r0 = vd.runs
+        vd @r0 = &vid
+        n @r1 = vd.runs
+        #(n - MAX_RUNS)
+        if #hs goto bad
         n += 1
         vd.runs = n
-        // whole frames f0..f1 in blocks o0..o
-        k @r1 = FRAME_BLOCKS
-        f0 @r2 = o0 + (FRAME_BLOCKS - 1)
-        f0 = f0 / k
-        f1 @r3 = o / k
+        c_ @r0 = r8
+        lba @r0 = call fat_clus_lba(c_)
         // the last cluster can run past the file's last frame
-        total @r1 = vd.total
-        #(f1 - total)
+        last @r1 = r7
+        #(last - limit)
         if {
             if #ls goto end
-            f1 = total
+            last = limit
         }
-        nf @r1 = f1 - f0
-        if {
-            #(nf - 0)
-            if #le goto end
-            best @r0 = vd.frames
-            #(nf - best)
-            if #ls goto end
-            vd.frames = nf
-            vd.first = f0
-            // its first block: the run's, plus the frame's offset in it
-            k @r1 = FRAME_BLOCKS
-            skip @r10 = f0 * k
-            skip -= o0
-            c_ @r0 = r8
-            lba @r0 = call fat_clus_lba(c_)
-            lba += skip
-            vd @r5 = &vid
-            vd.lba = lba
-        }
+        last -= o0
+        *table = lba
+        *(table + 4) = last
+        table += 8
+        #(o - limit)
+        if #hs goto break
         eoc @r1 = 0x0ffffff8
         #(r4 - eoc)
-        if #hs goto break
+        if #hs goto bad
         #(r4 - 2)
-        if #lo goto break
+        if #lo goto bad
         goto loop
     }
+    status @r0 = 0
+    pop(r4, r5, r6, r7, r8, r9, r10, pc)
+
+bad:
+    status @r0 = 1
     pop(r4, r5, r6, r7, r8, r9, r10, pc)
 }
 
-// Start a pass through the file: the next frame (vid.done) goes to its
-// slot, and the pass ends vid.frames frames on. The channel for the
-// next frame must be idle, with its write address at its slot, as must
-// the other. Sends CMD18 and returns its status.
+// Set up the channel for the slot of block pos of the stream, without
+// starting it: from pos up to the end of the slot or to run_end, whichever
+// comes first. It chains to the other channel only if the run goes on past
+// the slot. With pos at or past run_end, it just waits at the start of the
+// slot.
+#[link_section = ".ram"]
+fn vid_arm(pos: u32, run_end: u32) {
+    push(r4, r5, r6, r7, r8, lr)
+    k @r2 = FRAME_BLOCKS
+    g @r3 = pos / k
+    last @r12 = g + 1
+    last *= k
+    stop @r4 = last
+    #(run_end - stop)
+    if {
+        if #hs goto end
+        stop = run_end
+    }
+    #(stop - pos)
+    if {
+        if #hs goto end
+        stop = pos
+    }
+    n @r5 = stop - pos
+    t @r2 = g * k
+    off @r0 = pos - t
+    b @r2 = BLOCK_WORDS * 4
+    off *= b
+    ch @r6 = peripherals.DMA as *DmaChannel
+    ch += 0x80
+    ring @r2 = &vid_ring
+    if {
+        #(g & 1)
+        if #eq goto end
+        ch += 0x40
+        slot @r7 = SLOT_WORDS * 4
+        ring += slot
+    }
+    ring += off
+    ch.write_addr = ring
+    w @r2 = BLOCK_WORDS
+    n *= w
+    ch.trans_count = n
+    ctrl @r2 = VID_CTRL_TO2
+    other @r5 = VID_CTRL_TO3
+    if {
+        #(g & 1)
+        if #eq goto end
+        ctrl = VID_CTRL_TO3
+        other = VID_CTRL_TO2
+    }
+    // past the slot?
+    if {
+        #(stop - last)
+        if #ne goto end
+        #(run_end - last)
+        if #ls goto end
+        ctrl = other
+    }
+    ch.al1_ctrl = ctrl
+    pop(r4, r5, r6, r7, r8, pc)
+}
+
+// Start reading the run vid.run, at the block of the stream where the last
+// one ended, which can be anywhere in a slot. Both channels must be idle.
+// Sends CMD18 and returns its status.
 #[link_section = ".text"]
 fn vid_start() -> status: u32 {
-    push(r4, r5, r6, lr)
+    push(r4, r5, r6, r7, r8, lr)
     in_ @r0 = PIO_IN_PINS_4
     x @r1 = RX4_NIBBLES - 1
     call sd_rx_load(in_, x)
@@ -268,44 +331,48 @@ fn vid_start() -> status: u32 {
     dma @r0 = peripherals.DMA
     bits @r1 = 3 << 2
     dma.INTR = bits
-    // both channels at their slots, chaining to each other, a full slot
-    // each time they're triggered
     ch @r0 = peripherals.DMA as *DmaChannel
     ch += 0x80
     pio @r1 = peripherals.PIO1
     rx @r1 = &pio.RXF1
-    ring @r2 = &vid_ring
-    len @r3 = SLOT_WORDS
     ch.read_addr = rx
-    ch.write_addr = ring
-    ch.trans_count = len
-    ctrl @r12 = VID_CTRL_TO3
-    ch.al1_ctrl = ctrl
     ch += 0x40
-    k @r12 = SLOT_WORDS * 4
-    ring += k
     ch.read_addr = rx
-    ch.write_addr = ring
-    ch.trans_count = len
-    ctrl @r12 = VID_CTRL_TO2
-    ch.al1_ctrl = ctrl
 
-    // trigger the next frame's channel
+    v @r4 = &vid
+    i @r0 = v.run
+    table @r1 = &vid_runs
+    table += i * 8
+    lba @r6 = *table
+    n @r1 = *(table + 4)
+    start @r7 = v.run_end
+    run_end @r5 = start + n
+    v.run_end = run_end
+    zero @r1 = 0
+    v.at_end = zero
+    // the next slot first, as this one can chain to it
+    k @r1 = FRAME_BLOCKS
+    g @r2 = start / k
+    g += 1
+    pos @r0 = g * k
+    run_end @r1 = r5
+    call vid_arm(pos, run_end)
+    pos @r0 = r7
+    run_end @r1 = r5
+    call vid_arm(pos, run_end)
+
+    // and start it
     v @r4 = &vid
     done @r1 = v.done
     ch @r0 = peripherals.DMA as *DmaChannel
     ch += 0x80
-    ctrl @r12 = VID_CTRL_TO3
     if {
         #(done & 1)
         if #eq goto end
         ch += 0x40
-        ctrl = VID_CTRL_TO2
     }
+    ctrl @r1 = ch.al1_ctrl
     ch.ctrl_trig = ctrl
-    frames @r2 = v.frames
-    end_ @r2 = done + frames
-    v.pass_end = end_
     zero @r1 = 0
     v.stopped = zero
     pio @r0 = peripherals.PIO1
@@ -313,17 +380,16 @@ fn vid_start() -> status: u32 {
     pio.CTRL = both
 
     index @r0 = 18
-    v @r4 = &vid
-    lba @r2 = v.lba
     pw @r1 = &sd_addr_shift
     shift @r1 = *pw
     arg @r1 = lba << shift
     rbits @r2 = 48
     status @r0 = call sd_command(index, arg, rbits)
-    pop(r4, r5, r6, pc)
+    pop(r4, r5, r6, r7, r8, pc)
 }
 
-// End a pass, with CMD12, and start the next.
+// End a run, with CMD12, and start the next, wrapping around at the end of
+// the file.
 #[link_section = ".text"]
 fn vid_restart() {
     push(r4, lr)
@@ -342,6 +408,15 @@ fn vid_restart() {
     n @r1 = v.restarts
     n += 1
     v.restarts = n
+    i @r1 = v.run
+    i += 1
+    runs @r2 = v.runs
+    #(i - runs)
+    if {
+        if #ne goto end
+        i = 0
+    }
+    v.run = i
     status @r0 = call vid_start()
     #(status - 0)
     if #ne goto fail
@@ -359,81 +434,79 @@ fail:
 }
 
 // Keep the stream going, before line y: count the slots the DMA has
-// finished, putting their channels' write addresses back, and stop the
-// last channel of a pass from chaining. At line 0, move on to the next
-// frame if it's in. Then stop or restart CLK for flow control, or start
-// the next pass once there's room.
+// finished, setting their channels up for the slot after next, and note
+// when it stops at the end of a run. At line 0, move on to the next frame
+// if it's in. Then stop or restart CLK for flow control, or start the next
+// run once there's room.
 #[link_section = ".ram"]
 fn vid_poll(y: u32) {
     push(r4, r5, r6, r7, r8, lr)
     y @r7 = y
     v @r4 = &vid
     done @r5 = v.done
-    dma @r0 = peripherals.DMA
-    intr @r1 = dma.INTR
-    intr &= 3 << 2
-    if {
-        if intr == 0 goto end
-        dma.INTR = intr
+    // Only the channel for frame done can have finished, then the next
+    loop {
+        x @r1 = done & 1
+        bit @r0 = 1 << 2
+        bit <<= x
+        dma @r2 = peripherals.DMA
+        intr @r3 = dma.INTR
+        intr &= bit
+        if intr == 0 goto break
+        dma.INTR = bit
         ch @r2 = peripherals.DMA as *DmaChannel
         ch += 0x80
         ring @r3 = &vid_ring
+        slot @r12 = SLOT_WORDS * 4
+        ring += slot
         if {
-            #(intr & (1 << 2))
-            if #eq goto end
-            ch.write_addr = ring
-            done += 1
-        }
-        if {
-            #(intr & (1 << 3))
-            if #eq goto end
+            if x == 0 goto end
             ch += 0x40
-            k @r12 = SLOT_WORDS * 4
-            ring += k
-            ch.write_addr = ring
-            done += 1
+            ring += slot
         }
+        // stopped short of the end of the slot: the run ended there
+        a @r0 = ch.write_addr
+        #(a - ring)
+        if {
+            if #eq goto end
+            one @r0 = 1
+            v.at_end = one
+            goto break
+        }
+        done += 1
         v.done = done
-        // the last frame of the pass is on its way: don't chain after it
-        last @r1 = v.pass_end
-        last -= 1
-        #(done - last)
+        k @r1 = FRAME_BLOCKS
+        pos @r0 = done * k
+        run_end @r1 = v.run_end
+        #(pos - run_end)
         if {
             if #ne goto end
-            ch @r2 = peripherals.DMA as *DmaChannel
-            ch += 0x80
-            ctrl @r3 = VID_CTRL_TO2
-            if {
-                #(done & 1)
-                if #eq goto end
-                ch += 0x40
-                ctrl = VID_CTRL_TO3
-            }
-            ch.al1_ctrl = ctrl
+            one @r2 = 1
+            v.at_end = one
         }
+        k @r2 = FRAME_BLOCKS
+        pos += k
+        call vid_arm(pos, run_end)
     }
 
     // blocks in: the finished frames, and the active channel's progress
     k @r0 = FRAME_BLOCKS
     w @r6 = done * k
-    pass_end @r1 = v.pass_end
-    #(done - pass_end)
+    ch @r2 = peripherals.DMA as *DmaChannel
+    ch += 0x80
+    base @r3 = &vid_ring
     if {
+        #(done & 1)
         if #eq goto end
-        ch @r2 = peripherals.DMA as *DmaChannel
-        ch += 0x80
-        if {
-            #(done & 1)
-            if #eq goto end
-            ch += 0x40
-        }
-        rem @r2 = ch.trans_count
-        got @r3 = SLOT_WORDS
-        got -= rem
-        k @r2 = BLOCK_WORDS
-        got = got / k
-        w += got
+        ch += 0x40
+        slot @r12 = SLOT_WORDS * 4
+        base += slot
     }
+    got @r2 = ch.write_addr
+    got -= r3
+    k @r3 = BLOCK_WORDS * 4
+    got = got / k
+    w += got
 
     if {
         if y != 0 goto end
@@ -476,11 +549,10 @@ fn vid_poll(y: u32) {
     }
     #(room - (MARGIN_BLOCKS + RESUME_BLOCKS))
     if #lt goto polled
-    // room again: start the next pass, or restart CLK
-    pass_end @r1 = v.pass_end
-    #(done - pass_end)
+    // room again: start the next run, or restart CLK
+    at_end @r1 = v.at_end
     if {
-        if #ne goto end
+        if at_end == 0 goto end
         cyc @r0 = &peripherals.PPB.DWT_CYCCNT
         t0 @r8 = *cyc
         call vid_restart()
@@ -637,7 +709,7 @@ fn vid_frame(w: u32) {
     v.started = one
     pf @r0 = v.pass_frame
     pf += 1
-    frames @r1 = v.frames
+    frames @r1 = v.total
     #(pf - frames)
     if {
         if #ne goto end
