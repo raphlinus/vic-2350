@@ -38,9 +38,6 @@ symbol demo_init: fn()
 symbol demo_main: fn()
 symbol demo_line: fn(y: u32, pixels: *u32)
 
-// PLL_USB is derived from PLL_SYS in the SVD, so it isn't in peripherals
-const PLL_USB = 0x40058000
-
 // 640x480 at 60 Hz
 const H_FRONT_PORCH = 16
 const H_SYNC_WIDTH = 96
@@ -407,7 +404,7 @@ fn init_plls() {
     prim @r2 = (5 << 16) | (2 << 12)
     call init_pll(pll, fbdiv, prim)
     // VCO = 12 MHz * 126 = 1512 MHz, 1512 / (6 * 2) = 126 MHz
-    pll @r0 = PLL_USB
+    pll @r0 = peripherals.PLL_USB
     fbdiv @r1 = 126
     prim @r2 = (6 << 16) | (2 << 12)
     call init_pll(pll, fbdiv, prim)
