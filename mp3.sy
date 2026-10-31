@@ -1,0 +1,3348 @@
+// Copyright 2026 Raph Levien
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+use "mp3_tables.sy"
+
+// An MP3 (MPEG-1/2/2.5 Layer III) decoder, a port of mp3dec (itself a
+// port of minimp3), with the same results bit for bit. Layers I and II
+// are recognized but not decoded.
+//
+// Call mp3_decode_frame(mp3, len, pcm, info) with the rest of the stream
+// in mp3. It decodes the first frame, skipping any junk before it, and
+// returns the number of samples per channel, 0 if no frame was decoded
+// (no sync, layer 1 or 2, or the bit reservoir isn't filled yet, as after
+// a seek). The samples are interleaved i16s, up to MP3_MAX_SAMPLES. In
+// either case, advance by info.frame_bytes. With pcm 0, only the header
+// is parsed.
+//
+// There's one decoder, in mp3_decoder, with its scratch memory in
+// mp3_scratch. mp3_init resets it.
+//
+// Each function is in its own section, so its literal pool is right
+// after it, and the hot ones are in RAM.
+
+const MP3_MAX_SAMPLES = 1152 * 2
+
+const HDR_SIZE = 4
+const MAX_FREE_FORMAT_FRAME_SIZE = 2304
+const MAX_FRAME_SYNC_MATCHES = 10
+const MAX_BITRESERVOIR_BYTES = 511
+const MAINDATA_BYTES = MAX_BITRESERVOIR_BYTES + MAX_FREE_FORMAT_FRAME_SIZE
+const SHORT_BLOCK_TYPE = 2
+const STOP_BLOCK_TYPE = 3
+const L3_ERROR = 0xffffffff
+
+// Header bits. The header is kept as one word, its first byte on top, so
+// bit k of byte i is bit 8 * (3 - i) + k.
+const HDR_CRC_ABSENT = 1 << 16
+const HDR_MPEG1 = 1 << 19
+const HDR_NOT_MPEG25 = 1 << 20
+const HDR_PADDING = 1 << 9
+const HDR_I_STEREO = 1 << 4
+const HDR_MS_STEREO = 1 << 5
+// Joint stereo with M/S: the mode and HDR_MS_STEREO, masked by 0xe0
+const HDR_JOINT_MS = 0x60
+// The channel mode, mono when both bits are set
+const HDR_MODE = 0xc0
+
+struct Mp3Info {
+    // Bytes consumed, including any skipped junk; advance input by this
+    frame_bytes: u32
+    // Offset of the frame header within the input
+    frame_offset: u32
+    // 1 or 2
+    channels: u32
+    hz: u32
+    // MPEG layer (1-3); only layer 3 is decoded
+    layer: u32
+    bitrate_kbps: u32
+}
+
+// State carried between frames
+struct Mp3Decoder {
+    reserv: u32
+    free_format_bytes: u32
+    // 0 until a frame is found
+    header: u32
+    // to a multiple of 16 bytes, for mp3_zero
+    pad: u32
+    reserv_buf: [u8; 512]
+    mdct_overlap: [f32; 576]
+    // the synthesis buffer: 960 floats of QMF history, kept from granule
+    // to granule, then each granule's 1152 new values, also scratch for
+    // mp3_reorder
+    syn: [f32; 2112]
+}
+
+// A bit reader: pos and limit count bits from buf
+struct Mp3Bs {
+    buf: *u8
+    pos: u32
+    limit: u32
+}
+
+// Side information for one granule of one channel
+struct Mp3Gr {
+    // band widths, from mp3_scf_long, mp3_scf_short or mp3_scf_mixed
+    sfbtab: *u8
+    part_23_length: u16
+    big_values: u16
+    scalefac_compress: u16
+    global_gain: u8
+    block_type: u8
+    mixed_block_flag: u8
+    n_long_sfb: u8
+    n_short_sfb: u8
+    table_select: [u8; 3]
+    region_count: [u8; 3]
+    subblock_gain: [u8; 3]
+    preflag: u8
+    scalefac_scale: u8
+    count1_table: u8
+    scfsi: u8
+}
+
+// Memory for one frame. gr_info, scf and ist_pos are cleared at the start
+// of each frame, as one block. maindata ends with zeros, which the
+// Huffman decoder can read past the main data in a broken stream; the
+// bytes from dirty on are zero.
+struct Mp3Scratch {
+    bs: Mp3Bs
+    dirty: u32
+    gr_info: [Mp3Gr; 4]
+    scf: [f32; 40]
+    // [[u8; 39]; 2], padded
+    ist_pos: [u8; 80]
+    grbuf: [f32; 1152]
+    maindata: [u8; 4864]
+}
+
+const SCRATCH_CLEAR_WORDS = (size(Mp3Gr) * 4 + 160 + 80) / 4
+
+static mut mp3_decoder: Mp3Decoder
+static mut mp3_scratch: Mp3Scratch
+
+// Constants for the functions below that are too long for a literal pool
+static mp3_pow43_k: [f32; 4] = [16.0, 256.0, 1.3333334, 0.22222222]
+static mp3_dct9_k: [f32; 8] = [
+    0.5, 0.93969262, 0.76604444, 0.17364818, 0.86602540, 0.98480775, 0.34202014, 0.64278761,
+]
+static mp3_dct8_k: [f32; 9] = [
+    0.70710677, 0.198912367, 0.382683432, 0.50979561, 0.54119611, 0.60134488, 0.89997619,
+    1.30656302, 2.56291556,
+]
+// The second half of mp3_synth_pair's window, and mp3_scale_pcm's
+// clamp range
+static mp3_synth_k: [f32; 19] = [
+    29.0, 213.0, 459.0, 2037.0, 5153.0, 6574.0, 37489.0, 75038.0,
+    104.0, 1567.0, 9727.0, 64019.0, -9975.0, -45.0, 146.0, -5.0,
+    -32767.5, 32766.5, 0.5,
+]
+
+// Reset the decoder, as before the first frame
+#[link_section = ".text"]
+fn mp3_init() {
+    p @r0 = &mp3_decoder as *u32
+    n @r1 = size(Mp3Decoder) / 4
+    #[tail] call mp3_zero(p, n)
+}
+
+// Zero n words at p, n a nonzero multiple of 4: 8 at a time, then 4 if
+// left
+#[link_section = ".ram"]
+fn mp3_zero(p: *u32, n) {
+    push(r4, r5, r6, r7, lr)
+    a @r2 = 0
+    b @r3 = 0
+    c @r4 = 0
+    d @r5 = 0
+    e @r6 = 0
+    f @r7 = 0
+    g @r12 = 0
+    h @lr = 0
+    #(n -= 8)
+    if #lo goto four
+    loop {
+        #(n -= 8)
+        *p++ = (a, b, c, d, e, f, g, h)
+        if #hs goto loop
+    }
+four:
+    #(n += 8)
+    if #eq goto done
+    *p++ = (a, b, c, d)
+done:
+    pop(r4, r5, r6, r7, pc)
+}
+
+// Copy n words from src to dst, n a nonzero multiple of 4: 8 at a time,
+// then 4 if left
+#[link_section = ".ram"]
+fn mp3_copy_words(dst: *u32, src: *u32, n) {
+    push(r4, r5, r6, r7, r8, lr)
+    #(n -= 8)
+    if #lo goto four
+    loop {
+        #(n -= 8)
+        (a @r3, b @r4, c @r5, d @r6, e @r7, f @r8, g @r12, h @lr) = *src++
+        *dst++ = (a, b, c, d, e, f, g, h)
+        if #hs goto loop
+    }
+four:
+    #(n += 8)
+    if #eq goto done
+    (a @r3, b @r4, c @r5, d @r6) = *src++
+    *dst++ = (a, b, c, d)
+done:
+    pop(r4, r5, r6, r7, r8, pc)
+}
+
+// Copy n bytes from src to dst, 8 at a time with word loads and stores,
+// which may be unaligned
+#[link_section = ".text"]
+fn mp3_copy(dst: *u8, src: *u8, n) {
+    #(n -= 8)
+    if #lo goto tail
+    loop {
+        a @r3 = *(src as *u32)
+        b @r12 = *((src + 4) as *u32)
+        src += 8
+        *(dst as *u32) = a
+        *((dst + 4) as *u32) = b
+        dst += 8
+        #(n -= 8)
+        if #hs goto loop
+    }
+tail:
+    n += 8
+    if n == 0 goto done
+    loop {
+        c @r3 = *src++
+        *dst++ = c
+        #(n -= 1)
+        if #ne goto loop
+    }
+done:
+    bx lr
+}
+
+// Header fields
+
+#[link_section = ".text"]
+fn mp3_hdr_valid(h) -> ok {
+    b @r1 = h >> 24
+    #(b - 0xff)
+    if #ne goto no
+    b = h[16..24]
+    t @r2 = b & 0xf0
+    #(t - 0xf0)
+    if #eq goto sync
+    t = b & 0xfe
+    #(t - 0xe2)
+    if #ne goto no
+sync:
+    // layer, bitrate and sample rate
+    t = h[17..19]
+    if t == 0 goto no
+    t = h[12..16]
+    #(t - 15)
+    if #eq goto no
+    t = h[10..12]
+    #(t - 3)
+    if #eq goto no
+    ok = 1
+    bx lr
+no:
+    ok = 0
+    bx lr
+}
+
+// Whether other is a valid header for a frame of the same stream as h
+#[link_section = ".text"]
+fn mp3_hdr_compare(h, other) -> ok {
+    x @r2 = h ^ other
+    #(x & 0xfe0000)
+    if #ne goto no
+    #(x & 0xc00)
+    if #ne goto no
+    // both free format, or neither
+    a @r2 = h & 0xf000
+    b @r3 = other & 0xf000
+    if {
+        if a == 0 goto else
+        if b == 0 goto no
+        goto end
+    } else {
+        if b != 0 goto no
+    }
+    o @r0 = other
+    #[tail] call mp3_hdr_valid(o)
+no:
+    ok = 0
+    bx lr
+}
+
+#[link_section = ".text"]
+fn mp3_hdr_kbps(h) -> kbps {
+    // mp3_halfrate[mpeg1][layer - 1][bitrate]
+    m @r1 = h[19..20]
+    i @r2 = m + (m << 1)
+    l @r3 = h[17..19]
+    i += l
+    i -= 1
+    i = (i << 4) - i
+    b @r3 = h[12..16]
+    i += b
+    t @r3 = &mp3_halfrate as *u8
+    k @r3 = *(t + i)
+    kbps = k << 1
+    bx lr
+}
+
+#[link_section = ".text"]
+fn mp3_hdr_hz(h) -> hz {
+    sr @r1 = h[10..12]
+    t @r2 = &mp3_hz as *u32
+    v @r2 = *(t + sr * 4)
+    m @r1 = h[19..20]
+    m ^= 1
+    v >>= m
+    m = h[20..21]
+    m ^= 1
+    hz = v >> m
+    bx lr
+}
+
+// Samples per channel in a frame
+#[link_section = ".text"]
+fn mp3_hdr_samples(h) -> n {
+    l @r1 = h[17..19]
+    #(l - 3)
+    if #eq goto layer1
+    f @r1 = h[17..20]
+    n = 1152
+    #(f - 1)
+    if #eq {
+        n = 576
+    }
+    bx lr
+layer1:
+    n = 384
+    bx lr
+}
+
+#[link_section = ".text"]
+fn mp3_hdr_padding(h) -> n {
+    #(h & HDR_PADDING)
+    if #eq goto none
+    l @r1 = h[17..19]
+    n = 1
+    #(l - 3)
+    if #eq {
+        n = 4
+    }
+    bx lr
+none:
+    n = 0
+    bx lr
+}
+
+// The frame size without padding, or free, the free format frame size,
+// for a free format frame
+#[link_section = ".text"]
+fn mp3_hdr_frame_bytes(h, free) -> n {
+    push(r4, r5, r6, lr)
+    hh @r4 = h
+    f @r5 = free
+    s @r0 = call mp3_hdr_samples(h)
+    m @r6 = s
+    a @r0 = hh
+    k @r0 = call mp3_hdr_kbps(a)
+    m = m * k
+    t @r0 = 125
+    m = m * t
+    a @r0 = hh
+    hz @r0 = call mp3_hdr_hz(a)
+    n = m / hz
+    l @r1 = hh[17..19]
+    #(l - 3)
+    if #eq {
+        n &= !3
+    }
+    if n != 0 goto done
+    n = f
+done:
+    pop(r4, r5, r6, pc)
+}
+
+// The frame size with padding
+#[link_section = ".text"]
+fn mp3_hdr_frame_size(h, free) -> n {
+    push(r4, r5, r6, lr)
+    hh @r4 = h
+    b @r0 = call mp3_hdr_frame_bytes(h, free)
+    fb @r5 = b
+    a @r0 = hh
+    p @r0 = call mp3_hdr_padding(a)
+    n = fb + p
+    pop(r4, r5, r6, pc)
+}
+
+// Whether the frames from mp3, with frame_bytes for free format, are
+// followed by more of the same stream: up to MAX_FRAME_SYNC_MATCHES of
+// them, or at least one before the end of the data
+#[link_section = ".text"]
+fn mp3_match_frame(mp3: *u8, len, frame_bytes) -> ok {
+    push(r4, r5, r6, r7, r8, lr)
+    q @r4 = mp3
+    end @r8 = mp3 + len
+    fb @r6 = frame_bytes
+    h0 @r7 = *(mp3 as *u32)
+    h0 = rev(h0)
+    nmatch @r5 = 0
+    loop {
+        h @r0 = *(q as *u32)
+        h = rev(h)
+        f @r1 = fb
+        s @r0 = call mp3_hdr_frame_size(h, f)
+        q += s
+        t @r0 = q + HDR_SIZE
+        #(t - end)
+        if #hi goto out
+        o @r1 = *(q as *u32)
+        o = rev(o)
+        a @r0 = h0
+        ok = call mp3_hdr_compare(a, o)
+        if ok == 0 goto done
+        nmatch += 1
+        #(nmatch - MAX_FRAME_SYNC_MATCHES)
+        if #ne goto loop
+    }
+    ok = 1
+    goto done
+out:
+    ok = nmatch
+    if ok == 0 goto done
+    ok = 1
+done:
+    pop(r4, r5, r6, r7, r8, pc)
+}
+
+// Find the first frame in mp3, setting *ffb to its free format frame size
+// if it's free format. Returns its offset and size, or len and 0.
+#[link_section = ".text"]
+fn mp3_find_frame(mp3: *u8, len, ffb: *u32) -> (ix, size) {
+    push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
+    sp -= 12 (pad, other, fb2)
+    base @r9 = mp3
+    n @r8 = len
+    ffp @r6 = ffb
+    i @r7 = 0
+    loop {
+        t @r0 = i + HDR_SIZE
+        #(t - n)
+        if #hs goto break
+        hp @r0 = base + i
+        h @r5 = *(hp as *u32)
+        h = rev(h)
+        a @r0 = h
+        ok @r0 = call mp3_hdr_valid(a)
+        #(ok - 0)
+        if #eq goto next
+        a @r0 = h
+        f @r1 = *ffp
+        b @r0 = call mp3_hdr_frame_bytes(a, f)
+        fb @r4 = b
+        a @r0 = h
+        p @r0 = call mp3_hdr_padding(a)
+        sp.pad = p
+        fap @r10 = fb + p
+        if {
+            #(fb - 0)
+            if #ne goto end
+            // Free format: look for the next frame of the stream
+            k @r11 = HDR_SIZE
+            loop {
+                t @r0 = i + (k << 1)
+                t += HDR_SIZE
+                #(t - n)
+                if #hs goto break
+                hp @r1 = base + i
+                hp += k
+                o @r1 = *(hp as *u32)
+                o = rev(o)
+                sp.other = o
+                a @r0 = h
+                ok @r0 = call mp3_hdr_compare(a, o)
+                if ok == 0 goto next_k
+                p @r0 = sp.pad
+                b2 @r0 = k - p
+                sp.fb2 = b2
+                o @r0 = sp.other
+                po @r0 = call mp3_hdr_padding(o)
+                b2 @r1 = sp.fb2
+                nextfb @r0 = b2 + po
+                // and the frame after it
+                t @r1 = i + k
+                t += nextfb
+                e @r2 = t + HDR_SIZE
+                #(e - n)
+                if #hi goto next_k
+                hp @r1 = base + t
+                o2 @r1 = *(hp as *u32)
+                o2 = rev(o2)
+                a @r0 = h
+                ok @r0 = call mp3_hdr_compare(a, o2)
+                if ok == 0 goto next_k
+                fap = k
+                fb = sp.fb2
+                *ffp = fb
+                #(fb - 0)
+                if #ne goto break
+next_k:
+                k += 1
+                #(k - MAX_FREE_FORMAT_FRAME_SIZE)
+                if #lo goto loop
+            }
+        }
+        if {
+            #(fb - 0)
+            if #eq goto end
+            t @r0 = i + fap
+            #(t - n)
+            if #hi goto end
+            a @r0 = base + i
+            l @r1 = n - i
+            f @r2 = fb
+            ok @r0 = call mp3_match_frame(a, l, f)
+            if ok != 0 goto found
+        }
+        // or the data is exactly one frame
+        if i != 0 goto reset
+        #(fap - n)
+        if #eq goto found
+reset:
+        z @r0 = 0
+        *ffp = z
+next:
+        i += 1
+        goto loop
+    }
+    ix = n
+    size = 0
+    goto done
+found:
+    ix = i
+    size = fap
+done:
+    sp += 12
+    pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
+}
+
+// Read n bits, up to 24, or 0 past the limit. Reads the 4 bytes from the
+// first bit's, which may be up to 3 past the last bit.
+#[link_section = ".text"]
+fn mp3_bs_get_bits(bs: *Mp3Bs, n) -> v {
+    pos @r12 = bs.pos
+    lim @r3 = bs.limit
+    np @r2 = pos + n
+    bs.pos = np
+    #(np - lim)
+    if #hi goto zero
+    p @r3 = bs.buf
+    ix @r2 = pos >> 3
+    w @r2 = *((p + ix) as *u32)
+    s @r3 = pos & 7
+    w = rev(w)
+    w <<= s
+    t @r3 = 32 - n
+    v = w >> t
+    bx lr
+zero:
+    v = 0
+    bx lr
+}
+
+// Decode a frame; see the top of the file
+#[link_section = ".text"]
+fn mp3_decode_frame(mp3: *u8, len, pcm: *i16, info: *Mp3Info) -> n {
+    push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
+    sp -= 12 (bsf: Mp3Bs)
+    src @r8 = mp3
+    n_src @r9 = len
+    out @r6 = pcm
+    inf @r7 = info
+    dec @r4 = &mp3_decoder
+    size @r5 = 0
+    // If this continues the last frame's stream, it should start with a
+    // frame, followed by the next one's header
+    if {
+        #(n_src - HDR_SIZE)
+        if #ls goto end
+        old @r0 = dec.header
+        t @r1 = old >> 24
+        #(t - 0xff)
+        if #ne goto end
+        h @r1 = *(src as *u32)
+        h = rev(h)
+        hh @r10 = h
+        ok @r0 = call mp3_hdr_compare(old, h)
+        if ok == 0 goto end
+        a @r0 = hh
+        f @r1 = dec.free_format_bytes
+        s @r0 = call mp3_hdr_frame_size(a, f)
+        size = s
+        #(size - n_src)
+        if #eq goto end
+        t @r0 = size + HDR_SIZE
+        #(t - n_src)
+        if #hi goto mismatch
+        p @r1 = src + size
+        o @r1 = *(p as *u32)
+        o = rev(o)
+        a @r0 = hh
+        ok @r0 = call mp3_hdr_compare(a, o)
+        if ok != 0 goto end
+mismatch:
+        size = 0
+    }
+    ix @r10 = 0
+    if {
+        #(size - 0)
+        if #ne goto end
+        call mp3_init()
+        a @r0 = src
+        l @r1 = n_src
+        ffb @r2 = &dec.free_format_bytes
+        (i @r0, s @r1) = call mp3_find_frame(a, l, ffb)
+        ix = i
+        size = s
+        #(s - 0)
+        if #eq goto no_frame
+        t @r0 = i + s
+        #(t - n_src)
+        if #hi goto no_frame
+    }
+    hp @r0 = src + ix
+    h @r11 = *(hp as *u32)
+    h = rev(h)
+    dec.header = h
+    t @r0 = ix + size
+    inf.frame_bytes = t
+    inf.frame_offset = ix
+    ch @r0 = 2
+    t @r1 = h & HDR_MODE
+    #(t - HDR_MODE)
+    if #eq {
+        ch = 1
+    }
+    inf.channels = ch
+    a @r0 = h
+    hz @r0 = call mp3_hdr_hz(a)
+    inf.hz = hz
+    l @r0 = h[17..19]
+    l = 4 - l
+    inf.layer = l
+    a @r0 = h
+    k @r0 = call mp3_hdr_kbps(a)
+    inf.bitrate_kbps = k
+    if {
+        if out != 0 goto end
+        a @r0 = h
+        n = call mp3_hdr_samples(a)
+        goto done
+    }
+    #(size - HDR_SIZE)
+    if #lo goto bad
+    buf @r0 = src + ix
+    buf += HDR_SIZE
+    sp.bsf.buf = buf
+    zero @r0 = 0
+    sp.bsf.pos = zero
+    lim @r0 = size - HDR_SIZE
+    lim <<= 3
+    sp.bsf.limit = lim
+    if {
+        #(h & HDR_CRC_ABSENT)
+        if #ne goto end
+        b @r0 = &sp.bsf
+        w @r1 = 16
+        call mp3_bs_get_bits(b, w)
+    }
+    p @r0 = &mp3_scratch.gr_info as *u32
+    c @r1 = SCRATCH_CLEAR_WORDS
+    call mp3_zero(p, c)
+    // only layer 3 is decoded
+    l @r0 = h[17..19]
+    #(l - 1)
+    if #ne goto not_l3
+    b @r0 = &sp.bsf
+    a @r1 = h
+    mdb @r0 = call mp3_read_side_info(b, a)
+    #(mdb - L3_ERROR)
+    if #eq goto bad
+    pos @r1 = sp.bsf.pos
+    lim @r2 = sp.bsf.limit
+    #(pos - lim)
+    if #hi goto bad
+    m @r1 = mdb
+    b @r0 = &sp.bsf
+    ok @r0 = call mp3_restore_reservoir(b, m)
+    success @r5 = ok
+    if {
+        if ok == 0 goto end
+        nch @r7 = inf.channels
+        // the granule index, times channels
+        gi @r9 = 0
+        ngr @r10 = 1
+        #(h & HDR_MPEG1)
+        if #ne {
+            ngr = 2
+        }
+        loop {
+            p @r0 = &mp3_scratch.grbuf as *u32
+            c @r1 = 1152
+            call mp3_zero(p, c)
+            a @r0 = gi
+            b @r1 = nch
+            call mp3_l3_decode(a, b)
+            b @r0 = nch
+            o @r1 = out
+            call mp3_synth_granule(b, o)
+            t @r0 = nch << 10
+            t = t + (nch << 7)
+            out += t
+            gi += nch
+            #(ngr -= 1)
+            if #ne goto loop
+        }
+    }
+    call mp3_save_reservoir()
+    a @r0 = h
+    s @r0 = call mp3_hdr_samples(a)
+    n = s * success
+    goto done
+no_frame:
+    inf.frame_bytes = ix
+    n = 0
+    goto done
+bad:
+    old @r0 = dec.header
+    old &= 0x00ffffff
+    dec.header = old
+not_l3:
+    n = 0
+done:
+    sp += 12
+    pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
+}
+
+// Put the reservoir and then the frame's main data, from bs, in
+// mp3_scratch.maindata, and start mp3_scratch.bs on it. Returns whether
+// the reservoir had all main_data_begin bytes.
+#[link_section = ".text"]
+fn mp3_restore_reservoir(bs: *Mp3Bs, main_data_begin) -> ok {
+    push(r4, r5, r6, r7, r8, r9, r10, lr)
+    b @r4 = bs
+    mdb @r8 = main_data_begin
+    dec @r6 = &mp3_decoder
+    s @r7 = &mp3_scratch
+    pos @r0 = b.pos
+    lim @r1 = b.limit
+    fbytes @r5 = lim - pos
+    fbytes >>= 3
+    res @r2 = dec.reserv
+    have @r9 = res
+    #(have - mdb)
+    if #hi {
+        have = mdb
+    }
+    d @r0 = &mp3_scratch.maindata as *u8
+    src @r1 = &dec.reserv_buf as *u8
+    src += res
+    src -= have
+    cnt @r2 = have
+    call mp3_copy(d, src, cnt)
+    d @r0 = &mp3_scratch.maindata as *u8
+    d += have
+    buf @r1 = b.buf
+    pos @r2 = b.pos
+    src @r1 = buf + (pos >> 3)
+    cnt @r2 = fbytes
+    call mp3_copy(d, src, cnt)
+    total @r3 = have + fbytes
+    md @r0 = &mp3_scratch.maindata as *u8
+    s.bs.buf = md
+    zero @r1 = 0
+    s.bs.pos = zero
+    bits @r1 = total << 3
+    s.bs.limit = bits
+    // zero what's left of the last frame's main data
+    dirty @r2 = s.dirty
+    s.dirty = total
+    if {
+        #(dirty - total)
+        if #ls goto end
+        d @r0 = md + total
+        z @r1 = 0
+        n @r2 = dirty - total
+        loop {
+            *d++ = z
+            #(n -= 1)
+            if #ne goto loop
+        }
+    }
+    r @r1 = dec.reserv
+    ok = 0
+    #(r - mdb)
+    if #hs {
+        ok = 1
+    }
+    pop(r4, r5, r6, r7, r8, r9, r10, pc)
+}
+
+// Keep the end of the main data, up to MAX_BITRESERVOIR_BYTES, for the
+// next frame
+#[link_section = ".text"]
+fn mp3_save_reservoir() {
+    push(r4, lr)
+    s @r3 = &mp3_scratch
+    pos @r1 = s.bs.pos
+    pos += 7
+    pos >>= 3
+    lim @r2 = s.bs.limit
+    rem @r2 = lim >> 3
+    rem -= pos
+    mx @r12 = MAX_BITRESERVOIR_BYTES
+    #(rem - mx)
+    if #hi {
+        pos += rem
+        pos -= mx
+        rem = mx
+    }
+    dec @r4 = &mp3_decoder
+    dec.reserv = rem
+    d @r0 = &dec.reserv_buf as *u8
+    md @r3 = &mp3_scratch.maindata as *u8
+    src @r1 = md + pos
+    cnt @r2 = rem
+    call mp3_copy(d, src, cnt)
+    pop(r4, pc)
+}
+
+// Read the side information into mp3_scratch.gr_info. Returns
+// main_data_begin, or L3_ERROR.
+#[link_section = ".text"]
+fn mp3_read_side_info(bs: *Mp3Bs, h) -> mdb {
+    push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
+    sp -= 4 (tables)
+    b @r6 = bs
+    hh @r10 = h
+    gr @r5 = &mp3_scratch.gr_info as *Mp3Gr
+    // the sample rate index, mpeg1 ones last, less 1 but at least 0
+    sr @r4 = h[10..12]
+    t @r0 = h[19..20]
+    t2 @r1 = h[20..21]
+    t += t2
+    t = t + (t << 1)
+    sr += t
+    #(sr - 0)
+    if #ne {
+        sr -= 1
+    }
+    // the granules to read, 2 per channel for MPEG-1
+    cnt @r9 = 2
+    t = hh & HDR_MODE
+    #(t - HDR_MODE)
+    if #eq {
+        cnt = 1
+    }
+    scfsi @r7 = 0
+    if {
+        #(hh & HDR_MPEG1)
+        if #eq goto else
+        cnt <<= 1
+        a @r0 = b
+        w @r1 = 9
+        v @r0 = call mp3_bs_get_bits(a, w)
+        m @r11 = v
+        a @r0 = b
+        w @r1 = cnt + 7
+        v @r0 = call mp3_bs_get_bits(a, w)
+        scfsi = v
+        goto end
+    } else {
+        a @r0 = b
+        w @r1 = cnt + 8
+        v @r0 = call mp3_bs_get_bits(a, w)
+        m @r11 = v >> cnt
+    }
+    sum @r8 = 0
+    loop {
+        t @r0 = hh & HDR_MODE
+        #(t - HDR_MODE)
+        if #eq {
+            scfsi <<= 4
+        }
+        a @r0 = b
+        w @r1 = 12
+        v @r0 = call mp3_bs_get_bits(a, w)
+        gr.part_23_length = v
+        sum += v
+        a @r0 = b
+        w @r1 = 9
+        v @r0 = call mp3_bs_get_bits(a, w)
+        gr.big_values = v
+        #(v - 288)
+        if #hi goto error
+        a @r0 = b
+        w @r1 = 8
+        v @r0 = call mp3_bs_get_bits(a, w)
+        gr.global_gain = v
+        a @r0 = b
+        w @r1 = 9
+        #(hh & HDR_MPEG1)
+        if #ne {
+            w = 4
+        }
+        v @r0 = call mp3_bs_get_bits(a, w)
+        gr.scalefac_compress = v
+        tab @r0 = &mp3_scf_long as *u8
+        off @r1 = sr + (sr << 1)
+        off <<= 3
+        off -= sr
+        tab += off
+        gr.sfbtab = tab
+        nl @r0 = 22
+        gr.n_long_sfb = nl
+        zero @r0 = 0
+        gr.n_short_sfb = zero
+        a @r0 = b
+        w @r1 = 1
+        v @r0 = call mp3_bs_get_bits(a, w)
+        if {
+            #(v - 0)
+            if #eq goto else
+            a @r0 = b
+            w @r1 = 2
+            bt @r0 = call mp3_bs_get_bits(a, w)
+            #(bt - 0)
+            if #eq goto error
+            gr.block_type = bt
+            a @r0 = b
+            w @r1 = 1
+            mixed @r0 = call mp3_bs_get_bits(a, w)
+            gr.mixed_block_flag = mixed
+            rc @r1 = &gr.region_count as *u8
+            seven @r2 = 7
+            *rc = seven
+            all @r2 = 255
+            *(rc + 1) = all
+            if {
+                bt @r2 = gr.block_type
+                #(bt - SHORT_BLOCK_TYPE)
+                if #ne goto end
+                mk @r2 = 0xf0f
+                scfsi &= mk
+                off @r2 = sr << 3
+                off = off + (off << 2)
+                if {
+                    if mixed != 0 goto else
+                    eight @r0 = 8
+                    *rc = eight
+                    tab @r0 = &mp3_scf_short as *u8
+                    tab += off
+                    gr.sfbtab = tab
+                    zero @r0 = 0
+                    gr.n_long_sfb = zero
+                    ns @r0 = 39
+                    gr.n_short_sfb = ns
+                    goto end
+                } else {
+                    tab @r0 = &mp3_scf_mixed as *u8
+                    tab += off
+                    gr.sfbtab = tab
+                    nl @r0 = 6
+                    #(hh & HDR_MPEG1)
+                    if #ne {
+                        nl = 8
+                    }
+                    gr.n_long_sfb = nl
+                    ns @r0 = 30
+                    gr.n_short_sfb = ns
+                }
+            }
+            a @r0 = b
+            w @r1 = 10
+            v @r0 = call mp3_bs_get_bits(a, w)
+            v <<= 5
+            sp.tables = v
+            a @r0 = b
+            w @r1 = 3
+            v @r0 = call mp3_bs_get_bits(a, w)
+            sg @r1 = &gr.subblock_gain as *u8
+            *sg = v
+            a @r0 = b
+            w @r1 = 3
+            v @r0 = call mp3_bs_get_bits(a, w)
+            sg @r1 = &gr.subblock_gain as *u8
+            *(sg + 1) = v
+            a @r0 = b
+            w @r1 = 3
+            v @r0 = call mp3_bs_get_bits(a, w)
+            sg @r1 = &gr.subblock_gain as *u8
+            *(sg + 2) = v
+            goto end
+        } else {
+            zero @r0 = 0
+            gr.block_type = zero
+            gr.mixed_block_flag = zero
+            a @r0 = b
+            w @r1 = 15
+            v @r0 = call mp3_bs_get_bits(a, w)
+            sp.tables = v
+            a @r0 = b
+            w @r1 = 4
+            v @r0 = call mp3_bs_get_bits(a, w)
+            rc @r1 = &gr.region_count as *u8
+            *rc = v
+            a @r0 = b
+            w @r1 = 3
+            v @r0 = call mp3_bs_get_bits(a, w)
+            rc @r1 = &gr.region_count as *u8
+            *(rc + 1) = v
+            all @r0 = 255
+            *(rc + 2) = all
+        }
+        tables @r0 = sp.tables
+        ts @r1 = &gr.table_select as *u8
+        t @r2 = tables >> 10
+        *ts = t
+        t = tables[5..10]
+        *(ts + 1) = t
+        t = tables & 31
+        *(ts + 2) = t
+        if {
+            #(hh & HDR_MPEG1)
+            if #eq goto else
+            a @r0 = b
+            w @r1 = 1
+            v @r0 = call mp3_bs_get_bits(a, w)
+            gr.preflag = v
+            goto end
+        } else {
+            c @r0 = gr.scalefac_compress
+            p @r1 = 0
+            #(c - 500)
+            if #hs {
+                p = 1
+            }
+            gr.preflag = p
+        }
+        a @r0 = b
+        w @r1 = 1
+        v @r0 = call mp3_bs_get_bits(a, w)
+        gr.scalefac_scale = v
+        a @r0 = b
+        w @r1 = 1
+        v @r0 = call mp3_bs_get_bits(a, w)
+        gr.count1_table = v
+        t @r0 = scfsi[12..16]
+        gr.scfsi = t
+        scfsi <<= 4
+        gr += size(Mp3Gr)
+        #(cnt -= 1)
+        if #ne goto loop
+    }
+    // all the granules' bits must be in this frame and the reservoir
+    pos @r0 = b.pos
+    sum += pos
+    lim @r0 = b.limit
+    lim += m << 3
+    #(sum - lim)
+    if #hi goto error
+    mdb = m
+    goto done
+error:
+    mdb = L3_ERROR
+done:
+    sp += 4
+    pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
+}
+
+// y * 2^(-exp_q2 / 4), for exp_q2 at least 0
+#[link_section = ".text"]
+fn mp3_ldexp_q2(y: f32, exp_q2: i32) -> r: f32 {
+    e @r0 = exp_q2
+    while {
+        #(e - 120)
+        if #lt goto break
+    } loop {
+        k @s1 = 9.313225746154785e-10
+        y = y * k
+        e -= 120
+        #(e - 120)
+        if #ge goto loop
+    }
+    t @r1 = &mp3_expfrac as *f32
+    f3 @r2 = e & 3
+    a @r1 = t + (f3 << 2)
+    f @s1 = *a
+    y = y * f
+    sh @r2 = e >> 2
+    p @r3 = 1 << 30
+    p >>= sh
+    ps @s1 = p
+    pf @s1 = u32_to_f32(ps)
+    r = y * pf
+    bx lr
+}
+
+// Read the scalefactors of granule gr, channel ch, into mp3_scratch.scf,
+// and the intensity stereo positions into ist
+#[link_section = ".text"]
+fn mp3_decode_scalefactors(gr: *Mp3Gr, ist: *u8, ch) {
+    push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
+    push(s16)
+    sp -= 48 (iscf: [u8; 40], sizes: [u8; 4], pad)
+    g @r4 = gr
+    ip @r8 = ist
+    d @r9 = &mp3_decoder
+    hh @r9 = d.header
+    c @r7 = ch
+    // iscf = 0
+    z @r0 = 0
+    z1 @r1 = 0
+    z2 @r2 = 0
+    z3 @r12 = 0
+    p @r3 = &sp.iscf as *u32
+    *p++ = (z, z1, z2, z3)
+    *p++ = (z, z1, z2, z3)
+    *p++ = (z, z1)
+    // the partition table
+    ns @r0 = g.n_short_sfb
+    nl @r1 = g.n_long_sfb
+    k @r2 = 0
+    #(ns - 0)
+    if #ne {
+        k = 1
+    }
+    #(nl - 0)
+    if #eq {
+        k += 1
+    }
+    part @r10 = &mp3_scf_partitions as *u8
+    t @r12 = k << 5
+    t -= k << 2
+    part += t
+    scfsi @r6 = g.scfsi
+    if {
+        #(hh & HDR_MPEG1)
+        if #eq goto else
+        sc @r0 = g.scalefac_compress
+        tab @r1 = &mp3_scfc_decode as *u8
+        pv @r0 = *(tab + sc)
+        hi @r1 = pv >> 2
+        lo @r2 = pv & 3
+        both @r1 = hi | (hi << 8)
+        both |= lo << 16
+        both |= lo << 24
+        szw @r0 = &sp.sizes as *u32
+        *szw = both
+        goto end
+    } else {
+        sfc @r0 = g.scalefac_compress
+        mp @r1 = &mp3_mod as *u8
+        if {
+            #(hh & HDR_I_STEREO)
+            if #eq goto end
+            if c == 0 goto end
+            sfc >>= 1
+            mp += 12
+        }
+        mods @r5 = mp
+        szp @r7 = &sp.sizes as *u8
+        // the sizes, from the last, as digits of sfc in the bases from
+        // mp3_mod, until it goes negative
+        while {
+            #(sfc - 0)
+            if #lt goto break
+        } loop {
+            prod @r2 = 1
+            g3 @r12 = *(mods + 3)
+            q @r3 = sfc / prod
+            q2 @r11 = q / g3
+            q = q - q2 * g3
+            *(szp + 3) = q
+            prod = prod * g3
+            g3 = *(mods + 2)
+            q = sfc / prod
+            q2 = q / g3
+            q = q - q2 * g3
+            *(szp + 2) = q
+            prod = prod * g3
+            g3 = *(mods + 1)
+            q = sfc / prod
+            q2 = q / g3
+            q = q - q2 * g3
+            *(szp + 1) = q
+            prod = prod * g3
+            g3 = *mods
+            q = sfc / prod
+            q2 = q / g3
+            q = q - q2 * g3
+            *(szp + 0) = q
+            prod = prod * g3
+            sfc -= prod
+            mods += 4
+            #(sfc - 0)
+            if #ge goto loop
+        }
+        mp @r1 = &mp3_mod as *u8
+        k @r2 = mods - mp
+        part += k
+        scfsi = -16
+    }
+    // read_scalefactors: up to 4 partitions, of count scalefactors of
+    // sizes[i] bits each. A partition with its scfsi bit set (bit 3 of
+    // this) reuses the last granule's, which ist holds.
+    this @r6 = scfsi
+    dp @r9 = &sp.iscf as *u8
+    sz @r7 = &sp.sizes as *u8
+    i @r5 = 4
+    loop {
+        cnt @r11 = *part++
+        #(cnt - 0)
+        if #eq goto break
+        if {
+            #(this & 8)
+            if #eq goto else
+            loop {
+                v @r0 = *ip++
+                *dp++ = v
+                #(cnt -= 1)
+                if #ne goto loop
+            }
+            goto end
+        } else {
+            bits @r1 = *sz
+            if {
+                if bits != 0 goto else
+                z @r0 = 0
+                loop {
+                    *dp++ = z
+                    *ip++ = z
+                    #(cnt -= 1)
+                    if #ne goto loop
+                }
+                goto end
+            } else {
+                loop {
+                    a @r0 = &mp3_scratch.bs
+                    w @r1 = *sz
+                    v @r0 = call mp3_bs_get_bits(a, w)
+                    *dp++ = v
+                    if {
+                        // the largest value is an illegal position
+                        #(this - 0)
+                        if #pl goto end
+                        w @r1 = *sz
+                        t @r2 = v + 1
+                        t >>= w
+                        #(t - 1)
+                        if #ne goto end
+                        v = 255
+                    }
+                    *ip++ = v
+                    #(cnt -= 1)
+                    if #ne goto loop
+                }
+            }
+        }
+        this <<= 1
+        sz += 1
+        #(i -= 1)
+        if #ne goto loop
+    }
+    // subblock gain or preemphasis
+    ns @r0 = g.n_short_sfb
+    if {
+        if ns == 0 goto else
+        sh @r1 = g.scalefac_scale
+        sh = 2 - sh
+        sgp @r2 = &g.subblock_gain as *u8
+        sg0 @r12 = *sgp
+        sg0 <<= sh
+        sg1 @r3 = *(sgp + 1)
+        sg1 <<= sh
+        sg2 @lr = *(sgp + 2)
+        sg2 <<= sh
+        nl @r1 = g.n_long_sfb
+        isp @r2 = &sp.iscf as *u8
+        isp += nl
+        loop {
+            x @r1 = *isp
+            x += sg0
+            *isp = x
+            x = *(isp + 1)
+            x += sg1
+            *(isp + 1) = x
+            x = *(isp + 2)
+            x += sg2
+            *(isp + 2) = x
+            isp += 3
+            #(ns -= 3)
+            if #hi goto loop
+        }
+        goto end
+    } else {
+        pf @r1 = g.preflag
+        if pf == 0 goto end
+        isp @r2 = &sp.iscf as *u8
+        isp += 11
+        pre @r12 = &mp3_preamp as *u8
+        n @r3 = 10
+        loop {
+            x @r1 = *isp
+            y @r0 = *pre++
+            x += y
+            *isp++ = x
+            #(n -= 1)
+            if #ne goto loop
+        }
+    }
+    // the global gain, then each scalefactor
+    gg @r0 = g.global_gain
+    d @r1 = &mp3_decoder
+    hh @r1 = d.header
+    hh &= 0xe0
+    e @r2 = 44 + 214
+    #(hh - HDR_JOINT_MS)
+    if #eq {
+        e += 2
+    }
+    e -= gg
+    ex @r0 = e
+    big @s0 = 2048.0
+    gain @s0 = call mp3_ldexp_q2(big, ex)
+    keep @s16 = gain
+    shift @r7 = g.scalefac_scale
+    shift += 1
+    n @r5 = g.n_long_sfb
+    ns @r0 = g.n_short_sfb
+    n += ns
+    isp @r9 = &sp.iscf as *u8
+    out @r6 = &mp3_scratch.scf as *f32
+    loop {
+        x @r0 = *isp++
+        x <<= shift
+        yf @s0 = keep
+        r @s0 = call mp3_ldexp_q2(yf, x)
+        *out++ = r
+        #(n -= 1)
+        if #ne goto loop
+    }
+    sp += 48
+    pop(s16)
+    pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
+}
+
+// Decode the Huffman coded values of granule gr, which end at the bit
+// position limit, into dst, scaled by mp3_scratch.scf
+#[link_section = ".ram"]
+fn mp3_huffman(dst: *f32, gr: *Mp3Gr, limit) {
+    push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
+    push(s16)
+    sp -= 16 (ireg: *u8, bands, lim, c1)
+    sp.lim = limit
+    big @r6 = gr.big_values
+    sfb @r10 = gr.sfbtab
+    c1t @r2 = gr.count1_table
+    sp.c1 = c1t
+    ts @r2 = &gr.table_select as *u8
+    sp.ireg = ts
+    scf @r8 = &mp3_scratch.scf as *f32
+    // the bit cache: the next bits, left aligned. shift is the number of
+    // bits used of those loaded, less 8, at most -1 after a refill.
+    bsp @r2 = &mp3_scratch.bs
+    pos @r4 = bsp.pos
+    ptr @r9 = bsp.buf
+    t @r2 = pos >> 3
+    ptr += t
+    cache @r3 = *(ptr as *u32)
+    cache = rev(cache)
+    ptr += 4
+    t = pos & 7
+    cache <<= t
+    shift @r4 = t - 8
+    pow @lr = &mp3_pow43 as *f32
+    pow += 16 * 4
+    z @r2 = 0
+    one @s16 = from_bits(z)
+    // big values, in up to 3 regions of bands, each with its table
+    while {
+        #(big - 0)
+        if #le goto break
+    } loop {
+        ts @r2 = sp.ireg
+        tab @r5 = *ts
+        nb @r1 = *(ts + 3)
+        ts += 1
+        sp.ireg = ts
+        nb += 1
+        sp.bands = nb
+        hi @r2 = &mp3_huff_index as *u16
+        off @r2 = *(hi + tab * 2)
+        cb @r12 = &mp3_huff_tabs as *i16
+        cb = cb + (off << 1)
+        lb @r2 = &mp3_linbits as *u8
+        linbits @r7 = *(lb + tab)
+        if {
+            #(linbits - 0)
+            if #ne goto else
+            loop {
+                np @r5 = *sfb++
+                np >>= 1
+                pairs @r11 = big
+                #(pairs - np)
+                if #gt {
+                    pairs = np
+                }
+                // each pair's first lookup is at the end of the one before
+                t @r2 = cache >> 27
+                leaf @r1 = *(cb + t * 2)
+                one = *scf++
+                big -= np
+                #(pairs - 0)
+                if #le goto band_done
+                loop {
+                    // a longer code needs more lookups, after the loop
+                    #(leaf - 0)
+                    if #lt goto long_code
+                have_leaf:
+                    t = leaf >> 8
+                    cache <<= t
+                    shift += t
+                    // two values, the first in the low 4 bits, each with a
+                    // sign bit after it when it's nonzero. linbits is 0
+                    // here, so its register is free.
+                    lsb @r2 = leaf & 15
+                    lsb2 @r7 = (leaf as u32)[4..8]
+                    m @r5 = (cache as i32) >> 31
+                    m = lsb + (m << 4)
+                    #(lsb - 0)
+                    if #ne {
+                        cache <<= 1
+                        shift += 1
+                    }
+                    a @r5 = pow + (m << 2)
+                    m2 @r1 = (cache as i32) >> 31
+                    v @s0 = *a
+                    m2 = lsb2 + (m2 << 4)
+                    v = v * one
+                    #(lsb2 - 0)
+                    if #ne {
+                        cache <<= 1
+                        shift += 1
+                    }
+                    a2 @r5 = pow + (m2 << 2)
+                    *dst++ = v
+                    v2 @s1 = *a2
+                    v2 = v2 * one
+                    while {
+                        #(shift - 0)
+                        if #lt goto break
+                    } loop {
+                        b @r2 = *ptr++
+                        b <<= shift
+                        cache |= b
+                        #(shift -= 8)
+                        if #ge goto loop
+                    }
+                    t @r2 = cache >> 27
+                    leaf @r1 = *(cb + t * 2)
+                    *dst++ = v2
+                    #(pairs -= 1)
+                    if #ne goto loop
+                }
+band_done:
+                #(big - 0)
+                if #le goto break
+                nb @r1 = sp.bands
+                #(nb -= 1)
+                sp.bands = nb
+                if #ne goto loop
+            }
+            goto end
+        } else {
+            loop {
+                np @r5 = *sfb++
+                np >>= 1
+                pairs @r11 = big
+                #(pairs - np)
+                if #gt {
+                    pairs = np
+                }
+                one = *scf++
+                big -= np
+                #(pairs - 0)
+                if #le goto lin_band_done
+                loop {
+                    t @r2 = cache >> 27
+                    leaf @r1 = *(cb + t * 2)
+                    w @r5 = 5
+                    while {
+                        #(leaf - 0)
+                        if #ge goto break
+                    } loop {
+                        cache <<= w
+                        shift += w
+                        w = leaf & 7
+                        t = 32 - w
+                        t = cache >> t
+                        t -= (leaf as i32) >> 3
+                        leaf = *(cb + t * 2)
+                        #(leaf - 0)
+                        if #lt goto loop
+                    }
+                    t = leaf >> 8
+                    // the two values, the first in the low 4 bits; a bit
+                    // above them ends the loop
+                    leaf = (leaf as u32)[0..8]
+                    leaf |= 256
+                    cache <<= t
+                    shift += t
+                    loop {
+                        lsb @r2 = leaf & 15
+                        // l3_pow_43 of 15 plus linbits more bits, then the sign
+                        if {
+                            #(lsb - 15)
+                            if #ne goto else
+                            t @r5 = 32 - linbits
+                            x @r2 = cache >> t
+                            x += 15
+                            cache <<= linbits
+                            shift += linbits
+                            while {
+                                #(shift - 0)
+                                if #lt goto break
+                            } loop {
+                                b @r5 = *ptr++
+                                b <<= shift
+                                cache |= b
+                                #(shift -= 8)
+                                if #ge goto loop
+                            }
+                            if {
+                                #(x - 129)
+                                if #hs goto else
+                                a @r5 = pow + (x << 2)
+                                v @s0 = *a
+                                goto end
+                            } else {
+                                k @r5 = &mp3_pow43_k as *f32
+                                (c16 @s1, c256 @s2, c43 @s3, c29 @s4) = *k
+                                mult @s5 = c256
+                                #(x - 1024)
+                                if #lo {
+                                    mult = c16
+                                    x <<= 3
+                                }
+                                sign @r5 = x << 1
+                                sign &= 64
+                                nu @lr = x & 63
+                                nu -= sign
+                                ni @s6 = nu
+                                fnu @s6 = i32_to_f32(ni)
+                                de @lr = x & !63
+                                de += sign
+                                di @s7 = de
+                                fde @s7 = i32_to_f32(di)
+                                x += sign
+                                x >>= 6
+                                frac @s6 = fnu / fde
+                                sc @s7 = c43
+                                sc += frac * c29
+                                sc2 @s8 = 1.0
+                                sc2 += frac * sc
+                                sc2 = sc2 * mult
+                                pow @lr = &mp3_pow43 as *f32
+                                pow += 16 * 4
+                                a @r5 = pow + (x << 2)
+                                v @s0 = *a
+                                v = v * sc2
+                            }
+                            v = one * v
+                            #(cache - 0)
+                            if #mi {
+                                v = -v
+                            }
+                            *dst++ = v
+                            cache <<= 1
+                            shift += 1
+                            leaf >>= 4
+                            goto end
+                        } else {
+                            m @r5 = (cache as i32) >> 31
+                            m = lsb + (m << 4)
+                            #(lsb - 0)
+                            if #ne {
+                                cache <<= 1
+                                shift += 1
+                            }
+                            a @r5 = pow + (m << 2)
+                            leaf >>= 4
+                            v @s0 = *a
+                            v = v * one
+                            *dst++ = v
+                        }
+                        #(leaf - 16)
+                        if #hs goto loop
+                    }
+                    while {
+                        #(shift - 0)
+                        if #lt goto break
+                    } loop {
+                        b @r2 = *ptr++
+                        b <<= shift
+                        cache |= b
+                        #(shift -= 8)
+                        if #ge goto loop
+                    }
+                    #(pairs -= 1)
+                    if #ne goto loop
+                }
+lin_band_done:
+                #(big - 0)
+                if #le goto break
+                nb @r1 = sp.bands
+                #(nb -= 1)
+                sp.bands = nb
+                if #ne goto loop
+            }
+        }
+        #(big - 0)
+        if #gt goto loop
+    }
+    // the count1 region, values of 0 or 1 in quads, until the limit
+    np @r6 = 1 - big
+    cb1 @r12 = &mp3_tab32 as *u8
+    c1 @r5 = sp.c1
+    #(c1 - 0)
+    if #eq goto tab32
+    cb1 = &mp3_tab33 as *u8
+tab32:
+    lim24 @r7 = sp.lim
+    lim24 += 24
+    base @r11 = &mp3_scratch.maindata as *u8
+    // each value is one with the sign bit after it, so as bits
+    onebits @r5 = to_bits(one)
+    loop {
+        t @r2 = cache >> 28
+        leaf @r1 = *(cb1 + t)
+        pb @lr = ptr - base
+        if {
+            #(leaf & 8)
+            if #ne goto end
+            t = cache << 4
+            w @lr = leaf & 3
+            w = 32 - w
+            t >>= w
+            t += leaf >> 3
+            leaf = *(cb1 + t)
+            pb @lr = ptr - base
+        }
+        t = leaf & 7
+        cache <<= t
+        shift += t
+        // stop past the limit
+        t = shift + (pb << 3)
+        #(t - lim24)
+        if #hi goto count1_done
+        // a new band, with a new scale, after the loop
+        #(np -= 1)
+        if #eq goto band0
+have0:
+        if {
+            #(leaf & 128)
+            if #eq goto end
+            sg @r2 = cache & 0x80000000
+            sg ^= onebits
+            *(dst as *u32) = sg
+            cache <<= 1
+            shift += 1
+        }
+        if {
+            #(leaf & 64)
+            if #eq goto end
+            sg @r2 = cache & 0x80000000
+            sg ^= onebits
+            *((dst + 4) as *u32) = sg
+            cache <<= 1
+            shift += 1
+        }
+        #(np -= 1)
+        if #eq goto band1
+have1:
+        if {
+            #(leaf & 32)
+            if #eq goto end
+            sg @r2 = cache & 0x80000000
+            sg ^= onebits
+            *((dst + 8) as *u32) = sg
+            cache <<= 1
+            shift += 1
+        }
+        if {
+            #(leaf & 16)
+            if #eq goto end
+            sg @r2 = cache & 0x80000000
+            sg ^= onebits
+            *((dst + 12) as *u32) = sg
+            cache <<= 1
+            shift += 1
+        }
+        while {
+            #(shift - 0)
+            if #lt goto break
+        } loop {
+            b @r2 = *ptr++
+            b <<= shift
+            cache |= b
+            #(shift -= 8)
+            if #ge goto loop
+        }
+        dst += 16
+        goto loop
+    }
+count1_done:
+    bsp @r0 = &mp3_scratch.bs
+    lim @r1 = sp.lim
+    bsp.pos = lim
+    sp += 16
+    pop(s16)
+    pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
+    // The rest of a code longer than 5 bits, for the pair loop above: each
+    // negative leaf gives the next lookup's width and offset.
+long_code:
+    w @r5 = 5
+    loop {
+        cache <<= w
+        shift += w
+        w = leaf & 7
+        t = 32 - w
+        t = cache >> t
+        t -= (leaf as i32) >> 3
+        leaf = *(cb + t * 2)
+        #(leaf - 0)
+        if #lt goto loop
+    }
+    goto have_leaf
+    // The next band in the count1 region, before its first or third value
+band0:
+    np = *sfb++
+    #(np >>= 1)
+    if #eq goto count1_done
+    one = *scf++
+    onebits = to_bits(one)
+    goto have0
+band1:
+    np = *sfb++
+    #(np >>= 1)
+    if #eq goto count1_done
+    one = *scf++
+    onebits = to_bits(one)
+    goto have1
+}
+
+// Decode granule gi (times nch) of all channels into mp3_scratch.grbuf,
+// as frequency lines through the IMDCT
+#[link_section = ".text"]
+fn mp3_l3_decode(gi, nch) {
+    push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
+    sp -= 4
+    g0 @r9 = &mp3_scratch.gr_info as *Mp3Gr
+    t @r2 = size(Mp3Gr)
+    t = gi * t
+    g0 += t
+    n @r8 = nch
+    // scalefactors and Huffman decoding
+    gr @r4 = g0
+    ist @r10 = &mp3_scratch.ist_pos as *u8
+    gp @r11 = &mp3_scratch.grbuf as *f32
+    ch @r7 = 0
+    loop {
+        bsp @r0 = &mp3_scratch.bs
+        pos @r0 = bsp.pos
+        len @r1 = gr.part_23_length
+        lim @r5 = pos + len
+        a @r0 = gr
+        i @r1 = ist
+        c @r2 = ch
+        call mp3_decode_scalefactors(a, i, c)
+        d @r0 = gp
+        g @r1 = gr
+        l @r2 = lim
+        call mp3_huffman(d, g, l)
+        gr += size(Mp3Gr)
+        ist += 39
+        gp += 576 * 4
+        ch += 1
+        #(ch - n)
+        if #lo goto loop
+    }
+    // stereo
+    dec @r0 = &mp3_decoder
+    h @r10 = dec.header
+    if {
+        #(h & HDR_I_STEREO)
+        if #eq goto else
+        a @r0 = g0
+        call mp3_intensity_stereo(a)
+        goto end
+    } else {
+        t @r0 = h & 0xe0
+        #(t - HDR_JOINT_MS)
+        if #ne goto end
+        l @r0 = &mp3_scratch.grbuf as *f32
+        c @r1 = 576
+        call mp3_ms_band(l, c)
+    }
+    // reorder, antialias, IMDCT
+    gr = g0
+    gp = &mp3_scratch.grbuf as *f32
+    ov @r6 = &mp3_decoder.mdct_overlap as *f32
+    ch = 0
+    loop {
+        // the long bands of a mixed block, 4 at 8 kHz
+        nlb @r5 = 0
+        if {
+            m @r0 = gr.mixed_block_flag
+            if m == 0 goto end
+            nlb = 2
+            v @r0 = h[19..21]
+            if v != 0 goto end
+            sr @r0 = h[10..12]
+            #(sr - 2)
+            if #eq {
+                nlb = 4
+            }
+        }
+        if {
+            ns @r0 = gr.n_short_sfb
+            if ns == 0 goto end
+            t @r0 = nlb << 6
+            t = t + (nlb << 3)
+            g @r0 = gp + t
+            nl @r1 = gr.n_long_sfb
+            s @r2 = gr.sfbtab
+            sfb @r1 = s + nl
+            call mp3_reorder(g, sfb)
+        }
+        aa @r1 = 31
+        if {
+            ns @r0 = gr.n_short_sfb
+            if ns == 0 goto end
+            aa = nlb
+            #(aa - 0)
+            if #ne {
+                aa -= 1
+            }
+        }
+        g @r0 = gp
+        call mp3_antialias(g, aa)
+        g @r0 = gp
+        o @r1 = ov
+        bt @r2 = gr.block_type
+        nl @r3 = nlb
+        call mp3_imdct_gr(g, o, bt, nl)
+        g @r0 = gp
+        call mp3_change_sign(g)
+        gr += size(Mp3Gr)
+        gp += 576 * 4
+        ov += 288 * 4
+        ch += 1
+        #(ch - n)
+        if #lo goto loop
+    }
+    sp += 4
+    pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
+}
+
+// Mid/side stereo for n lines from l, and the right channel's
+#[link_section = ".ram"]
+fn mp3_ms_band(l: *f32, n) {
+    r @r2 = l + 576 * 4
+    loop {
+        a @s0 = *l
+        b @s1 = *r
+        x @s2 = a + b
+        y @s3 = a - b
+        *l++ = x
+        *r++ = y
+        #(n -= 1)
+        if #ne goto loop
+    }
+    bx lr
+}
+
+// Intensity stereo: both channels from the left, scaled
+#[link_section = ".ram"]
+fn mp3_is_band(l: *f32, n, kl: f32, kr: f32) {
+    r @r2 = l + 576 * 4
+    loop {
+        a @s2 = *l
+        x @s3 = a * kl
+        y @s4 = a * kr
+        *l++ = x
+        *r++ = y
+        #(n -= 1)
+        if #ne goto loop
+    }
+    bx lr
+}
+
+// Intensity stereo for the granule whose left channel is gr
+#[link_section = ".text"]
+fn mp3_intensity_stereo(gr: *Mp3Gr) {
+    push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
+    push(s16)
+    sp -= 16 (max_band: [u32; 3], saved)
+    g @r5 = gr
+    // the last nonzero band of the right channel, per window
+    m @r0 = -1
+    mb @r1 = &sp.max_band as *u32
+    *mb = m
+    *(mb + 4) = m
+    *(mb + 8) = m
+    nl @r0 = g.n_long_sfb
+    ns @r1 = g.n_short_sfb
+    nsfb @r9 = nl + ns
+    p @r8 = &mp3_scratch.grbuf as *u32
+    p += 576 * 4
+    sfb @r6 = g.sfbtab
+    i @r7 = 0
+    m3 @r4 = 0
+    while {
+        #(i - nsfb)
+        if #hs goto break
+    } loop {
+        wd @r10 = *(sfb + i)
+        q @r0 = p
+        c @r1 = wd
+        loop {
+            x @r2 = *q++
+            #(x <<= 1)
+            if #ne goto nonzero
+            #(c -= 1)
+            if #ne goto loop
+            goto next_band
+        }
+nonzero:
+        mb @r0 = &sp.max_band as *u32
+        *(mb + m3 * 4) = i
+next_band:
+        p = p + (wd << 2)
+        i += 1
+        m3 += 1
+        #(m3 - 3)
+        if #eq {
+            m3 = 0
+        }
+        #(i - nsfb)
+        if #lo goto loop
+    }
+    mb @r0 = &sp.max_band as *u32
+    if {
+        nl @r1 = g.n_long_sfb
+        if nl == 0 goto end
+        a @r1 = *mb
+        b @r2 = *(mb + 4)
+        #(a - b)
+        if #lt {
+            a = b
+        }
+        b = *(mb + 8)
+        #(a - b)
+        if #lt {
+            a = b
+        }
+        *mb = a
+        *(mb + 4) = a
+        *(mb + 8) = a
+    }
+    d @r1 = &mp3_decoder
+    h @r10 = d.header
+    // the top band of each window keeps the one below's position, unless
+    // the right channel is nonzero there
+    blocks @r1 = 1
+    ns @r2 = g.n_short_sfb
+    #(ns - 0)
+    if #ne {
+        blocks = 3
+    }
+    ist @r8 = &mp3_scratch.ist_pos as *u8
+    ist += 39
+    dflt @r11 = 0
+    #(h & HDR_MPEG1)
+    if #ne {
+        dflt = 3
+    }
+    itop @r2 = nsfb - blocks
+    i @r7 = 0
+    loop {
+        prev @r3 = itop - blocks
+        band @r12 = *(mb + i * 4)
+        v @lr = dflt
+        #(band - prev)
+        if #lt {
+            v = *(ist + prev)
+        }
+        *(ist + itop) = v
+        itop += 1
+        i += 1
+        #(i - blocks)
+        if #lo goto loop
+    }
+    g1 @r0 = g + size(Mp3Gr)
+    sh @r11 = g1.scalefac_compress
+    sh &= 1
+    // l3_stereo_process
+    maxpos @r9 = 64
+    #(h & HDR_MPEG1)
+    if #ne {
+        maxpos = 7
+    }
+    s @s16 = 1.0
+    if {
+        #(h & HDR_MS_STEREO)
+        if #eq goto end
+        s = 1.41421356
+    }
+    l @r5 = &mp3_scratch.grbuf as *f32
+    i = 0
+    m3 = 0
+    loop {
+        n @r1 = *(sfb + i)
+        #(n - 0)
+        if #eq goto break
+        ipos @r2 = *(ist + i)
+        if {
+            mb @r0 = &sp.max_band as *u32
+            band @r0 = *(mb + m3 * 4)
+            #(i - band)
+            if #le goto else
+            #(ipos - maxpos)
+            if #hs goto else
+            if {
+                #(h & HDR_MPEG1)
+                if #eq goto else
+                pan @r0 = &mp3_pan as *f32
+                pan = pan + (ipos << 3)
+                (kl @s2, kr @s3) = *pan
+                goto end
+            } else {
+                // k = 2^(-((ipos + 1) >> 1 << sh) / 4) on one side
+                sp.saved = ipos
+                e @r0 = ipos + 1
+                e >>= 1
+                e <<= sh
+                one @s0 = 1.0
+                k @s0 = call mp3_ldexp_q2(one, e)
+                one @s1 = 1.0
+                ipos @r2 = sp.saved
+                kl @s2 = k
+                kr @s3 = one
+                #(ipos & 1)
+                if #eq {
+                    kl = one
+                    kr = k
+                }
+            }
+            xl @s0 = kl * s
+            xr @s1 = kr * s
+            a @r0 = l
+            n @r1 = *(sfb + i)
+            call mp3_is_band(a, n, xl, xr)
+            goto end
+        } else {
+            #(h & HDR_MS_STEREO)
+            if #eq goto end
+            a @r0 = l
+            call mp3_ms_band(a, n)
+        }
+        n @r1 = *(sfb + i)
+        l = l + (n << 2)
+        i += 1
+        m3 += 1
+        #(m3 - 3)
+        if #eq {
+            m3 = 0
+        }
+        goto loop
+    }
+    sp += 16
+    pop(s16)
+    pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
+}
+
+// Reorder short blocks, from window by window to line by line, through
+// the scratch part of mp3_decoder.syn
+#[link_section = ".text"]
+fn mp3_reorder(grbuf: *u32, sfb: *u8) {
+    push(grbuf, r4, r5, r6, r7, lr)
+    src @r0 = grbuf
+    d @r2 = &mp3_decoder.syn as *u32
+    d += 960 * 4
+    loop {
+        len @r3 = *sfb
+        sfb += 3
+        if len == 0 goto break
+        l4 @r6 = len << 2
+        l8 @lr = len << 3
+        loop {
+            a @r4 = *src
+            b @r5 = *(src + l4)
+            c @r7 = *(src + l8)
+            *d++ = (a, b, c)
+            src += 4
+            #(len -= 1)
+            if #ne goto loop
+        }
+        src += l8
+        goto loop
+    }
+    s @r1 = &mp3_decoder.syn as *u32
+    s += 960 * 4
+    n @r2 = d - s
+    n >>= 2
+    g @r0 = sp.grbuf
+    call mp3_copy_words(g, s, n)
+    pop(r0, r4, r5, r6, r7, pc)
+}
+
+// The alias reduction butterflies between each pair of long bands
+#[link_section = ".ram"]
+fn mp3_antialias(grbuf: *f32, nbands) {
+    #(nbands - 0)
+    if #eq goto done
+    push(s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31)
+    t @r2 = &mp3_aa as *f32
+    (cs0 @s16, cs1 @s17, cs2 @s18, cs3 @s19, cs4 @s20, cs5 @s21, cs6 @s22, cs7 @s23, ca0 @s24, ca1 @s25, ca2 @s26, ca3 @s27, ca4 @s28, ca5 @s29, ca6 @s30, ca7 @s31) = *t
+    p @r0 = grbuf + 18 * 4
+    // The 8 butterflies of a band boundary, 4 at a time: u at p up, d at
+    // p - 4 down, x = u cs - d ca to u and y = u ca + d cs to d
+    loop {
+        #(nbands -= 1)
+        q @r2 = p - 16
+        pu @r3 = p + 16
+        qd @r12 = p - 32
+        (u0 @s0, u1 @s1, u2 @s2, u3 @s3) = *p
+        (d3 @s4, d2 @s5, d1 @s6, d0 @s7) = *q
+        x0 @s8 = u0 * cs0
+        t0 @s15 = d0 * ca0
+        dc0 @s7 = d0 * cs0
+        ua0 @s0 = u0 * ca0
+        x0 = x0 - t0
+        y0 @s15 = ua0 + dc0
+        x1 @s9 = u1 * cs1
+        t1 @s14 = d1 * ca1
+        dc1 @s6 = d1 * cs1
+        ua1 @s1 = u1 * ca1
+        x1 = x1 - t1
+        y1 @s14 = ua1 + dc1
+        x2 @s10 = u2 * cs2
+        t2 @s13 = d2 * ca2
+        dc2 @s5 = d2 * cs2
+        ua2 @s2 = u2 * ca2
+        x2 = x2 - t2
+        y2 @s13 = ua2 + dc2
+        x3 @s11 = u3 * cs3
+        t3 @s12 = d3 * ca3
+        dc3 @s4 = d3 * cs3
+        ua3 @s3 = u3 * ca3
+        x3 = x3 - t3
+        y3 @s12 = ua3 + dc3
+        *p = (x0, x1, x2, x3)
+        *q = (y3, y2, y1, y0)
+        (u4 @s0, u5 @s1, u6 @s2, u7 @s3) = *pu
+        (d7 @s4, d6 @s5, d5 @s6, d4 @s7) = *qd
+        x4 @s8 = u4 * cs4
+        t4 @s15 = d4 * ca4
+        dc4 @s7 = d4 * cs4
+        ua4 @s0 = u4 * ca4
+        x4 = x4 - t4
+        y4 @s15 = ua4 + dc4
+        x5 @s9 = u5 * cs5
+        t5 @s14 = d5 * ca5
+        dc5 @s6 = d5 * cs5
+        ua5 @s1 = u5 * ca5
+        x5 = x5 - t5
+        y5 @s14 = ua5 + dc5
+        x6 @s10 = u6 * cs6
+        t6 @s13 = d6 * ca6
+        dc6 @s5 = d6 * cs6
+        ua6 @s2 = u6 * ca6
+        x6 = x6 - t6
+        y6 @s13 = ua6 + dc6
+        x7 @s11 = u7 * cs7
+        t7 @s12 = d7 * ca7
+        dc7 @s4 = d7 * cs7
+        ua7 @s3 = u7 * ca7
+        x7 = x7 - t7
+        y7 @s12 = ua7 + dc7
+        *pu = (x4, x5, x6, x7)
+        *qd = (y7, y6, y5, y4)
+        p += 18 * 4
+        if #ne goto loop
+    }
+    pop(s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31)
+done:
+    bx lr
+}
+
+// The 9 point DCT at y, in place, scheduled by tools/sched.py
+#[link_section = ".ram"]
+fn mp3_dct9(y: *f32) {
+    (e0 @s0, o1 @s1, e2 @s2, o3 @s3, e4 @s4, o5 @s5, e6 @s6, o7 @s7, e8 @s8) = *y
+    half @s9 = 0.5
+    k @r1 = &mp3_dct9_k as *f32
+    t0 @s10 = e6 * half
+    t4 @s11 = e4 + e2
+    t2 @s12 = e8 + e2
+    d @s2 = e8 - e2
+    t0 @s10 = e0 + t0
+    e0 @s0 = e0 - e6
+    t0_3 @s6 = o5 + o1
+    e6 @s8 = e4 - e8
+    e4 @s4 = e4 + d
+    t4_3 @s2 = o5 - o7
+    o1_2 @s5 = o1 - o5
+    t2_3 @s1 = o1 + o7
+    o1 @s5 = o1_2 - o7
+    c @s7 = *(k + 4)
+    t4 @s11 = t4 * c
+    c @s7 = *(k + 8)
+    t2 @s12 = t2 * c
+    c3 @s7 = *(k + 16)
+    o3 @s3 = o3 * c3
+    o1 @s5 = o1 * c3
+    c @s7 = *(k + 20)
+    t0_4 @s6 = t0_3 * c
+    c @s7 = *(k + 24)
+    t4_4 @s2 = t4_3 * c
+    c @s7 = *(k + 12)
+    e6 @s8 = e6 * c
+    c @s7 = *(k + 28)
+    t2_4 @s1 = t2_3 * c
+    d @s9 = e4 * half
+    e8 @s7 = t0 - t2
+    e2 @s9 = e0 - d
+    d @s4 = e4 + e0
+    e0 @s0 = t0 - t4
+    e4 @s10 = t0 + t4
+    o5 @s11 = t0_4 - o3
+    e0 @s0 = e0 + t2
+    o7 @s12 = t4_4 - o3
+    o3 @s2 = t4_4 + o3
+    e8 @s7 = e8 + e6
+    e4 @s10 = e4 - e6
+    o5 @s11 = o5 - t2_4
+    o7 @s12 = o7 - t0_4
+    o3 @s2 = o3 - t2_4
+    d_4 @s1 = e4 - o7
+    d_5 @s3 = e2 + o1
+    d_6 @s6 = e0 - o3
+    d_7 @s8 = e8 + o5
+    d_8 @s7 = e8 - o5
+    d_9 @s0 = e0 + o3
+    d_10 @s9 = e2 - o1
+    d_11 @s10 = e4 + o7
+    *(y + 16) = d
+    *y = d_4
+    *(y + 4) = d_5
+    *(y + 8) = d_6
+    *(y + 12) = d_7
+    *(y + 20) = d_8
+    *(y + 24) = d_9
+    *(y + 28) = d_10
+    *(y + 32) = d_11
+    bx lr
+}
+
+// The 36 point IMDCT of nbands long blocks, with overlap-add
+#[link_section = ".ram"]
+fn mp3_imdct36(grbuf: *f32, overlap: *f32, window: *f32, nbands) {
+    push(r4, r5, r6, r7, r8, lr)
+    sp -= 72 (co: [f32; 9], si: [f32; 9])
+    g @r4 = grbuf
+    ov @r5 = overlap
+    win @r8 = window
+    n @r7 = nbands
+    tw @r6 = &mp3_twid9 as *f32
+    loop {
+        // the DCT inputs, scheduled by tools/sched.py
+        q @r0 = &sp.co as *f32
+        ga @r1 = g + 4
+        x @s0 = *g
+        (xa @s1, xb @s2, xc @s3, xd @s4) = *ga
+        ga @r1 = g + 20
+        v @s5 = xc + xd
+        (xa2 @s6, xb2 @s7, xc2 @s8, xd2 @s9) = *ga
+        ga @r1 = g + 36
+        v9 @s10 = xc2 + xd2
+        (xa3 @s11, xb3 @s12, xc3 @s13, xd3 @s14) = *ga
+        v3 @s4 = xd - xc
+        v8 @s9 = xd2 - xc2
+        *(q + 64) = v3
+        ga @r1 = g + 52
+        v14 @s3 = xc3 + xd3
+        v13 @s14 = xd3 - xc3
+        x @s0 = -x
+        v1 @s4 = xa - xb
+        v2 @s1 = xa + xb
+        v @s5 = -v
+        v6 @s2 = xa2 - xb2
+        v7 @s6 = xa2 + xb2
+        v10 @s10 = -v9
+        v11 @s7 = xa3 - xb3
+        v12 @s11 = xa3 + xb3
+        v15 @s3 = -v14
+        x3 @s8 = *(g + 68)
+        *q = x
+        *(q + 36) = x3
+        *(q + 68) = v1
+        *(q + 4) = v2
+        *(q + 8) = v
+        *(q + 60) = v6
+        *(q + 12) = v7
+        *(q + 56) = v8
+        *(q + 16) = v10
+        *(q + 52) = v11
+        (xa @s4, xb @s5, xc @s6, xd @s7) = *ga
+        v @s0 = xc + xd
+        v16 @s1 = xa - xb
+        v17 @s4 = xa + xb
+        v18 @s7 = xd - xc
+        v @s0 = -v
+        *(q + 20) = v12
+        *(q + 48) = v13
+        *(q + 24) = v15
+        *(q + 44) = v16
+        *(q + 28) = v17
+        *(q + 40) = v18
+        *(q + 32) = v
+        call mp3_dct9(q)
+        q @r0 = &sp.si as *f32
+        call mp3_dct9(q)
+        // the odd si are negated, folded into the signs below. The 9
+        // twiddles, windows and overlap-adds, scheduled by tools/sched.py.
+        q @r0 = &sp.co as *f32
+        t @s0 = *tw
+        c @s1 = *q
+        s @s2 = *(q + 36)
+        t9 @s3 = *(tw + 36)
+        c2 @s4 = *(q + 4)
+        s_2 @s5 = *(q + 40)
+        t2 @s6 = *(tw + 4)
+        t9_2 @s7 = *(tw + 40)
+        c3 @s8 = *(q + 8)
+        s_3 @s9 = *(q + 44)
+        t3 @s10 = *(tw + 8)
+        t9_3 @s11 = *(tw + 44)
+        sum @s12 = c * t9
+        o @s1 = c * t
+        pr @s0 = s * t
+        pr2 @s2 = s * t9
+        sum3 @s3 = c2 * t9_2
+        sum @s12 = sum + pr
+        pr @s0 = s_2 * t2
+        o3 @s4 = c2 * t2
+        sum5 @s6 = c3 * t9_3
+        sum4 @s3 = sum3 - pr
+        pr @s0 = s_3 * t3
+        pr6 @s5 = s_2 * t9_2
+        sum6 @s6 = sum5 + pr
+        ovl @s0 = *ov
+        wi @s7 = *win
+        o5 @s8 = c3 * t3
+        w9 @s10 = *(win + 36)
+        pr @s9 = s_3 * t9_3
+        ovl2 @s11 = *(ov + 4)
+        o @s1 = o - pr2
+        wi2 @s2 = *(win + 4)
+        o4 @s4 = o3 + pr6
+        w9_2 @s5 = *(win + 40)
+        o6 @s8 = o5 - pr
+        ovl3 @s9 = *(ov + 8)
+        *ov = o
+        c @s1 = *(q + 12)
+        *(ov + 4) = o4
+        s @s4 = *(q + 48)
+        *(ov + 8) = o6
+        wi3 @s8 = *(win + 8)
+        w9_3 @s13 = *(win + 44)
+        ovl4 @s14 = *(ov + 12)
+        lo @s15 = ovl * wi
+        hi @s0 = ovl * w9
+        pr @s10 = sum * w9
+        pr4 @s12 = sum * wi
+        lo @s15 = lo - pr
+        hi @s0 = hi + pr4
+        *g = lo
+        t @s7 = *(tw + 12)
+        *(g + 68) = hi
+        t9 @s0 = *(tw + 48)
+        c5 @s10 = *(q + 16)
+        s_5 @s12 = *(q + 52)
+        sum @s15 = c * t9
+        o @s1 = c * t
+        pr @s7 = s * t
+        pr14 @s4 = s * t9
+        sum @s15 = sum - pr
+        o @s1 = o + pr14
+        wi @s0 = *(win + 12)
+        *(ov + 12) = o
+        w9 @s1 = *(win + 48)
+        ovl @s4 = *(ov + 16)
+        lo @s7 = ovl2 * wi2
+        hi @s11 = ovl2 * w9_2
+        pr @s5 = sum4 * w9_2
+        pr8 @s3 = sum4 * wi2
+        lo @s7 = lo - pr
+        hi @s11 = hi + pr8
+        *(g + 4) = lo
+        t @s2 = *(tw + 16)
+        *(g + 64) = hi
+        t9 @s3 = *(tw + 52)
+        c @s5 = *(q + 20)
+        s @s7 = *(q + 56)
+        sum9 @s11 = c5 * t9
+        o @s10 = c5 * t
+        pr @s2 = s_5 * t
+        pr18 @s12 = s_5 * t9
+        sum10 @s11 = sum9 + pr
+        o @s10 = o - pr18
+        wi5 @s2 = *(win + 16)
+        *(ov + 16) = o
+        w9_5 @s3 = *(win + 52)
+        ovl6 @s10 = *(ov + 20)
+        lo @s12 = ovl3 * wi3
+        hi @s9 = ovl3 * w9_3
+        pr @s13 = sum6 * w9_3
+        pr12 @s6 = sum6 * wi3
+        lo @s12 = lo - pr
+        hi @s9 = hi + pr12
+        *(g + 8) = lo
+        t @s6 = *(tw + 20)
+        *(g + 60) = hi
+        t9 @s8 = *(tw + 56)
+        c7 @s9 = *(q + 24)
+        s_7 @s12 = *(q + 60)
+        sum11 @s13 = c * t9
+        o @s5 = c * t
+        pr @s6 = s * t
+        pr22 @s7 = s * t9
+        sum12 @s13 = sum11 - pr
+        o @s5 = o + pr22
+        wi6 @s6 = *(win + 20)
+        *(ov + 20) = o
+        w9_6 @s5 = *(win + 56)
+        ovl7 @s7 = *(ov + 24)
+        lo @s8 = ovl4 * wi
+        hi @s14 = ovl4 * w9
+        pr @s1 = sum * w9
+        pr16 @s15 = sum * wi
+        lo @s8 = lo - pr
+        hi @s14 = hi + pr16
+        *(g + 12) = lo
+        t @s0 = *(tw + 24)
+        *(g + 56) = hi
+        t9 @s1 = *(tw + 60)
+        c @s8 = *(q + 28)
+        s @s14 = *(q + 64)
+        sum @s15 = c7 * t9
+        o @s9 = c7 * t
+        pr @s0 = s_7 * t
+        pr26 @s12 = s_7 * t9
+        sum @s15 = sum + pr
+        o @s9 = o - pr26
+        wi @s0 = *(win + 24)
+        *(ov + 24) = o
+        w9 @s1 = *(win + 60)
+        ovl8 @s9 = *(ov + 28)
+        lo @s12 = ovl * wi5
+        hi @s4 = ovl * w9_5
+        pr @s3 = sum10 * w9_5
+        pr20 @s11 = sum10 * wi5
+        lo @s12 = lo - pr
+        hi @s4 = hi + pr20
+        *(g + 16) = lo
+        t @s2 = *(tw + 28)
+        *(g + 52) = hi
+        t9 @s3 = *(tw + 64)
+        c9 @s4 = *(q + 32)
+        s_9 @s11 = *(q + 68)
+        sum15 @s12 = c * t9
+        o @s8 = c * t
+        pr @s2 = s * t
+        pr30 @s14 = s * t9
+        sum16 @s12 = sum15 - pr
+        o @s8 = o + pr30
+        wi8 @s2 = *(win + 28)
+        *(ov + 28) = o
+        w9_8 @s3 = *(win + 64)
+        ovl @s8 = *(ov + 32)
+        lo @s14 = ovl6 * wi6
+        hi @s10 = ovl6 * w9_6
+        pr @s5 = sum12 * w9_6
+        pr24 @s13 = sum12 * wi6
+        lo @s14 = lo - pr
+        hi @s10 = hi + pr24
+        *(g + 20) = lo
+        t @s5 = *(tw + 32)
+        *(g + 48) = hi
+        t9 @s6 = *(tw + 68)
+        sum17 @s10 = c9 * t9
+        o @s4 = c9 * t
+        pr @s5 = s_9 * t
+        pr34 @s11 = s_9 * t9
+        sum18 @s10 = sum17 + pr
+        wi9 @s5 = *(win + 32)
+        o @s4 = o - pr34
+        w9_9 @s6 = *(win + 68)
+        *(ov + 32) = o
+        lo @s4 = ovl7 * wi
+        hi @s7 = ovl7 * w9
+        pr @s1 = sum * w9
+        pr28 @s15 = sum * wi
+        lo15 @s0 = ovl8 * wi8
+        lo @s4 = lo - pr
+        pr @s1 = sum16 * w9_8
+        hi15 @s9 = ovl8 * w9_8
+        pr32 @s12 = sum16 * wi8
+        lo17 @s2 = ovl * wi9
+        pr35 @s3 = sum18 * w9_9
+        hi17 @s8 = ovl * w9_9
+        pr36 @s10 = sum18 * wi9
+        hi @s7 = hi + pr28
+        lo16 @s0 = lo15 - pr
+        hi16 @s9 = hi15 + pr32
+        lo18 @s2 = lo17 - pr35
+        hi18 @s8 = hi17 + pr36
+        *(g + 24) = lo
+        *(g + 44) = hi
+        *(g + 28) = lo16
+        *(g + 40) = hi16
+        *(g + 32) = lo18
+        *(g + 36) = hi18
+        g += 18 * 4
+        ov += 9 * 4
+        #(n -= 1)
+        if #ne goto loop
+    }
+    sp += 72
+    pop(r4, r5, r6, r7, r8, pc)
+}
+
+// The 12 point IMDCT of x[0], x[3], .., x[15], with overlap-add: 6
+// samples to dst, and 3 to overlap
+#[link_section = ".ram"]
+fn mp3_imdct12(x: *f32, dst: *f32, overlap: *f32) {
+    t @r3 = &mp3_twid3 as *f32
+    (tw0 @s10, tw1 @s11, tw2 @s12, tw3 @s13, tw4 @s14, tw5 @s15) = *t
+    x0 @s0 = *x
+    x3 @s1 = *(x + 12)
+    x6 @s2 = *(x + 24)
+    x9 @s3 = *(x + 36)
+    x12 @s4 = *(x + 48)
+    x15 @s5 = *(x + 60)
+    // l3_idct3(-x0, x6 + x3, x12 + x9) and l3_idct3(x15, x12 - x9, x6 - x3)
+    ca @s0 = -x0
+    cb @s6 = x6 + x3
+    cc @s7 = x12 + x9
+    sb @s8 = x12 - x9
+    sc @s9 = x6 - x3
+    k @s1 = 0.86602540
+    half @s2 = 0.5
+    m @s3 = cb * k
+    a1 @s4 = cc * half
+    a1 = ca - a1
+    co1 @s7 = ca + cc
+    co0 @s6 = a1 + m
+    co2 @s0 = a1 - m
+    m = sb * k
+    a1 = sc * half
+    a1 = x15 - a1
+    si1 @s9 = x15 + sc
+    si1 = -si1
+    si0 @s8 = a1 + m
+    si2 @s5 = a1 - m
+    ovl @s1 = *overlap
+    sum @s2 = co0 * tw3
+    sum += si0 * tw0
+    o @s3 = co0 * tw0
+    o -= si0 * tw3
+    *overlap = o
+    d @s4 = ovl * tw2
+    d -= sum * tw5
+    *dst = d
+    d = ovl * tw5
+    d += sum * tw2
+    *(dst + 20) = d
+    ovl = *(overlap + 4)
+    sum = co1 * tw4
+    sum += si1 * tw1
+    o = co1 * tw1
+    o -= si1 * tw4
+    *(overlap + 4) = o
+    d = ovl * tw1
+    d -= sum * tw4
+    *(dst + 4) = d
+    d = ovl * tw4
+    d += sum * tw1
+    *(dst + 16) = d
+    ovl = *(overlap + 8)
+    sum = co2 * tw5
+    sum += si2 * tw2
+    o = co2 * tw2
+    o -= si2 * tw5
+    *(overlap + 8) = o
+    d = ovl * tw0
+    d -= sum * tw3
+    *(dst + 8) = d
+    d = ovl * tw3
+    d += sum * tw0
+    *(dst + 12) = d
+    bx lr
+}
+
+// The IMDCT of nbands short blocks
+#[link_section = ".ram"]
+fn mp3_imdct_short(grbuf: *f32, overlap: *f32, nbands) {
+    push(r4, r5, r6, lr)
+    sp -= 72 (tmp: [f32; 18])
+    g @r4 = grbuf
+    ov @r5 = overlap
+    n @r6 = nbands
+    loop {
+        q @r0 = &sp.tmp as *f32
+        (a0 @s0, a1 @s1, a2 @s2, a3 @s3, a4 @s4, a5 @s5, a6 @s6, a7 @s7, a8 @s8, a9 @s9, a10 @s10, a11 @s11, a12 @s12, a13 @s13, a14 @s14, a15 @s15) = *g
+        *q = (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15)
+        gq @r1 = g + 64
+        (a0, a1) = *gq
+        q2 @r1 = q + 64
+        *q2 = (a0, a1)
+        (a0, a1, a2, a3, a4, a5) = *ov
+        *g = (a0, a1, a2, a3, a4, a5)
+        d @r1 = g + 6 * 4
+        o @r2 = ov + 6 * 4
+        call mp3_imdct12(q, d, o)
+        q @r0 = &sp.tmp as *f32
+        q += 4
+        d @r1 = g + 12 * 4
+        o @r2 = ov + 6 * 4
+        call mp3_imdct12(q, d, o)
+        q @r0 = &sp.tmp as *f32
+        q += 8
+        d @r1 = ov
+        o @r2 = ov + 6 * 4
+        call mp3_imdct12(q, d, o)
+        g += 18 * 4
+        ov += 9 * 4
+        #(n -= 1)
+        if #ne goto loop
+    }
+    sp += 72
+    pop(r4, r5, r6, pc)
+}
+
+// Negate the odd lines of the odd bands
+#[link_section = ".ram"]
+fn mp3_change_sign(grbuf: *u32) {
+    push(r4, r5)
+    p @r0 = grbuf + 19 * 4
+    j @r1 = 16
+    loop {
+        // 9 lines, 3 at a time
+        k @r2 = 3
+        loop {
+            x @r3 = *p
+            y @r4 = *(p + 8)
+            z @r5 = *(p + 16)
+            #(k -= 1)
+            x ^= 0x80000000
+            y ^= 0x80000000
+            z ^= 0x80000000
+            *p = x
+            *(p + 8) = y
+            *(p + 16) = z
+            p += 24
+            if #ne goto loop
+        }
+        p += 18 * 4
+        #(j -= 1)
+        if #ne goto loop
+    }
+    pop(r4, r5)
+    bx lr
+}
+
+// The IMDCT of a granule: n_long_bands long blocks, then the rest as
+// block_type says
+#[link_section = ".text"]
+fn mp3_imdct_gr(grbuf: *f32, overlap: *f32, block_type, n_long_bands) {
+    push(r4, r5, r6, r7, r8, lr)
+    g @r4 = grbuf
+    ov @r5 = overlap
+    bt @r6 = block_type
+    nl @r7 = n_long_bands
+    if {
+        if nl == 0 goto end
+        w @r2 = &mp3_mdct_window as *f32
+        call mp3_imdct36(grbuf, overlap, w, n_long_bands)
+    }
+    t @r0 = nl << 6
+    t = t + (nl << 3)
+    g += t
+    t = nl << 5
+    t = t + (nl << 2)
+    ov += t
+    rest @r8 = 32 - nl
+    if {
+        #(bt - SHORT_BLOCK_TYPE)
+        if #ne goto else
+        a @r0 = g
+        b @r1 = ov
+        c @r2 = rest
+        call mp3_imdct_short(a, b, c)
+        goto end
+    } else {
+        a @r0 = g
+        b @r1 = ov
+        w @r2 = &mp3_mdct_window as *f32
+        #(bt - STOP_BLOCK_TYPE)
+        if #eq {
+            w += 18 * 4
+        }
+        c @r3 = rest
+        call mp3_imdct36(a, b, w, c)
+    }
+    pop(r4, r5, r6, r7, r8, pc)
+}
+
+// Polyphase synthesis of a granule, from mp3_scratch.grbuf to nch
+// interleaved channels at pcm
+#[link_section = ".text"]
+fn mp3_synth_granule(nch, pcm: *i16) {
+    push(r4, r5, r6, r7, r8, lr)
+    n @r4 = nch
+    out @r5 = pcm
+    g @r0 = &mp3_scratch.grbuf as *f32
+    call mp3_dct_ii(g)
+    if {
+        #(n - 2)
+        if #ne goto end
+        g @r0 = &mp3_scratch.grbuf as *f32
+        g += 576 * 4
+        call mp3_dct_ii(g)
+    }
+    band @r6 = 0
+    lins @r7 = &mp3_decoder.syn as *f32
+    loop {
+        a @r0 = band
+        o @r1 = out
+        c @r2 = n
+        l @r3 = lins
+        call mp3_synth(a, o, c, l)
+        t @r0 = n << 7
+        out += t
+        lins += 128 * 4
+        band += 2
+        #(band - 18)
+        if #lo goto loop
+    }
+    // the history for the next granule to the front
+    d @r0 = &mp3_decoder.syn as *u32
+    s @r1 = d + 1152 * 4
+    if {
+        #(n - 1)
+        if #ne goto else
+        // only the even ones
+        c @r2 = 480
+        loop {
+            x @r3 = *s
+            s += 8
+            *d = x
+            d += 8
+            #(c -= 1)
+            if #ne goto loop
+        }
+        goto end
+    } else {
+        c @r2 = 960
+        call mp3_copy_words(d, s, c)
+    }
+    pop(r4, r5, r6, r7, r8, pc)
+}
+
+// The 32 point DCT-II across the subbands, for each of the 18 lines
+#[link_section = ".ram"]
+fn mp3_dct_ii(grbuf: *f32) {
+    push(r4, r5, r6, r7, r8)
+    push(s16, s17, s18, s19, s20, s21, s22, s23, s24)
+    sp -= 128 (t: [f32; 32])
+    kp @r1 = &mp3_dct8_k as *f32
+    (k0 @s16, k1 @s17, k2 @s18, k3 @s19, k4 @s20, k5 @s21, k6 @s22, k7 @s23, k8 @s24) = *kp
+    p @r0 = grbuf
+    kc @r1 = 18
+    // Each loop ends with a 16 bit add of a stride in a register, which
+    // doesn't set flags, so that the branch folds with it.
+    row @r2 = 72
+    // The ops below are in mp3dec's order for each value, but interleaved,
+    // so that no result is used by the very next instruction.
+    loop {
+        q0 @r8 = p
+        q1 @r3 = p + 15 * 72
+        q2 @r12 = p + 16 * 72
+        q3 @r4 = p + 31 * 72
+        sec @r5 = &mp3_sec as *f32
+        tp @r6 = &sp.t as *f32
+        i @r7 = 8
+        loop {
+            #(i -= 1)
+            x0 @s0 = *q0
+            x1 @s1 = *q1
+            x2 @s2 = *q2
+            x3 @s3 = *q3
+            (c0 @s4, c1 @s5, c2 @s6) = *sec++
+            t0 @s7 = x0 + x3
+            t1 @s8 = x1 + x2
+            t2 @s9 = x1 - x2
+            t3 @s10 = x0 - x3
+            u @s11 = t0 + t1
+            v @s12 = t0 - t1
+            t2 = t2 * c0
+            t3 = t3 * c1
+            *tp++ = u
+            v = v * c2
+            u2 @s13 = t3 + t2
+            v2 @s14 = t3 - t2
+            *(tp + 28) = v
+            v2 = v2 * c2
+            *(tp + 60) = u2
+            q0 += row
+            q1 -= 72
+            *(tp + 92) = v2
+            q3 -= 72
+            q2 += row
+            if #ne goto loop
+        }
+        // an 8 point DCT of each row of t, with the results in s8-s15 in
+        // order, for one store
+        tp = &sp.t as *f32
+        i = 4
+        step @r3 = 32
+        loop {
+            #(i -= 1)
+            (x0 @s0, x1 @s1, x2 @s2, x3 @s3, x4 @s4, x5 @s5, x6 @s6, x7 @s7) = *tp
+            x3a @s9 = x3 + x4
+            x5a @s4 = x3 - x4
+            x2a @s3 = x2 + x5
+            x6a @s5 = x2 - x5
+            x0a @s2 = x0 + x7
+            xt @s0 = x0 - x7
+            x1a @s7 = x1 + x6
+            x7a @s1 = x1 - x6
+            x4b @s6 = x0a - x3a
+            x0b @s2 = x0a + x3a
+            x5b @s4 = x5a + x6a
+            x7b @s9 = x7a + xt
+            x3b @s10 = x1a - x2a
+            m @s11 = x7b * k1
+            x1b @s7 = x1a + x2a
+            x5c @s4 = x5b - m
+            x6b @s5 = x6a + x7a
+            x3c @s10 = x3b + x4b
+            m = x5c * k2
+            y0 @s8 = x0b + x1b
+            x6c @s5 = x6b * k0
+            x7c @s1 = x7b + m
+            y4 @s12 = x0b - x1b
+            m = x7c * k1
+            x3d @s10 = x3c * k0
+            y4 = y4 * k0
+            x5d @s4 = x5c - m
+            x0c @s2 = xt - x6c
+            xtb @s0 = xt + x6c
+            w2 @s3 = x4b + x3d
+            y6 @s14 = x4b - x3d
+            w3 @s6 = x0c - x5d
+            w5 @s7 = x0c + x5d
+            y1 @s9 = xtb + x7c
+            y7 @s15 = xtb - x7c
+            y2 @s10 = w2 * k4
+            y6 = y6 * k7
+            y3 @s11 = w3 * k5
+            y5 @s13 = w5 * k6
+            y1 = y1 * k3
+            y7 = y7 * k8
+            *tp = (y0, y1, y2, y3, y4, y5, y6, y7)
+            tp += step
+            if #ne goto loop
+        }
+        // back to the subbands
+        o @r8 = p
+        tp = &sp.t as *f32
+        i = 7
+        step = 288
+        loop {
+            #(i -= 1)
+            a @s0 = *tp++
+            t2i @s1 = *(tp + 60)
+            t3i @s2 = *(tp + 92)
+            t3n @s3 = *(tp + 96)
+            t1i @s5 = *(tp + 28)
+            t1n @s6 = *(tp + 32)
+            t2n @s8 = *(tp + 64)
+            v @s4 = t2i + t3i
+            u @s7 = t1i + t1n
+            v2 @s9 = t2n + t3i
+            v = v + t3n
+            *o = a
+            v2 = v2 + t3n
+            *(o + 144) = u
+            *(o + 72) = v
+            *(o + 216) = v2
+            o += step
+            if #ne goto loop
+        }
+        a @s0 = *tp
+        t2i @s1 = *(tp + 64)
+        t3i @s2 = *(tp + 96)
+        t1i @s5 = *(tp + 32)
+        v @s4 = t2i + t3i
+        p += 4
+        #(kc -= 1)
+        *o = a
+        *(o + 144) = t1i
+        *(o + 216) = t3i
+        *(o + 72) = v
+        if #ne goto loop
+    }
+    sp += 128
+    pop(s16, s17, s18, s19, s20, s21, s22, s23, s24)
+    pop(r4, r5, r6, r7, r8)
+    bx lr
+}
+
+// The two outputs of a subband pair that need only the history: pcm[0]
+// from z[64 k], and pcm[16 nch] from z[64 k + 2]
+#[link_section = ".ram"]
+fn mp3_synth_pair(pcm: *i16, nch, z: *f32) {
+    push(r4, r5, r6, r7)
+    k @r5 = &mp3_synth_k as *f32
+    (k0 @s8, k1 @s9, k2 @s10, k3 @s11, k4 @s12, k5 @s13, k6 @s14, k7 @s15) = *k++
+    zb @r3 = z + 4 * 64 * 4
+    zc @r12 = z + 8 * 64 * 4
+    zd @r4 = z + 12 * 64 * 4
+    // a = sum of d_i * k_i in order, each d_i the sum or difference of a
+    // pair. vmla rounds the product, so this is the same as mp3dec's, but
+    // pipelined: the loads of one term, the d of the next and the product
+    // of the one before, three registers apart.
+    x0 @s0 = *(zd + 512)
+    y0 @s1 = *z
+    x1 @s2 = *(z + 256)
+    y1 @s3 = *(zd + 256)
+    d0 @s0 = x0 - y0
+    x2 @s4 = *zd
+    y2 @s5 = *(z + 512)
+    d1 @s2 = x1 + y1
+    a @s7 = d0 * k0
+    m1 @s3 = d1 * k1
+    x3 @s0 = *(z + 768)
+    y3 @s1 = *(zc + 768)
+    d2 @s4 = x2 - y2
+    a = a + m1
+    m2 @s5 = d2 * k2
+    x4 @s2 = *(zc + 512)
+    y4 @s3 = *zb
+    d3 @s0 = x3 + y3
+    a = a + m2
+    m3 @s1 = d3 * k3
+    x5 @s4 = *(zb + 256)
+    y5 @s5 = *(zc + 256)
+    d4 @s2 = x4 - y4
+    a = a + m3
+    m4 @s3 = d4 * k4
+    x6 @s0 = *zc
+    y6 @s1 = *(zb + 512)
+    d5 @s4 = x5 + y5
+    a = a + m4
+    m5 @s5 = d5 * k5
+    x7 @s2 = *(zb + 768)
+    d6 @s0 = x6 - y6
+    a = a + m5
+    m6 @s1 = d6 * k6
+    m7 @s2 = x7 * k7
+    a = a + m6
+    (j0 @s8, j1 @s9, j2 @s10, j3 @s11, j4 @s12, j5 @s13, j6 @s14, j7 @s15) = *k++
+    (lo @s4, hi @s5, half @s6) = *k
+    a = a + m7
+    // b = sum of z_j * j_j, with a's conversion to i16 in between
+    u0 @s0 = *(zd + 520)
+    u1 @s1 = *(zd + 8)
+    cl @s2 = max(a, lo)
+    b @s7 = u0 * j0
+    n1 @s1 = u1 * j1
+    u2 @s0 = *(zc + 520)
+    cl = min(cl, hi)
+    b = b + n1
+    n2 @s0 = u2 * j2
+    u3 @s1 = *(zc + 8)
+    cl = cl + half
+    b = b + n2
+    n3 @s1 = u3 * j3
+    u4 @s0 = *(zb + 520)
+    ci @s3 = f32_to_i32(cl)
+    b = b + n3
+    n4 @s0 = u4 * j4
+    u5 @s1 = *(zb + 8)
+    v @r5 = ci
+    b = b + n4
+    n5 @s1 = u5 * j5
+    u6 @s0 = *(z + 520)
+    sgn @r6 = to_bits(cl)
+    b = b + n5
+    n6 @s0 = u6 * j6
+    u7 @s1 = *(z + 8)
+    v = v + ((sgn as i32) >> 31)
+    b = b + n6
+    n7 @s1 = u7 * j7
+    *pcm = v
+    off @r1 = nch << 5
+    b = b + n7
+    cl = max(b, lo)
+    cl = min(cl, hi)
+    cl = cl + half
+    ci = f32_to_i32(cl)
+    sgn = to_bits(cl)
+    v = ci
+    v = v + ((sgn as i32) >> 31)
+    *(pcm + off) = v
+    pop(r4, r5, r6, r7)
+    bx lr
+}
+
+// Synthesis of the subband pair band, band + 1 (of both channels), into
+// 64 samples per channel at dst. lins is the synthesis buffer: 960 floats
+// of history, then this pair's new values.
+#[link_section = ".ram"]
+fn mp3_synth(band, dst: *i16, nch, lins: *f32) {
+    push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
+    push(s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31)
+    sp -= 4
+    gl @r6 = &mp3_scratch.grbuf as *f32
+    gl = gl + (band << 2)
+    out @r7 = dst
+    n @r4 = nch
+    zl @r10 = lins
+    // the right channel's offset from the left
+    roff @r8 = 0
+    #(n - 2)
+    if #eq {
+        roff = 576 * 4
+    }
+    gr @r12 = gl + roff
+    a @r0 = *(gl + 16 * 18 * 4)
+    b @r1 = *(gr + 16 * 18 * 4)
+    c @r2 = *gl
+    d @r3 = *gr
+    z @r5 = zl + (960 + 4 * 15) * 4
+    *z = (a, b, c, d)
+    a = *(gl + (16 * 18 + 1) * 4)
+    b = *(gr + (16 * 18 + 1) * 4)
+    c = *(gl + 4)
+    d = *(gr + 4)
+    z += 16 * 4 * 4
+    *z = (a, b, c, d)
+    // the outputs for the right channel first, which in mono the left's
+    // overwrite
+    if {
+        #(n - 2)
+        if #ne goto end
+        p @r0 = out + 2
+        nc @r1 = n
+        z @r2 = zl + (4 * 15 + 1) * 4
+        call mp3_synth_pair(p, nc, z)
+        p @r0 = out + 130
+        nc @r1 = n
+        z @r2 = zl + (4 * 15 + 64 + 1) * 4
+        call mp3_synth_pair(p, nc, z)
+    }
+    p @r0 = out
+    nc @r1 = n
+    z @r2 = zl + 4 * 15 * 4
+    call mp3_synth_pair(p, nc, z)
+    t @r0 = n << 6
+    p @r0 = out + t
+    nc @r1 = n
+    z @r2 = zl + (4 * 15 + 64) * 4
+    call mp3_synth_pair(p, nc, z)
+    k @r0 = &mp3_synth_k as *f32
+    k += 16 * 4
+    (lo @s28, hi @s29, half @s30) = *k
+    // i from 14 down to 0
+    pp @r9 = zl + (960 + 4 * 14) * 4
+    end @lr = zl + (960 - 4) * 4
+    gb @r12 = gl + 18 * 15 * 4
+    ga @r6 = gl + 18 * 17 * 4
+    wp @r11 = &mp3_win as *f32
+    t @r0 = n << 6
+    t -= n << 1
+    o2 @r1 = out + t
+    t = n << 1
+    o1 @r7 = out + t
+    n @r10 = n
+    o2 @r4 = o2
+    loop {
+        // the new values for this i
+        (v0 @r0, v2 @r2) = *ga
+        gt @r5 = ga + roff
+        (v1 @r1, v3 @r3) = *gt
+        *pp = (v0, v1, v2, v3)
+        (v0, v2) = *gb
+        gt = gb + roff
+        (v1, v3) = *gt
+        *(pp + 256) = (v2, v3)
+        *(pp - 248) = (v0, v1)
+        zero @r0 = 0
+        a0 @s16 = from_bits(zero)
+        a1 @s17 = from_bits(zero)
+        a2 @s18 = from_bits(zero)
+        a3 @s19 = from_bits(zero)
+        b0 @s20 = from_bits(zero)
+        b1 @s21 = from_bits(zero)
+        b2 @s22 = from_bits(zero)
+        b3 @s23 = from_bits(zero)
+        zp @r1 = pp
+        yp @r2 = pp - 15 * 64 * 4
+        kc @r3 = 4
+        if {
+            #(n - 2)
+            if #eq goto else
+            // mono: only lanes 0 and 2 reach the output, as mp3dec keeps
+            // only their history
+            loop {
+                #(kc -= 1)
+                zq @r0 = zp - 64 * 4
+                yq @r5 = yp + 64 * 4
+                (w0 @s24, w1 @s25, w2 @s26, w3 @s27) = *wp++
+                z0 @s0 = *zp
+                z2 @s2 = *(zp + 8)
+                y0 @s4 = *yp
+                y2 @s6 = *(yp + 8)
+                m @s8 = z0 * w1
+                m2 @s9 = y0 * w0
+                nn @s10 = z0 * w0
+                n2 @s11 = y0 * w1
+                m = m + m2
+                nn = nn - n2
+                b0 = b0 + m
+                a0 = a0 + nn
+                m @s8 = z2 * w1
+                m2 @s9 = y2 * w0
+                nn @s10 = z2 * w0
+                n2 @s11 = y2 * w1
+                m = m + m2
+                nn = nn - n2
+                b2 = b2 + m
+                a2 = a2 + nn
+                z0 = *zq
+                z2 = *(zq + 8)
+                y0 = *yq
+                y2 = *(yq + 8)
+                m @s8 = z0 * w3
+                m2 @s9 = y0 * w2
+                nn @s10 = y0 * w3
+                n2 @s11 = z0 * w2
+                m = m + m2
+                nn = nn - n2
+                b0 = b0 + m
+                a0 = a0 + nn
+                m @s8 = z2 * w3
+                m2 @s9 = y2 * w2
+                nn @s10 = y2 * w3
+                n2 @s11 = z2 * w2
+                m = m + m2
+                nn = nn - n2
+                b2 = b2 + m
+                a2 = a2 + nn
+                zp -= 128 * 4
+                yp += 128 * 4
+                if #ne goto loop
+            }
+            goto end
+        } else {
+            loop {
+                #(kc -= 1)
+                zq @r0 = zp - 64 * 4
+                yq @r5 = yp + 64 * 4
+                (w0 @s24, w1 @s25, w2 @s26, w3 @s27) = *wp++
+                (z0 @s0, z1 @s1, z2 @s2, z3 @s3) = *zp
+                (y0 @s4, y1 @s5, y2 @s6, y3 @s7) = *yp
+                m @s8 = z0 * w1
+                m2 @s9 = y0 * w0
+                nn @s10 = z0 * w0
+                n2 @s11 = y0 * w1
+                m = m + m2
+                nn = nn - n2
+                b0 = b0 + m
+                a0 = a0 + nn
+                m @s12 = z1 * w1
+                m2 @s13 = y1 * w0
+                nn @s14 = z1 * w0
+                n2 @s15 = y1 * w1
+                m = m + m2
+                nn = nn - n2
+                b1 = b1 + m
+                a1 = a1 + nn
+                m @s8 = z2 * w1
+                m2 @s9 = y2 * w0
+                nn @s10 = z2 * w0
+                n2 @s11 = y2 * w1
+                m = m + m2
+                nn = nn - n2
+                b2 = b2 + m
+                a2 = a2 + nn
+                m @s12 = z3 * w1
+                m2 @s13 = y3 * w0
+                nn @s14 = z3 * w0
+                n2 @s15 = y3 * w1
+                m = m + m2
+                nn = nn - n2
+                b3 = b3 + m
+                a3 = a3 + nn
+                (z0, z1, z2, z3) = *zq
+                (y0, y1, y2, y3) = *yq
+                m @s8 = z0 * w3
+                m2 @s9 = y0 * w2
+                nn @s10 = y0 * w3
+                n2 @s11 = z0 * w2
+                m = m + m2
+                nn = nn - n2
+                b0 = b0 + m
+                a0 = a0 + nn
+                m @s12 = z1 * w3
+                m2 @s13 = y1 * w2
+                nn @s14 = y1 * w3
+                n2 @s15 = z1 * w2
+                m = m + m2
+                nn = nn - n2
+                b1 = b1 + m
+                a1 = a1 + nn
+                m @s8 = z2 * w3
+                m2 @s9 = y2 * w2
+                nn @s10 = y2 * w3
+                n2 @s11 = z2 * w2
+                m = m + m2
+                nn = nn - n2
+                b2 = b2 + m
+                a2 = a2 + nn
+                m @s12 = z3 * w3
+                m2 @s13 = y3 * w2
+                nn @s14 = y3 * w3
+                n2 @s15 = z3 * w2
+                m = m + m2
+                nn = nn - n2
+                b3 = b3 + m
+                a3 = a3 + nn
+                zp -= 128 * 4
+                yp += 128 * 4
+                if #ne goto loop
+            }
+        }
+        // a0, b0, a2, b2 go to the left channel, or both when mono, and
+        // a1, b1, a3, b3 to the right. Four at a time, so that each op's
+        // result is ready by its next use.
+        t @r5 = n << 6
+        cx0 @s0 = max(a0, lo)
+        cx1 @s1 = max(b0, lo)
+        cx2 @s2 = max(a2, lo)
+        cx3 @s3 = max(b2, lo)
+        cx0 = min(cx0, hi)
+        cx1 = min(cx1, hi)
+        cx2 = min(cx2, hi)
+        cx3 = min(cx3, hi)
+        cx0 = cx0 + half
+        cx1 = cx1 + half
+        cx2 = cx2 + half
+        cx3 = cx3 + half
+        ix0 @s4 = f32_to_i32(cx0)
+        ix1 @s5 = f32_to_i32(cx1)
+        ix2 @s6 = f32_to_i32(cx2)
+        ix3 @s7 = f32_to_i32(cx3)
+        u0 @r0 = ix0
+        sg0 @r1 = to_bits(cx0)
+        u1 @r2 = ix1
+        sg1 @r3 = to_bits(cx1)
+        u0 = u0 + ((sg0 as i32) >> 31)
+        u1 = u1 + ((sg1 as i32) >> 31)
+        *o1 = u0
+        *o2 = u1
+        u0 = ix2
+        sg0 = to_bits(cx2)
+        u1 = ix3
+        sg1 = to_bits(cx3)
+        u0 = u0 + ((sg0 as i32) >> 31)
+        u1 = u1 + ((sg1 as i32) >> 31)
+        *(o1 + t) = u0
+        *(o2 + t) = u1
+        #(n - 2)
+        if #ne goto mono
+        t += 2
+        cx0 = max(a1, lo)
+        cx1 = max(b1, lo)
+        cx2 = max(a3, lo)
+        cx3 = max(b3, lo)
+        cx0 = min(cx0, hi)
+        cx1 = min(cx1, hi)
+        cx2 = min(cx2, hi)
+        cx3 = min(cx3, hi)
+        cx0 = cx0 + half
+        cx1 = cx1 + half
+        cx2 = cx2 + half
+        cx3 = cx3 + half
+        ix0 = f32_to_i32(cx0)
+        ix1 = f32_to_i32(cx1)
+        ix2 = f32_to_i32(cx2)
+        ix3 = f32_to_i32(cx3)
+        u0 = ix0
+        sg0 = to_bits(cx0)
+        u1 = ix1
+        sg1 = to_bits(cx1)
+        u0 = u0 + ((sg0 as i32) >> 31)
+        u1 = u1 + ((sg1 as i32) >> 31)
+        *(o1 + 2) = u0
+        *(o2 + 2) = u1
+        u0 = ix2
+        sg0 = to_bits(cx2)
+        u1 = ix3
+        sg1 = to_bits(cx3)
+        u0 = u0 + ((sg0 as i32) >> 31)
+        u1 = u1 + ((sg1 as i32) >> 31)
+        *(o1 + t) = u0
+        *(o2 + t) = u1
+    mono:
+        o1 = o1 + (n << 1)
+        o2 = o2 - (n << 1)
+        ga += 18 * 4
+        gb -= 18 * 4
+        pp -= 16
+        #(pp - end)
+        if #ne goto loop
+    }
+    sp += 4
+    pop(s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31)
+    pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
+}

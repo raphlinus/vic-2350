@@ -39,6 +39,22 @@ tools/run.sh build/colorbars.elf
 
 This loads the demo with [picotool] and prints its log over USB serial. Development has been on macOS; Linux should work but hasn't been tested.
 
+## MP3 decoder
+
+`mp3.sy` is an MP3 (Layer III) decoder, a port of [mp3dec], which is in turn a port of [minimp3]. Its output matches mp3dec's bit for bit. `mp3sim` runs it on the [m33 emulator] from symbolasm and checks every frame against mp3dec, which it expects checked out next to this repo:
+
+```
+cd mp3sim && cargo run -r -- song.mp3
+```
+
+With `--cycles`, it also estimates cycles per function and per line, from the emulator's instruction counts and the cycles per instruction of `symbolasm --analyze`. Some of mp3.sy's FP code was scheduled with `tools/sched.py`, which reorders a straight-line block so that no result is used by the very next instruction.
+
+`mp3bench` times mp3.sy and mp3dec on the board, a frame at a time, and checks their samples against mp3dec's on the host:
+
+```
+cd mp3bench && MP3=song.mp3 cargo build -r && ../tools/run.sh target/thumbv8m.main-none-eabihf/release/mp3bench 60
+```
+
 ## License
 
 Licensed under either of
@@ -55,3 +71,6 @@ at your option.
 [pico-dvi-rs]: https://github.com/DusterTheFirst/pico-dvi-rs
 [rp235x-pac]: https://crates.io/crates/rp235x-pac
 [picotool]: https://github.com/raspberrypi/picotool
+[mp3dec]: https://github.com/raphlinus/mp3dec
+[minimp3]: https://github.com/lieff/minimp3
+[m33 emulator]: https://github.com/raphlinus/symbolasm/tree/main/m33

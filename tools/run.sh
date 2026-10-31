@@ -56,7 +56,7 @@ if ! in_bootsel; then
     fi
 fi
 
-"$PICOTOOL" load -x "$ELF" >/dev/null
+"$PICOTOOL" load -x -t elf "$ELF" >/dev/null
 
 port_up() {
     [ -n "$(find_port)" ]
