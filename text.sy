@@ -17,13 +17,35 @@ use "pico_alloc.sy"
 //     <delay>                      @ the previous glyph's last instruction
 //     ubfx r3, r4, #lsb, #width    @ the glyph's pixels
 //
-// r2 accumulates the output word containing the current position. The
-// delay instruction, which fills the load's delay slot, merges the glyph
-// into r2 with orr r2, r2, r3, lsl #shift. A glyph that crosses a word
-// boundary instead extracts into r4, puts the finished word in r3 and the
-// rest in r2, and its delay is stmia r1!, {r3}. When a glyph ends exactly
-// on a boundary, the next glyph stores r2 before its ubfx, and its delay
-// is movs r2, r3.
+// r2 accumulates an output word, which isn't stored until a glyph starts or
+// ends past it. The delay instruction, which fills the load's delay slot,
+// merges the glyph into r2 with orr r2, r2, r3, lsl #shift. A glyph that
+// crosses a word boundary instead extracts into r4, puts the finished word
+// in r3 and the rest in r2, and its delay is stmia r1!, {r3}. A glyph that
+// starts past the word stores r2 before its ubfx, and its delay is lsls r2,
+// r3, #shift. A blank glyph generates no code.
+//
+// A glyph can start left of the word in r2, in the word before it, which
+// has been stored. That word is loaded and stored again:
+//
+//     ldr r4, [r0, #word]
+//     <delay>
+//     ubfx r4, r4, #lsb, #width
+//     subs r1, #4
+//     ldr r3, [r1]
+//     orr r2, r2, r4, lsr #32 - shift
+//     orr r3, r3, r4, lsl #shift
+//
+// and its delay is stmia r1!, {r3}.
+
+// The font format. Each of the FONT_HEIGHT rows of font_bits is FONT_STRIDE
+// bytes, with pixels packed least significant bit first, and a glyph's
+// bitmap has no blank columns. font_glyphs[c - FONT_FIRST] has these fields:
+//
+//     [0..16]   the bit where the glyph's bitmap starts in each row
+//     [16..20]  signed, the bitmap's left edge relative to the origin
+//     [20..26]  the bitmap's width in pixels, at most 32; 0 for a blank
+//     [26..32]  the advance, from this glyph's origin to the next one's
 
 // Instruction templates indexed by a 5 bit field, as two halfwords in a
 // word, which don't depend on the font: jit_orr[n] is orr r2, r2, r3,
@@ -43,8 +65,12 @@ const T_BX_LR = 0x4770
 const T_LDR_R4_R0 = 0x6804
 // ubfx r3, r4, #0, #1, both halfwords; add 1 << 24 for Rd = r4
 const T_UBFX_R3_R4 = 0x0300f3c4
+// subs r1, #4; ldr r3, [r1]
+const T_SUBS_LDR = 0x680b3904
 // orr r2, r2, r3, lsl #0; add 0x01010000 for orr r3, r2, r4
 const T_ORR_R2_R2_R3 = 0x0203ea42
+// add 0x00110000 for orr r2, r2, r4, lsr #0
+const ORR_LSR_R4 = 0x00110000
 // lsrs r2, r4, #32 - n is T_LSRS_R2_R4_32 - (n << 6)
 const T_LSRS_R2_R4_32 = 0x1022
 
@@ -63,10 +89,10 @@ fn text_init() {
         orr @r12 = T_ORR_R2_R2_R3
         orr |= f
         *(orr_t + n * 4) = orr
-        // width - 1 goes in bits 16-20, so take 1 off for the width to add
-        ubfx @r12 = T_UBFX_R3_R4
-        ubfx |= f
-        ubfx -= 1 << 16
+        // width - 1 goes in bits 16-20, so take 1 off for the width to add;
+        // that borrows from bits 22-23, so f is added, not ored
+        ubfx @r12 = T_UBFX_R3_R4 - (1 << 16)
+        ubfx += f
         *(ubfx_t + n * 4) = ubfx
         if #ne goto loop
     }
@@ -74,14 +100,15 @@ fn text_init() {
 }
 
 // Compile n (at least 1) characters of text into code. Returns the end of
-// the code, which takes at most 14 * n + 6 bytes, with 2 more bytes of
-// room needed while generating.
+// the code, which takes at most 20 * n + 10 bytes, with 2 more bytes of
+// room needed while generating. A first glyph that extends left of its
+// origin moves the text right, as in text_width.
 #[link_section = ".ram"]
+#[align = 4]
 fn jit_text(code: *u16, text: *u8, n: u32) {
     push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
     glyphs @r9 = &font_glyphs
     c @r8 = *text++
-    start @r11 = code
     orr_t @lr = &jit_orr
     ubfx_t @r5 = &jit_ubfx
     glyphs -= FONT_FIRST * 4
@@ -92,34 +119,41 @@ fn jit_text(code: *u16, text: *u8, n: u32) {
     first_delay @r7 = T_MOVS_R2_0
     *(code + 2) = first_delay
     code += 4
-    // shift: the glyph's position in the output word
-    shift @r6 = 0
+    // pen: the next glyph's origin, relative to the start of the output
+    // word in r2. It's negative when the last glyph ended past the pen.
+    g @r12 = *(glyphs + c * 4)
+    pen @r6 = 0
+    left @r4 = (g as i32)[16..20]
+    #(left - 0)
+    if #lt {
+        pen -= left
+    }
     loop {
 glyph:
-        // offset | width << 16
         g @r12 = *(glyphs + c * 4)
         // the next character, reading one past the end
         c = *text++
-        // ldr r4, [r0, #offset / 32 words]; the font is narrower than 32
-        // words, so the offset fits. The width lands above bit 16, and
-        // strh leaves it out.
-        word @r4 = g >> 5
-        ldr @r7 = ldr_base + (word << 6)
+        width @r7 = g[20..26]
         lsb @r4 = g & 31
-        *slot = ldr
-        pair @r4 = *(ubfx_t + lsb * 4)
-        width @r7 = g >> 16
-        // where the glyph ends in the output word
-        last @r12 = shift + width
+        if width == 0 goto blank
+        pair @r11 = *(ubfx_t + lsb * 4)
+        // ldr r4, [r0, #offset / 32 words]; the font is narrower than 32
+        // words, so the offset fits, and strh leaves out what's above it.
+        word @r4 = g >> 5
+        ldr @r4 = ldr_base + (word << 6)
         pair += width << 16
-        #(last - 32)
+        *slot = ldr
+        left @r4 = (g as i32)[16..20]
         *(code as *u32) = pair
-        if #hi goto straddle
-        if shift == 0 goto boundary
-plain:
+        // shift: where the glyph starts, relative to the word in r2. As
+        // unsigned, it's only above room if the glyph isn't all in the word.
+        shift @r4 = pen + left
+        room @r7 = 32 - width
+        pen += g >> 26
+        #(shift - room)
+        if #hi goto off_word
         // the delay: orr r2, r2, r3, lsl #shift
-        d @r4 = *(orr_t + shift * 4)
-        shift = last & 31
+        d @r12 = *(orr_t + shift * 4)
         *((code + 6) as *u32) = d
         slot = code + 4
         code += 10
@@ -127,24 +161,49 @@ plain:
         if #ne goto loop
     }
 finish:
-    // The last slot isn't needed: move the last delay back over it, and
-    // end with stmia r1!, {r2}; bx lr.
+    // The last slot isn't needed: move the last delay back over it.
     d @r4 = *((slot + 2) as *u32)
     code -= 2
     *(slot as *u32) = d
+    // Words that trailing blanks passed over
+    while {
+        #(pen - 32)
+        if #le goto break
+        z @r12 = T_STMIA_R2 | (T_MOVS_R2_0 << 16)
+    } loop {
+        *(code as *u32) = z
+        code += 4
+        pen -= 32
+        #(pen - 32)
+        if #gt goto loop
+    }
+    // End with stmia r1!, {r2}; bx lr.
     tail @r12 = T_STMIA_R2 | (T_BX_LR << 16)
     *(code as *u32) = tail
     code += 4
     pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
-    nop
 
+blank:
+    pen += g >> 26
+    #(n -= 1)
+    if #ne goto glyph
+    goto finish
+
+off_word:
+    #(shift - 0)
+    if #lt goto behind
+    // last: where the glyph ends in the output word
+    last @r7 = 32 - room
+    last += shift
+    #(shift - 32)
+    if #hs goto outside
 straddle:
     // ubfx r4, r4, ...; orr r3, r2, r4, lsl #shift;
     // lsrs r2, r4, #32 - shift; then the delay is stmia r1!, {r3}
     pair += 1 << 24
     d @r7 = *(orr_t + shift * 4)
     *(code as *u32) = pair
-    lsrs @r4 = T_LSRS_R2_R4_32
+    lsrs @r12 = T_LSRS_R2_R4_32
     d += 0x01000000
     lsrs -= shift << 6
     d += 0x00010000
@@ -154,24 +213,69 @@ straddle:
     *(code + 12) = stm
     slot = code + 10
     code += 14
-    shift = last - 32
+    pen -= 32
     #(n -= 1)
     if #ne goto glyph
     goto finish
 
-boundary:
-    // The previous glyph ended on a word boundary, unless this is the
-    // first glyph: store r2, ubfx, and the delay is movs r2, r3.
-    stm @r7 = T_STMIA_R2
-    #(slot - start)
-    if #eq goto plain
-    *code = stm
-    *((code + 2) as *u32) = pair
-    movs @r7 = T_MOVS_R2_R3
-    *(code + 8) = movs
-    slot = code + 6
-    code += 10
-    shift = last & 31
+outside:
+    // The glyph starts past the word in r2: store it, and any words of
+    // zeros that blanks passed over.
+    loop {
+        shift -= 32
+        insn @r12 = T_STMIA_R2
+        *code = insn
+        code += 2
+        last -= 32
+        pen -= 32
+        #(shift - 32)
+        if #lo goto break
+        insn = T_MOVS_R2_0
+        *code = insn
+        code += 2
+        goto loop
+    }
+    #(last - 32)
+    if #hi goto clear
+    // ubfx, then the delay is lsls r2, r3, #shift
+    *(code as *u32) = pair
+    lsls @r12 = T_MOVS_R2_R3
+    lsls += shift << 6
+    *(code + 6) = lsls
+    slot = code + 4
+    code += 8
+    #(n -= 1)
+    if #ne goto glyph
+    goto finish
+
+clear:
+    // only after blanks: an empty r2 for the straddle
+    empty @r12 = T_MOVS_R2_0
+    *code = empty
+    code += 2
+    goto straddle
+
+behind:
+    // The glyph starts in the word before the one in r2.
+    pair += 1 << 24
+    s @r7 = shift + 32
+    *(code as *u32) = pair
+    rs @r11 = 32 - s
+    back @r12 = T_SUBS_LDR
+    *((code + 4) as *u32) = back
+    d @r12 = *(orr_t + rs * 4)
+    d2 @r7 = *(orr_t + s * 4)
+    d += ORR_LSR_R4
+    *((code + 8) as *u32) = d
+    // orr r3, r3, r4, lsl #s
+    d2 += 0x01000000
+    stm @r12 = T_STMIA_R3
+    d2 += 0x00010000
+    *(code + 18) = stm
+    d2 += 1
+    *((code + 12) as *u32) = d2
+    slot = code + 16
+    code += 20
     #(n -= 1)
     if #ne goto glyph
     goto finish
@@ -218,11 +322,11 @@ fn text_start(self: *Text) {
     // the bits, plus a word that the funnel shift in text_render reads
     words @r5 = width + 31
     words >>= 5
-    // the bits, and at most 14 * len + 8 bytes of code
-    k @r3 = 14
+    // the bits, and at most 20 * len + 12 bytes of code
+    k @r3 = 20
     size @r0 = len * k
     words += 1
-    size += 8
+    size += 12
     size += words << 2
     addr @r0 = call pico_alloc(size)
     bits @r0 = addr as *u32
@@ -415,22 +519,31 @@ no_scratch:
     #[tail] call fill_16(dst, color, count)
 }
 
-// The width in pixels of the len characters at s.
+// The width in pixels of the len characters at s: their advances, plus
+// what the first glyph extends left of its origin.
 #[align = 4]
 fn text_width(s: *u8, len: u32) -> result {
-    // glyph widths, the high halves of font_glyphs
-    widths @r2 = (&font_glyphs + 2) as *u16
-    widths -= FONT_FIRST * 4
+    glyphs @r2 = &font_glyphs
     width @r3 = 0
-    while {
-        if len == 0 goto break
-    } loop {
+    glyphs -= FONT_FIRST * 4
+    if len == 0 goto done
+    first @r12 = *s
+    g @r12 = *(glyphs + first * 4)
+    left @r12 = (g as i32)[16..20]
+    #(left - 0)
+    if #lt {
+        width -= left
+    }
+    // glyph advances, in the high bytes of font_glyphs
+    advs @r2 = (glyphs + 3) as *u8
+    loop {
         c @r12 = *s++
         #(len -= 1)
-        w @r12 = *(widths + c * 4)
-        width += w
+        w @r12 = *(advs + c * 4)
+        width += w >> 2
         if #ne goto loop
     }
+done:
     result @r0 = width
     bx lr
 }
@@ -453,20 +566,29 @@ fn text_add(list: *DisplayList, xy: u32, colors: u32, s: *u8, len: u32) {
     // width.
     x0 @r0 = xy[0..16]
     room @r1 = H_ACTIVE - x0
-    // glyph widths, the high halves of font_glyphs
-    widths @r2 = (&font_glyphs + 2) as *u16
+    glyphs @r2 = &font_glyphs
     p @r3 = s
-    widths -= FONT_FIRST * 4
+    glyphs -= FONT_FIRST * 4
     end @r9 = s + len
+    // what the first glyph extends left of its origin
+    c @r0 = *s
+    g @r12 = *(glyphs + c * 4)
+    left @r0 = (g as i32)[16..20]
     width @r8 = 0
+    #(left - 0)
+    if #lt {
+        width -= left
+    }
+    // glyph advances, in the high bytes of font_glyphs
+    advs @r2 = (glyphs + 3) as *u8
     w @r12 = 0
     loop {
-        width += w
+        width += w >> 2
         #(width - room)
         // may load one past the end, unused
         c @r0 = *p
         if #hs goto break
-        w = *(widths + c * 4)
+        w = *(advs + c * 4)
         #(p - end)
         if #eq goto break
         p += 1
