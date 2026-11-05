@@ -45,7 +45,8 @@ use "pico_alloc.sy"
 //     [0..16]   the bit where the glyph's bitmap starts in each row
 //     [16..20]  signed, the bitmap's left edge relative to the origin
 //     [20..26]  the bitmap's width in pixels, at most 32; 0 for a blank
-//     [26..32]  the advance, from this glyph's origin to the next one's
+//     [26..32]  the advance, from this glyph's origin to the next one's;
+//               signed for a blank, as kern codes have negative advances
 
 // Instruction templates indexed by a 5 bit field, as two halfwords in a
 // word, which don't depend on the font: jit_orr[n] is orr r2, r2, r3,
@@ -100,9 +101,9 @@ fn text_init() {
 }
 
 // Compile n (at least 1) characters of text into code. Returns the end of
-// the code, which takes at most 20 * n + 10 bytes, with 2 more bytes of
-// room needed while generating. A first glyph that extends left of its
-// origin moves the text right, as in text_width.
+// the code, which with the room needed while generating takes at most
+// text_code_size bytes. A first glyph that extends left of its origin
+// moves the text right, as in text_width.
 #[link_section = ".ram"]
 #[align = 4]
 fn jit_text(code: *u16, text: *u8, n: u32) {
@@ -184,7 +185,8 @@ finish:
     pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
 
 blank:
-    pen += g >> 26
+    // signed: a kern code moves back
+    pen += (g as i32) >> 26
     #(n -= 1)
     if #ne goto glyph
     goto finish
@@ -281,7 +283,8 @@ behind:
     goto finish
 }
 
-// A text object: this header, then the text, len bytes, padded to a word.
+// A text object: this header, then the text with text_add's kern codes,
+// len bytes, padded to a word.
 // Its height is FONT_HEIGHT. Use text_add to make one.
 struct Text {
     vtable: *DisplayVtable
@@ -296,6 +299,8 @@ struct Text {
     len: u32
     // of the whole text, in pixels; x1 may clip it
     width: u32
+    // the most bytes of code text_start can generate, from text_code_size
+    code_size: u32
     // Set by text_start: the scratch block, which holds the row's bits
     // and then the code; and the y the bits were made for.
     scratch: *u32
@@ -318,15 +323,12 @@ fn text_start(self: *Text) {
     push(r4, r5, r6, lr)
     self @r4 = self
     width @r1 = self.width
-    len @r2 = self.len
     // the bits, plus a word that the funnel shift in text_render reads
     words @r5 = width + 31
     words >>= 5
-    // the bits, and at most 20 * len + 12 bytes of code
-    k @r3 = 20
-    size @r0 = len * k
+    // the bits, and the code
+    size @r0 = self.code_size
     words += 1
-    size += 12
     size += words << 2
     addr @r0 = call pico_alloc(size)
     bits @r0 = addr as *u32
@@ -519,88 +521,176 @@ no_scratch:
     #[tail] call fill_16(dst, color, count)
 }
 
-// The width in pixels of the len characters at s: their advances, plus
+// Measure the first n of the len (at least 1) characters at s, as text_add
+// sets them, where n stops short of the first character that would start
+// at or past room. Returns n, their width in pixels and the number of kern
+// codes between them. The width is their advances, less their kerns, plus
 // what the first glyph extends left of its origin.
+//
+// A pair kerns by the number of bits set in both the first's right byte in
+// font_kern and the second's left byte. For the 8 bits of x, x * 0x08040201
+// has copies at bits 0, 9, 18 and 27, so that shifted right by 3 they put
+// one each of the 8 bits at bits 0, 4, ... 28, and multiplying those by
+// 0x11111111 adds them in the top 4 bits.
 #[align = 4]
-fn text_width(s: *u8, len: u32) -> result {
-    glyphs @r2 = &font_glyphs
-    width @r3 = 0
+fn text_measure(s: *u8, len: u32, room: u32) -> (n: u32, width: u32, kerns: u32) {
+    push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
+    glyphs @r3 = &font_glyphs
     glyphs -= FONT_FIRST * 4
-    if len == 0 goto done
-    first @r12 = *s
-    g @r12 = *(glyphs + first * 4)
+    c @r12 = *s
+    g @r12 = *(glyphs + c * 4)
+    total @r4 = 0
     left @r12 = (g as i32)[16..20]
     #(left - 0)
     if #lt {
-        width -= left
+        total -= left
     }
     // glyph advances, in the high bytes of font_glyphs
-    advs @r2 = (glyphs + 3) as *u8
+    advs @r3 = (glyphs + 3) as *u8
+    kern_t @r5 = &font_kern
+    kern_t -= FONT_FIRST * 2
+    spread @r6 = 0x08040201
+    sum @r7 = 0x11111111
+    // the last character's right byte
+    right @r8 = 0
+    count @r9 = 0
+    p @r10 = s
+    end @r1 = s + len
     loop {
-        c @r12 = *s++
-        #(len -= 1)
-        w @r12 = *(advs + c * 4)
-        width += w >> 2
+        c @r12 = *p
+        pair @lr = *(kern_t + c * 2)
+        w @r11 = *(advs + c * 4)
+        t @r12 = right & pair
+        right = pair >> 8
+        t = t * spread
+        t = sum & (t >> 3)
+        t = t * sum
+        k @r12 = t >> 28
+        // where c starts
+        start @lr = total - k
+        #(start - room)
+        if #hs goto break
+        total = start + (w >> 2)
+        #(k - 0)
+        if #ne {
+            count += 1
+        }
+        p += 1
+        #(p - end)
         if #ne goto loop
     }
-done:
-    result @r0 = width
+    n = p - s
+    width = total
+    kerns = count
+    pop(r4, r5, r6, r7, r8, r9, r10, r11, pc)
+}
+
+// The most bytes jit_text can need, room included, for the n (at least 1)
+// characters at s as text_add stores them. That's 10 for each glyph with
+// pixels, 10 more for each that can start in the output word before the one
+// in r2, 4 for each word boundary, which a straddle or a store passes, and
+// 8 for the start, the tail and the room. A glyph can only start behind
+// the word in r2 if it starts left of where earlier glyphs' pixels end,
+// since that word moves past a glyph's start only for pixels that reach
+// past it.
+fn text_code_size(s: *u8, n: u32) -> size {
+    push(r4, r5, r6, lr)
+    glyphs @r2 = &font_glyphs
+    glyphs -= FONT_FIRST * 4
+    c @r12 = *s
+    g @r12 = *(glyphs + c * 4)
+    pen @r3 = 0
+    left @r12 = (g as i32)[16..20]
+    #(left - 0)
+    if #lt {
+        pen -= left
+    }
+    // where the pixels so far end
+    reach @r4 = 0
+    total @r5 = 8
+    loop {
+        c @r12 = *s++
+        g @r12 = *(glyphs + c * 4)
+        width @r6 = g[20..26]
+        if {
+            if width != 0 goto else
+            // signed: a kern code moves back
+            pen += (g as i32) >> 26
+            goto end
+        } else {
+            left @lr = (g as i32)[16..20]
+            start @lr = pen + left
+            total += 10
+            #(start - reach)
+            if #lt {
+                total += 10
+            }
+            ink @lr = start + width
+            #(ink - reach)
+            if #gt {
+                reach = ink
+            }
+            pen += g >> 26
+        }
+        #(n -= 1)
+        if #ne goto loop
+    }
+    // the boundaries, at most one for each 32 pixels of output
+    #(pen - reach)
+    if #gt {
+        reach = pen
+    }
+    words @r4 = reach >> 5
+    size = total + (words << 2)
+    pop(r4, r5, r6, pc)
+}
+
+// The width in pixels of the len characters at s, as text_add sets them.
+fn text_width(s: *u8, len: u32) -> result {
+    if len == 0 goto empty
+    push(r4, lr)
+    room @r2 = -1
+    (n @r0, width @r1, kerns @r2) = call text_measure(s, len, room)
+    result = width
+    pop(r4, pc)
+empty:
+    result = 0
     bx lr
 }
 
 // Append a text object to list, for the len characters at s, at x, y
 // (packed as x | y << 16) in colors fg | bg << 16. The text is cut off at
-// the right edge of the screen. Called from thread mode.
-#[align = 4]
+// the right edge of the screen, and kerned: a kerned pair gets a kern code
+// between, a blank that moves back by the kern. Called from thread mode.
 fn text_add(list: *DisplayList, xy: u32, colors: u32, s: *u8, len: u32) {
     // r10 keeps sp 8 byte aligned for dl_alloc
     push(r4, r5, r6, r7, r8, r9, r10, lr)
     list @r4 = list
-    nop
     xy @r5 = xy
     colors @r6 = colors
     s @r7 = s
     // the fifth argument, on the stack
-    len @r9 = sp.len
-    // Count the characters that are at least partly on screen, and their
-    // width.
-    x0 @r0 = xy[0..16]
-    room @r1 = H_ACTIVE - x0
-    glyphs @r2 = &font_glyphs
-    p @r3 = s
-    glyphs -= FONT_FIRST * 4
-    end @r9 = s + len
-    // what the first glyph extends left of its origin
-    c @r0 = *s
-    g @r12 = *(glyphs + c * 4)
-    left @r0 = (g as i32)[16..20]
-    width @r8 = 0
-    #(left - 0)
-    if #lt {
-        width -= left
-    }
-    // glyph advances, in the high bytes of font_glyphs
-    advs @r2 = (glyphs + 3) as *u8
-    w @r12 = 0
-    loop {
-        width += w >> 2
-        #(width - room)
-        // may load one past the end, unused
-        c @r0 = *p
-        if #hs goto break
-        w = *(advs + c * 4)
-        #(p - end)
-        if #eq goto break
-        p += 1
-        goto loop
-    }
-    len @r9 = p - s
+    len @r1 = sp.len
+    #(len - 0)
+    if #eq goto done
+    // The characters that are at least partly on screen
+    x0 @r2 = xy[0..16]
+    room @r2 = H_ACTIVE - x0
+    arg @r0 = s
+    (n @r0, width @r1, kerns @r2) = call text_measure(arg, len, room)
+    #(n - 0)
+    if #eq goto done
+    len @r9 = n
+    width @r8 = width
+    kerns @r10 = kerns
     l @r0 = list
-    sz @r1 = len + size(Text) + 3
+    sz @r1 = len + kerns
+    sz += size(Text) + 3
     sz &= !3
     block @r0 = call dl_alloc(l, sz)
     obj @r0 = block as *Text
-    if obj == 0 goto done
+    #(obj - 0)
+    if #eq goto done
     vt @r1 = &text_vtable
     obj.vtable = vt
     x @r1 = xy[0..16]
@@ -625,20 +715,41 @@ fn text_add(list: *DisplayList, xy: u32, colors: u32, s: *u8, len: u32) {
     fg @lr = colors[0..16]
     pair3 @lr = pkhbt(fg, fg << 16)
     *pairs = (pair0, pair1, pair2, pair3)
-    obj.len = len
+    total @r1 = len + kerns
+    obj.len = total
     obj.width = width
-    // copy the text
+    obj @r10 = obj
+    // Copy the text, kerning as text_measure does. Kern code FONT_KERN - k
+    // moves back k pixels.
     dst @r1 = obj as *u8
     dst += size(Text)
-    n @r3 = len
-    while {
-        if n == 0 goto break
-    } loop {
-        c @r2 = *s++
+    kern_t @r4 = &font_kern
+    kern_t -= FONT_FIRST * 2
+    spread @r5 = 0x08040201
+    sum @r6 = 0x11111111
+    right @r8 = 0
+    loop {
+        c @r0 = *s++
+        pair @r3 = *(kern_t + c * 2)
+        t @r12 = right & pair
+        right = pair >> 8
+        t = t * spread
+        t = sum & (t >> 3)
+        t = t * sum
+        #(k @r12 = t >> 28)
+        if #ne {
+            code @r12 = FONT_KERN - k
+            *dst++ = code
+        }
         *dst++ = c
-        #(n -= 1)
+        #(len -= 1)
         if #ne goto loop
     }
+    text @r0 = obj as *u8
+    text += size(Text)
+    n @r1 = obj.len
+    size @r0 = call text_code_size(text, n)
+    obj.code_size = size
 done:
     pop(r4, r5, r6, r7, r8, r9, r10, pc)
 }
