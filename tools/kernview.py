@@ -4,14 +4,15 @@
 
 """Preview a .kbitx font's kerning from a .kern file, as text.sy sets it.
 
-Usage: kernview.py FONT KERN [-c] [--pairs] [--png OUT] [TEXT...]
+Usage: kernview.py FONT KERN [-c] [--pairs] [--png OUT [--margin N]] [TEXT...]
 
 Draws each TEXT (or a few test lines) in the terminal with half block
 characters, a pixel per column and two rows per line, with the kern
 amounts marked under the gaps they close. -c draws each line unkerned
 above it. --pairs lists every kerned pair with the blank columns left
 between it, and the problems kbitx2font.py would refuse. --png writes the
-lines to an image as well, each pixel SCALE square.
+lines to an image as well, each pixel SCALE square, with N blank pixels
+around them.
 """
 
 import argparse
@@ -69,14 +70,19 @@ def terminal(rows):
     return "\n".join(out)
 
 
-def write_png(path, images, scale):
-    width = max(len(r[0]) for r in images) * scale
-    pixels = []
-    for rows in images:
-        for row in rows + [[False] * len(rows[0])] * 3:
-            line = bytes(0 if on else 255 for on in row for _ in range(scale))
+def write_png(path, images, scale, margin):
+    width = (max(len(r[0]) for r in images) + 2 * margin) * scale
+    blank = bytes([255]) * width
+    pixels = [blank] * (margin * scale)
+    for i, rows in enumerate(images):
+        if i:
+            pixels += [blank] * (3 * scale)
+        for row in rows:
+            line = bytes([255]) * (margin * scale)
+            line += bytes(0 if on else 255 for on in row for _ in range(scale))
             line += bytes([255]) * (width - len(line))
             pixels += [line] * scale
+    pixels += [blank] * (margin * scale)
     raw = b"".join(b"\0" + line for line in pixels)
 
     def chunk(kind, data):
@@ -98,6 +104,7 @@ def main():
     parser.add_argument("--pairs", action="store_true", help="list the kerned pairs")
     parser.add_argument("--png", help="write the lines to this image")
     parser.add_argument("--scale", type=int, default=3)
+    parser.add_argument("--margin", type=int, default=0)
     args = parser.parse_args()
 
     glyphs = kf.load_font(args.font)
@@ -129,7 +136,7 @@ def main():
             if kerned:
                 print(marks)
     if args.png:
-        write_png(args.png, images, args.scale)
+        write_png(args.png, images, args.scale, args.margin)
 
 
 if __name__ == "__main__":

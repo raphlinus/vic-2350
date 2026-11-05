@@ -8,7 +8,7 @@ use "display_list.sy"
 use "stats.sy"
 use "text.sy"
 
-// Text: a background and lines of text in a few colors, including a file
+// Text: a background and lines of text in a rainbow, including a file
 // list with sizes right aligned in a second column, and a line scrolling
 // sideways a pixel per frame, so its spans start at every bit alignment.
 // Built into a new display list each frame.
@@ -18,48 +18,49 @@ const TEXT_LEFT = 8
 // the right edge of the second column
 const COLUMN_RIGHT = 200
 const LINE_PITCH = 16
-const BG_COLOR = 0x0841
+const BG_COLOR = 0
 
-static t0: [u8; _] = "vic-2350: text rendered by code compiled at the start of each text object"
+static t0: [u8; _] = "vic-2350 text rendering: racing the beam with a specialized JIT"
 static t1: [u8; _] = "scrolling: The quick brown fox jumps over the lazy dog."
-static t2: [u8; _] = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+static t2: [u8; _] = " !\"#$%&'()*+,-./ @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_"
+static t3: [u8; _] = "0123456789:;<=>? `abcdefghijklmnopqrstuvwxyz{|}~"
 static t4: [u8; _] = "README.md"
-static c4: [u8; _] = "1214"
+static c4: [u8; _] = "4778"
 static t5: [u8; _] = "LICENSE-APACHE"
-static c5: [u8; _] = "10847"
+static c5: [u8; _] = "11358"
 static t6: [u8; _] = "LICENSE-MIT"
-static c6: [u8; _] = "1023"
+static c6: [u8; _] = "1068"
 static t7: [u8; _] = "alloc.sy"
-static c7: [u8; _] = "4410"
+static c7: [u8; _] = "3293"
 static t8: [u8; _] = "colorbars.sy"
-static c8: [u8; _] = "3920"
+static c8: [u8; _] = "3344"
 static t9: [u8; _] = "display_list.sy"
-static c9: [u8; _] = "2731"
+static c9: [u8; _] = "4076"
 static t10: [u8; _] = "fill.sy"
-static c10: [u8; _] = "1797"
+static c10: [u8; _] = "1616"
 static t11: [u8; _] = "font.sy"
-static c11: [u8; _] = "5265"
+static c11: [u8; _] = "5709"
 static t12: [u8; _] = "main.sy"
-static c12: [u8; _] = "20514"
+static c12: [u8; _] = "21193"
 static t13: [u8; _] = "pico_alloc.sy"
-static c13: [u8; _] = "1675"
+static c13: [u8; _] = "1849"
 static t14: [u8; _] = "rects.sy"
-static c14: [u8; _] = "6123"
+static c14: [u8; _] = "7975"
 static t15: [u8; _] = "render.sy"
-static c15: [u8; _] = "8790"
+static c15: [u8; _] = "10934"
 static t16: [u8; _] = "stats.sy"
-static c16: [u8; _] = "3086"
+static c16: [u8; _] = "3020"
 static t17: [u8; _] = "text.sy"
-static c17: [u8; _] = "14562"
+static c17: [u8; _] = "22243"
 static t18: [u8; _] = "vec.sy"
-static c18: [u8; _] = "1934"
-static t20: [u8; _] = "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW"
-static t21: [u8; _] = "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii"
-static t22: [u8; _] = "Mixed: AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz 0123456789"
-static t23: [u8; _] = "Every glyph, every alignment, and the right edge clips this line, which is far too long to fit"
-static t24: [u8; _] = "The end."
+static c18: [u8; _] = "1852"
+static t20: [u8; _] = "The Vic Sans 14 font was custom designed for this project. It's ASCII only for now, but that"
+static t21: [u8; _] = "might change. The engine has the capability to render overprinting (which is used to"
+static t22: [u8; _] = "adjust spacing for the j glyph) as well as kerning, and that can be used to render accents"
+static t23: [u8; _] = "efficiently. Other enhancements are also in the works, for when I design more sizes and"
+static t24: [u8; _] = "variations. And in any case, it's just fun."
 
-const N_TEXT = 23
+const N_TEXT = 24
 
 // Each line's text, and the text of its second column, if any, as
 // pointer and length
@@ -67,6 +68,7 @@ static text_lines: [u32; N_TEXT * 4] = [
     &t0, count(t0), 0, 0,
     &t1, count(t1), 0, 0,
     &t2, count(t2), 0, 0,
+    &t3, count(t3), 0, 0,
     &t4, count(t4), &c4, count(c4),
     &t5, count(t5), &c5, count(c5),
     &t6, count(t6), &c6, count(c6),
@@ -89,15 +91,25 @@ static text_lines: [u32; N_TEXT * 4] = [
     &t24, count(t24), 0, 0,
 ]
 static text_rows: [u32; N_TEXT] = [
-    0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24,
+    0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 24, 25,
 ]
 
-// fg | bg << 16, chosen by row & 3
-static text_colors: [u32; 4] = [
-    0xffff | (BG_COLOR << 16),
-    0xffe0 | (BG_COLOR << 16),
-    0x07ff | (BG_COLOR << 16),
-    0x0000 | (0xc618 << 16),
+// fg | bg << 16, a line each in turn: the 12-bit rainbow palette by Kate
+// Morley, https://iamkate.com/data/12-bit-rainbow/
+const N_COLORS = 12
+static text_colors: [u32; N_COLORS] = [
+    0x888e | (BG_COLOR << 16), // #817
+    0xa98a | (BG_COLOR << 16), // #a35
+    0xcb2c | (BG_COLOR << 16), // #c66
+    0xecc8 | (BG_COLOR << 16), // #e94
+    0xeee0 | (BG_COLOR << 16), // #ed0
+    0x9eea | (BG_COLOR << 16), // #9d5
+    0x46f1 | (BG_COLOR << 16), // #4d8
+    0x2677 | (BG_COLOR << 16), // #2cb
+    0x05d9 | (BG_COLOR << 16), // #0bc
+    0x04d9 | (BG_COLOR << 16), // #09c
+    0x3337 | (BG_COLOR << 16), // #36b
+    0x6193 | (BG_COLOR << 16), // #639
 ]
 
 // Built alternately: one is rendered while the other is built.
@@ -141,7 +153,12 @@ fn demo_main() {
             e += i << 4
             row @r1 = *(rows + i * 4)
             colors_p @r0 = &text_colors
-            idx @r12 = row & 3
+            idx @r12 = i
+            if {
+                #(idx - N_COLORS)
+                if #lo goto end
+                idx -= N_COLORS
+            }
             colors @r9 = *(colors_p + idx * 4)
             y @r10 = row * LINE_PITCH
             y += TEXT_TOP

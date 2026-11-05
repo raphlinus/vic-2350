@@ -4,4 +4,6 @@ The Vic Sans font is custom designed for this project. Font sources are in [Bits
 
 The kerning data for the font is in vic-sans-14.kern, a separate file.
 
+![A showing of the font](vic-sans-14.png)
+
 [Bits'N'Picas]: https://github.com/kreativekorp/bitsnpicas
