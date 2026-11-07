@@ -110,8 +110,8 @@ fn jit_text(code: *u16, text: *u8, n: u32) {
     push(r4, r5, r6, r7, r8, r9, r10, r11, lr)
     glyphs @r9 = &font_glyphs
     c @r8 = *text++
-    orr_t @lr = &jit_orr
-    ubfx_t @r5 = &jit_ubfx
+    orr_table @lr = &jit_orr
+    ubfx_table @r5 = &jit_ubfx
     glyphs -= FONT_FIRST * 4
     ldr_base @r10 = T_LDR_R4_R0
     // Each glyph's ldr goes in slot, ahead of the delay instruction,
@@ -135,26 +135,28 @@ glyph:
         // the next character, reading one past the end
         c = *text++
         width @r7 = g[20..26]
-        lsb @r4 = g & 31
+        bit_offset @r4 = g & 31
         if width == 0 goto blank
-        pair @r11 = *(ubfx_t + lsb * 4)
-        // ldr r4, [r0, #offset / 32 words]; the font is narrower than 32
-        // words, so the offset fits, and strh leaves out what's above it.
-        word @r4 = g >> 5
-        ldr @r4 = ldr_base + (word << 6)
-        pair += width << 16
+        // ubfx r3, r4, #offset % 32, #width
+        ubfx_instr @r11 = *(ubfx_table + bit_offset * 4)
+        // ldr r4, [r0, #offset / 32]; the font is narrower than 32 words,
+        // so the offset fits, and strh leaves out what's above it.
+        word_offset @r4 = g >> 5
+        ldr @r4 = ldr_base + (word_offset << 6)
+        ubfx_instr += width << 16
         *slot = ldr
+        // left side bearing
         left @r4 = (g as i32)[16..20]
-        *(code as *u32) = pair
-        // shift: where the glyph starts, relative to the word in r2. As
-        // unsigned, it's only above room if the glyph isn't all in the word.
+        *(code as *u32) = ubfx_instr
+        // shift: where the glyph starts, relative to the word in r2. Branch is
+        // also taken if negative.
         shift @r4 = pen + left
         room @r7 = 32 - width
         pen += g >> 26
         #(shift - room)
         if #hi goto off_word
         // the delay: orr r2, r2, r3, lsl #shift
-        d @r12 = *(orr_t + shift * 4)
+        d @r12 = *(orr_table + shift * 4)
         *((code + 6) as *u32) = d
         slot = code + 4
         code += 10
@@ -202,16 +204,16 @@ off_word:
 straddle:
     // ubfx r4, r4, ...; orr r3, r2, r4, lsl #shift;
     // lsrs r2, r4, #32 - shift; then the delay is stmia r1!, {r3}
-    pair += 1 << 24
-    d @r7 = *(orr_t + shift * 4)
-    *(code as *u32) = pair
-    lsrs @r12 = T_LSRS_R2_R4_32
+    ubfx_instr += 1 << 24
+    d @r7 = *(orr_table + shift * 4)
+    *(code as *u32) = ubfx_instr
+    lsrs_instr @r12 = T_LSRS_R2_R4_32
     d += 0x01000000
-    lsrs -= shift << 6
+    lsrs_instr -= shift << 6
     d += 0x00010000
     *((code + 4) as *u32) = d
     stm @r7 = T_STMIA_R3
-    *(code + 8) = lsrs
+    *(code + 8) = lsrs_instr
     *(code + 12) = stm
     slot = code + 10
     code += 14
@@ -240,10 +242,10 @@ outside:
     #(last - 32)
     if #hi goto clear
     // ubfx, then the delay is lsls r2, r3, #shift
-    *(code as *u32) = pair
-    lsls @r12 = T_MOVS_R2_R3
-    lsls += shift << 6
-    *(code + 6) = lsls
+    *(code as *u32) = ubfx_instr
+    lsls_instr @r12 = T_MOVS_R2_R3
+    lsls_instr += shift << 6
+    *(code + 6) = lsls_instr
     slot = code + 4
     code += 8
     #(n -= 1)
@@ -259,14 +261,14 @@ clear:
 
 behind:
     // The glyph starts in the word before the one in r2.
-    pair += 1 << 24
+    ubfx_instr += 1 << 24
     s @r7 = shift + 32
-    *(code as *u32) = pair
+    *(code as *u32) = ubfx_instr
     rs @r11 = 32 - s
     back @r12 = T_SUBS_LDR
     *((code + 4) as *u32) = back
-    d @r12 = *(orr_t + rs * 4)
-    d2 @r7 = *(orr_t + s * 4)
+    d @r12 = *(orr_table + rs * 4)
+    d2 @r7 = *(orr_table + s * 4)
     d += ORR_LSR_R4
     *((code + 8) as *u32) = d
     // orr r3, r3, r4, lsl #s
@@ -292,17 +294,18 @@ struct Text {
     y0: u16
     x1: u16
     y1: u16
-    // The RGB565 pixel pairs for each 2 bits n of a row, first pixel in
-    // the low half, a 1 bit being the foreground: bg bg, fg bg, bg fg and
-    // fg fg.
-    pairs: [u32; 4]
+    // RGB565, fg | bg << 16
+    colors: u32
     len: u32
     // of the whole text, in pixels; x1 may clip it
     width: u32
     // the most bytes of code text_start can generate, from text_code_size
     code_size: u32
-    // Set by text_start: the scratch block, which holds the row's bits
-    // and then the code; and the y the bits were made for.
+    // Set by text_start: the scratch block, which holds the pixel pairs,
+    // the row's bits and then the code; and the y the bits were made for.
+    // The pairs are the RGB565 pixels for each 2 bits n of a row, first
+    // pixel in the low half, a 1 bit being the foreground: bg bg, fg bg,
+    // bg fg and fg fg.
     scratch: *u32
     bits: *u32
     code: *u8
@@ -326,14 +329,25 @@ fn text_start(self: *Text) {
     // the bits, plus a word that the funnel shift in text_render reads
     words @r5 = width + 31
     words >>= 5
-    // the bits, and the code
+    // the pairs, the bits, and the code
     size @r0 = self.code_size
     words += 1
+    size += 16
     size += words << 2
     addr @r0 = call pico_alloc(size)
-    bits @r0 = addr as *u32
-    self.scratch = bits
-    if bits == 0 goto done
+    scratch @r0 = addr as *u32
+    self.scratch = scratch
+    if scratch == 0 goto done
+    // fg bg is colors itself
+    colors @r3 = self.colors
+    bg @r2 = colors >> 16
+    pair0 @r2 = pkhbt(bg, bg << 16)
+    pair2 @r12 = ror(colors, 16)
+    fg @lr = colors[0..16]
+    pair3 @lr = pkhbt(fg, fg << 16)
+    pair1 @r3 = colors
+    *scratch = (pair0, pair1, pair2, pair3)
+    bits @r0 = scratch + 16
     self.bits = bits
     code @r5 = bits + (words << 2)
     text @r1 = self as *u8
@@ -373,7 +387,7 @@ fn text_render(self: *Text, y: u32, x1x0: u32, buf: *u16) {
     obj_x0 @r9 = self.x0
     #(scratch - 0)
     if #eq goto no_scratch
-    pairs @r8 = &self.pairs
+    pairs @r8 = scratch
     #(y - row_y)
     if {
         if #eq goto end
@@ -514,8 +528,9 @@ no_scratch:
     x0 @r0 = x1x0[0..16]
     x1 @r2 = x1x0 >> 16
     count @r2 = x1 - x0
-    pairs @r1 = &self.pairs
-    color @r1 = *pairs
+    // fill_16 only looks at the low half
+    colors @r1 = self.colors
+    color @r1 = colors >> 16
     dst @r0 = buf + (x0 << 1)
     pop(r4, r5, r6, r7, r8, r9, r10, r11, lr)
     #[tail] call fill_16(dst, color, count)
@@ -706,15 +721,7 @@ fn text_add(list: *DisplayList, xy: u32, colors: u32, s: *u8, len: u32) {
     obj.x1 = x1
     y += FONT_HEIGHT
     obj.y1 = y
-    // the pixel pairs; fg bg is colors itself
-    pairs @r1 = &obj.pairs
-    bg @r2 = colors >> 16
-    pair0 @r2 = pkhbt(bg, bg << 16)
-    pair1 @r3 = colors
-    pair2 @r12 = ror(colors, 16)
-    fg @lr = colors[0..16]
-    pair3 @lr = pkhbt(fg, fg << 16)
-    *pairs = (pair0, pair1, pair2, pair3)
+    obj.colors = colors
     total @r1 = len + kerns
     obj.len = total
     obj.width = width
