@@ -9,7 +9,9 @@ Usage: kbitx2font.py FONT [--kern KERN]
 Replaces FONT_STRIDE, FONT_FIRST, FONT_GLYPHS, FONT_KERN, font_glyphs,
 font_kern and font_bits, and leaves the rest of font.sy alone. Each glyph is trimmed to
 the columns it has pixels in, and keeps its advance and the position of
-those columns.
+those columns. Glyphs share columns in font_bits where they match: one
+whose columns all appear in another's is placed there, and one whose
+first columns are another's last overlaps it.
 
 KERN gives each character two bytes of kerning opportunities, one for each
 side. A pair kerns by the number of bits set in both the right byte of the
@@ -32,6 +34,7 @@ pixels, where FONT_KERN is FIRST.
 import argparse
 import base64
 import os
+import random
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -101,24 +104,113 @@ def trim(c, glyph):
     return left, width
 
 
-def pack(chars, trimmed):
-    # First fit, widest first. The generated code extracts a glyph from a
-    # single word, so none can cross a word boundary.
-    words = []
-    place = {}
-    for c in sorted(chars, key=lambda c: -trimmed[c][1]):
-        width = trimmed[c][1]
-        if width == 0:
-            place[c] = 0
-            continue
-        for i, used in enumerate(words):
-            if used + width <= 32:
+def columns(glyph, trim):
+    """A trimmed glyph's columns, each as a mask of its rows."""
+    x, y, _, rows = glyph
+    left, width = trim
+    cols = [0] * width
+    for row_y, row in enumerate(rows):
+        for row_x, on in enumerate(row):
+            if on:
+                cols[x + row_x - left] |= 1 << (ASCENT - y + row_y)
+    return tuple(cols)
+
+
+def overlap(a, b):
+    """How many of a's last columns are b's first."""
+    return max((k for k in range(1, min(len(a), len(b))) if a[-k:] == b[:k]), default=0)
+
+
+def find(a, b):
+    """Where a's columns appear in b's, or None."""
+    return next((i for i in range(len(b) - len(a) + 1) if b[i : i + len(a)] == a), None)
+
+
+def chain(cols, rng):
+    """Join glyphs into runs of at most 32 columns, each glyph sharing
+    columns with the one before where they match, longest overlap first and
+    ties broken by rng. Each run is (columns, [(char, offset)])."""
+    runs = {c: (cols[c], [(c, 0)]) for c in cols}
+    ov = {(a, b): overlap(cols[a], cols[b]) for a in cols for b in cols if a != b}
+    while True:
+        fits = [(k, rng.random(), a, b) for (a, b), k in ov.items() if k and len(runs[a][0]) + len(runs[b][0]) - k <= 32]
+        if not fits:
+            return list(runs.values())
+        k, _, a, b = max(fits)
+        (ca, pa), (cb, pb) = runs.pop(a), runs.pop(b)
+        runs[a] = (ca + cb[k:], pa + [(c, o + len(ca) - k) for c, o in pb])
+        ov = {p: v for p, v in ov.items() if b not in p and a not in p}
+        for o in runs:
+            if o != a:
+                ov[a, o] = overlap(runs[a][0], runs[o][0])
+                ov[o, a] = overlap(runs[o][0], runs[a][0])
+
+
+def fill(widths, n, limit=20000):
+    """Which of n words each width goes in, without overfilling any, by a
+    search that gives up after limit steps; None if it found none."""
+    used = [0] * n
+    where = []
+    steps = 0
+
+    def go(i):
+        nonlocal steps
+        if i == len(widths):
+            return True
+        steps += 1
+        if steps > limit:
+            return False
+        tried = set()
+        for w in range(n):
+            if used[w] + widths[i] <= 32 and used[w] not in tried:
+                tried.add(used[w])
+                used[w] += widths[i]
+                where.append(w)
+                if go(i + 1):
+                    return True
+                where.pop()
+                used[w] -= widths[i]
+        return False
+
+    return where if go(0) else None
+
+
+def pack(chars, glyphs, trimmed):
+    # The generated code extracts a glyph from a single word, so none can
+    # cross a word boundary, but glyphs can share columns: a glyph whose
+    # columns are all in another's goes there, and the rest are chained
+    # where one's last columns are the next one's first. The chains are
+    # packed into as few words as a bounded search finds, and as the
+    # result depends on how ties were broken, that's tried a few times.
+    cols = {c: columns(glyphs[c], trimmed[c]) for c in chars if trimmed[c][1]}
+    inside = {}
+    for c in cols:
+        for h in cols:
+            if h != c and h not in inside and len(cols[c]) < len(cols[h]) and find(cols[c], cols[h]) is not None:
+                inside[c] = h
                 break
-        else:
-            words.append(0)
-            i = len(words) - 1
-        place[c] = i * 32 + words[i]
-        words[i] += width
+    rng = random.Random(0)
+    best = None
+    for _ in range(100):
+        runs = sorted(chain({c: cols[c] for c in cols if c not in inside}, rng), key=lambda r: -len(r[0]))
+        widths = [len(r[0]) for r in runs]
+        n = -(-sum(widths) // 32)
+        if best and n >= best[1]:
+            continue
+        where = fill(widths, n)
+        if where is not None:
+            best = (runs, n, where)
+    if best is None:
+        sys.exit("no packing found")
+    runs, n, where = best
+    words = [0] * n
+    place = {c: 0 for c in chars}
+    for (run, at), w in zip(runs, where):
+        for c, o in at:
+            place[c] = w * 32 + words[w] + o
+        words[w] += len(run)
+    for c, h in inside.items():
+        place[c] = place[h] + find(cols[c], cols[h])
     return place, words
 
 
@@ -227,7 +319,7 @@ def main():
     if problems:
         sys.exit("\n".join(problems))
     trimmed = {c: trim(c, glyphs[c]) for c in chars}
-    place, words = pack(chars, trimmed)
+    place, words = pack(chars, glyphs, trimmed)
     # jit_text's ldr reaches 32 words. The advance limits how many words of
     # code a glyph or blank can need; only a first glyph can be clamped, so
     # any other can't reach left of the text's start, kerned or not.

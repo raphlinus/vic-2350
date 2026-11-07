@@ -577,6 +577,7 @@ fn text_measure(s: *u8, len: u32, room: u32) -> (n: u32, width: u32, kerns: u32)
         w @r11 = *(advs + c * 4)
         t @r12 = right & pair
         right = pair >> 8
+        // do popcount of `t` to determine kerning value
         t = t * spread
         t = sum & (t >> 3)
         t = t * sum
@@ -740,6 +741,7 @@ fn text_add(list: *DisplayList, xy: u32, colors: u32, s: *u8, len: u32) {
         pair @r3 = *(kern_t + c * 2)
         t @r12 = right & pair
         right = pair >> 8
+        // do popcount of `t` to determine kerning value
         t = t * spread
         t = sum & (t >> 3)
         t = t * sum
